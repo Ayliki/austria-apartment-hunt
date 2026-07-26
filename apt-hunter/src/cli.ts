@@ -71,7 +71,7 @@ async function huntWillhaben(opts: CliOptions): Promise<NormalizedListing[]> {
     if (opts.roomsFrom != null) baseArgs.rooms = opts.roomsFrom;
 
     const hits = [];
-    for (let page = 1; page <= Math.min(opts.maxPages, 2); page++) {
+    for (let page = 1; page <= opts.maxPages; page++) {
       const text = await conn.callToolText('willhaben_search_real_estate', { ...baseArgs, page });
       const parsed = parseWillhabenSearchText(text);
       hits.push(...parsed);

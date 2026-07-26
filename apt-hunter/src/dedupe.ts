@@ -84,15 +84,17 @@ export function dedupeListings(
   let duplicatePairs = 0;
   for (const group of groups.values()) {
     if (group.length === 1) {
-      merged.push(group[0]);
+      merged.push({ ...group[0] });
       continue;
     }
     const primary = pickPrimary(group);
-    primary.alsoListedOn = group
-      .filter((l) => l !== primary)
-      .map((l) => ({ source: l.source, url: l.url }));
     duplicatePairs += group.length - 1;
-    merged.push(primary);
+    merged.push({
+      ...primary,
+      alsoListedOn: group
+        .filter((l) => l !== primary)
+        .map((l) => ({ source: l.source, url: l.url })),
+    });
   }
   return { merged, duplicatePairs };
 }

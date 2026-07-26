@@ -6,7 +6,37 @@
 
 /** Replace bare `undefined` tokens (valid JS, invalid JSON) with `null`. */
 export function normalizeJsObjectLiteral(raw: string): string {
-  return raw.replace(/([:,\[]\s*)undefined\s*(?=[,}\]])/g, '$1null');
+  let out = '';
+  let i = 0;
+  let inStr = false;
+  let esc = false;
+  while (i < raw.length) {
+    const c = raw[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      i++;
+      continue;
+    }
+    const rest = raw.slice(i);
+    const m = rest.match(/^undefined(?=\s*[,}\]])/);
+    if (m) {
+      out += 'null';
+      i += m[0].length;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 /**

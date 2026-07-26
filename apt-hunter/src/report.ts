@@ -109,10 +109,14 @@ header .meta { color: #78716c; font-size: 13px; }
 .srclink { font-size: 11px; }
 `;
 
+function htmlEsc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
+
 export function renderReport(input: ReportInput): string {
   const dataJson = JSON.stringify(input).replace(/</g, '\\u003c');
   const queryLine = Object.entries(input.query)
-    .map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(',') : v}`)
+    .map(([k, v]) => `${htmlEsc(k)}=${htmlEsc(Array.isArray(v) ? v.join(',') : String(v))}`)
     .join(' · ');
   const warnings = input.warnings.length
     ? `<div class="warnings">⚠ Partial coverage: ${input.warnings.map((w) => w.replace(/</g, '&lt;')).join(' — ')}</div>`

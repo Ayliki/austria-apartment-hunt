@@ -9,6 +9,13 @@ test('normalizeJsObjectLiteral replaces bare undefined tokens with null', () => 
   );
 });
 
+test('normalizeJsObjectLiteral does not replace undefined inside strings', () => {
+  assert.equal(
+    normalizeJsObjectLiteral('{"a": "Note: undefined, please ignore", "b": undefined}'),
+    '{"a": "Note: undefined, please ignore", "b": null}',
+  );
+});
+
 test('extractEmbeddedJson extracts a balanced object after a marker', () => {
   const html = `<html><script>window.__INITIAL_STATE__ = {"a": 1, "b": {"c": "x{y}"}};</script></html>`;
   assert.deepEqual(extractEmbeddedJson(html, 'window.__INITIAL_STATE__'), { a: 1, b: { c: 'x{y}' } });
