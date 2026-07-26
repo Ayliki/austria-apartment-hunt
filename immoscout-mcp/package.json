@@ -1,0 +1,23 @@
+{
+  "name": "immoscout-mcp",
+  "version": "0.1.0",
+  "description": "Unofficial MCP server for immobilienscout24.at (personal, non-commercial use)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": { "immoscout-mcp": "dist/index.js" },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx --test test/*.test.ts",
+    "dev": "tsx src/index.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
