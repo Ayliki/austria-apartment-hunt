@@ -22,19 +22,18 @@ manual flow: search → score €/m² vs median → dedupe reposts → details o
 
 ## Step 2 — Run apt-hunter
 
-The repo checkout is at `<REPO_ROOT>` (the directory containing `immoscout-mcp/` and
-`apt-hunter/`; currently `~/willhaben-apartment-hunt`, renamed `austria-apartment-hunt`).
+The repo checkout is at `/Users/ayliki/austria-apartment-hunt` (the directory containing `immoscout-mcp/` and `apt-hunter/`).
 Run via Bash:
 
 ```bash
-node <REPO_ROOT>/apt-hunter/dist/cli.js \
+node /Users/ayliki/austria-apartment-hunt/apt-hunter/dist/cli.js \
   --price-to <N> [--price-from <N>] [--area-from <N>] [--area-to <N>] \
   [--rooms-from <N>] [--rooms-to <N>] [--districts 1-9] --no-open
 ```
 
 Always pass `--no-open` (the user opens the report when they're ready). Use a generous
 Bash timeout (5 min) — willhaben enrichment is rate-limited to ~1 request/second.
-If `dist/` is missing, build first: `cd <REPO_ROOT>/immoscout-mcp && npm install && npm run build`
+If `dist/` is missing, build first: `cd /Users/ayliki/austria-apartment-hunt/immoscout-mcp && npm install && npm run build`
 and the same in `apt-hunter/`.
 
 ## Step 3 — Read the stdout JSON summary
