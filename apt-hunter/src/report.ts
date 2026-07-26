@@ -50,14 +50,14 @@ function card(l) {
       l.alsoListedOn.map((a) => '<a class="srclink" href="' + esc(a.url) + '">↗ ' + esc(a.source) + '</a>').join(' ')
     : '';
   const waitlist = l.requiresWaitlistTicket ? '<span class="badge waitlist">Wohnticket / Gemeinde</span>' : '';
-  const value = l.valueFlag ? '<span class="badge ' + l.valueFlag + '">' + l.valueFlag + ' value</span>' : '';
+  const value = l.valueFlag ? '<span class="badge ' + esc(l.valueFlag) + '">' + esc(l.valueFlag) + ' value</span>' : '';
   return '<article class="card">' + img +
     '<div class="body"><h3><a href="' + esc(l.url) + '">' + esc(l.title) + '</a></h3>' +
     '<p class="price">' + eur(l.price) + ' <span class="dim">· ' + esc(l.pricePerSqm ?? '–') + ' €/m²</span></p>' +
     '<p>' + esc(l.area ?? '–') + ' m² · ' + esc(l.rooms ?? '–') + ' Zi · ' +
       (l.district ? esc(l.district) + '. Bezirk' : 'Bezirk ?') + '</p>' +
     '<p class="dim">' + esc(l.addressLine ?? '') + '</p>' +
-    '<p><span class="badge src-' + l.source + '">' + l.source + '</span> ' + both + waitlist + ' ' + value + '</p>' +
+    '<p><span class="badge src-' + esc(l.source) + '">' + esc(l.source) + '</span> ' + both + waitlist + ' ' + value + '</p>' +
     '</div></article>';
 }
 
