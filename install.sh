@@ -23,14 +23,19 @@ echo "==> Building immoscout-mcp..."
 echo "==> Building apt-hunter..."
 (cd "$SCRIPT_DIR/apt-hunter" && npm install && npm run build)
 
+echo "==> Building swipe-bot..."
+(cd "$SCRIPT_DIR/swipe-bot" && npm install && npm run build)
+
 echo "==> Registering MCP servers (user scope)..."
 
 # Remove any previously-registered entries so the script is idempotent on re-runs.
 claude mcp remove -s user willhaben 2>/dev/null || true
 claude mcp remove -s user immoscout 2>/dev/null || true
+claude mcp remove -s user swipe-bot 2>/dev/null || true
 
 claude mcp add -s user willhaben -- npx -y willhaben-mcp
 claude mcp add -s user immoscout -- node "$SCRIPT_DIR/immoscout-mcp/dist/index.js"
+claude mcp add -s user swipe-bot -- node "$SCRIPT_DIR/swipe-bot/dist/mcp-server.js"
 
 SKILL_SRC="$SCRIPT_DIR/.claude/skills/apartment-hunt"
 SKILL_DEST="$HOME/.claude/skills/apartment-hunt"

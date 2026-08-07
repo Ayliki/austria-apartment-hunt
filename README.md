@@ -138,6 +138,17 @@ queue on demand (useful right after a poll lands new listings).
 Runs entirely on your Mac — no inbound port needed (Telegram long-polling).
 The bot is offline while your Mac is off or asleep.
 
+### Swipe from a Claude Code conversation (MCP)
+
+The same engine is also exposed as an MCP server, registered by `install.sh` as
+`swipe-bot`. In any Claude Code session you can ask things like "show me the
+next apartment card" or "I liked that one, show the next" and Claude will call
+`swipe_next_card` / `swipe_record` / `swipe_shortlist` / `swipe_set_prefs`
+directly — no Telegram needed. MCP swiping uses its own fixed profile,
+independent from any Telegram chat's learned preferences, but reads from the
+same shared, continuously-polled listing pool. Call `swipe_set_prefs` once
+before the first `swipe_next_card`.
+
 ## Verified behavior
 
 Before publishing this, both MCP servers were driven directly over their stdio
