@@ -1,3 +1,5 @@
 node_modules/
 dist/
 apt-hunter/reports/
+swipe-bot/data/
+.env
