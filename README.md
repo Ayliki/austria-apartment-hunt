@@ -106,6 +106,38 @@ Or run the CLI directly:
 node ./apt-hunter/dist/cli.js --price-to 700 --area-from 30 --districts 1-9 --no-open
 ```
 
+## Swipe bot (Telegram)
+
+`swipe-bot/` turns the same willhaben + immoscout sources into a Telegram
+swipe-card experience: a background poller keeps a shared listing pool fresh
+(one poll every ~3h regardless of how many people use the bot — never scales
+requests with user count), and each person swipes 👍/👎 on cards with photos.
+The bot learns per-person preferences from swipe history using a deterministic
+Laplace-smoothed bucket score (district, price band, room count, size band,
+private/agency, has-photos) — no LLM calls, so it's cheap to share with friends.
+
+### Setup
+
+```bash
+cd swipe-bot
+cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN (from @BotFather)
+npm run build
+npm start               # or install the LaunchAgent for always-on:
+cp com.hq.swipe-bot.plist ~/Library/LaunchAgents/
+# edit the copied plist's TELEGRAM_BOT_TOKEN before loading
+launchctl load ~/Library/LaunchAgents/com.hq.swipe-bot.plist
+```
+
+### Usage
+
+DM the bot on Telegram: `/start` asks for budget, districts, rooms, and size,
+then starts sending cards. 👍 saves to `/shortlist`; 👍/👎 both advance to the
+next card. `/settings` re-runs the preference wizard. `/next` re-checks the
+queue on demand (useful right after a poll lands new listings).
+
+Runs entirely on your Mac — no inbound port needed (Telegram long-polling).
+The bot is offline while your Mac is off or asleep.
+
 ## Verified behavior
 
 Before publishing this, both MCP servers were driven directly over their stdio
