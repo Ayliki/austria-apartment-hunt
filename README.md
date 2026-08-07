@@ -146,8 +146,16 @@ next apartment card" or "I liked that one, show the next" and Claude will call
 `swipe_next_card` / `swipe_record` / `swipe_shortlist` / `swipe_set_prefs`
 directly — no Telegram needed. MCP swiping uses its own fixed profile,
 independent from any Telegram chat's learned preferences, but reads from the
-same shared, continuously-polled listing pool. Call `swipe_set_prefs` once
-before the first `swipe_next_card`.
+same shared listing pool. Call `swipe_set_prefs` once before the first
+`swipe_next_card`.
+
+Note: the MCP server itself never polls willhaben/ImmoScout — it only reads
+and writes the shared database. Listings only populate while `swipe-bot`'s
+Telegram entrypoint (`swipe-bot/dist/index.js`, e.g. via the LaunchAgent from
+the Setup section above) is also running in the background. If you only want
+the MCP tools and don't care about the Telegram bot itself, you still need
+that process running purely for its polling loop, or `swipe_next_card` will
+report "No new listings right now" forever.
 
 ## Verified behavior
 

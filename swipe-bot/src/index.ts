@@ -28,11 +28,24 @@ async function main(): Promise<void> {
   setInterval(poll, POLL_INTERVAL_MS);
 
   const bot = createBot(db, token);
-  await bot.launch();
-  console.log('swipe-bot: Telegram long-polling started');
 
+  // Register signal handlers before launching: launch() in long-polling mode
+  // never resolves while the bot is running, so handlers registered after
+  // `await`ing it would only take effect once the bot has already stopped.
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+  // Don't await: use the onLaunch callback for the startup log instead, and
+  // an explicit .catch() so startup failures (e.g. bad token, network error
+  // during the getMe() call launch() makes before polling starts) are still
+  // caught and logged/exit non-zero, instead of becoming an unhandled
+  // rejection that main().catch() would never see.
+  bot
+    .launch(() => console.log('swipe-bot: Telegram long-polling started'))
+    .catch((err) => {
+      console.error('bot.launch failed:', err);
+      process.exit(1);
+    });
 }
 
 main().catch((err) => {
