@@ -87,7 +87,7 @@ CREATE TABLE listings (
   id TEXT PRIMARY KEY,          -- "willhaben:1234567890" / "immoscout:987654"
   source TEXT NOT NULL,
   title TEXT, price REAL, price_per_sqm REAL, area REAL, rooms REAL,
-  district TEXT, floor TEXT, has_elevator INTEGER, landlord_type TEXT,
+  district TEXT, is_private INTEGER,   -- from NormalizedListing.isPrivate (0/1/NULL)
   images TEXT,                  -- JSON array of URLs
   url TEXT NOT NULL,
   value_flag TEXT,              -- 'good' | 'fair' | 'premium' from apt-hunter score.ts
@@ -125,9 +125,13 @@ CREATE TABLE shortlist (
 No LLM calls, no external ML dependency — deterministic, explainable,
 per-chat bucket scoring:
 
-1. **Feature buckets** per listing: district, price band (€100-wide), room
-   count (rounded), size band (10m²-wide), floor group (ground / mid / top),
-   has_elevator, landlord_type, has_photos (bool).
+1. **Feature buckets** per listing, using only fields `normalize.ts` already
+   populates today (no new scraping/parsing required): district, price band
+   (€100-wide), room count (rounded), size band (10m²-wide), is_private
+   (bool), has_photos (bool, `images.length > 0`). Floor and elevator data
+   are not currently extracted by either source parser, so they're excluded
+   from v1 — a future fast-follow if willhaben/immoscout detail parsing is
+   extended to capture them.
 2. **Per-user bucket stats**: for each (chat_id, feature, bucket_value) pair,
    maintain running like/pass counts, derived live from the `swipes` +
    `listings` join (no separate stats table — recomputed per query, cheap at
