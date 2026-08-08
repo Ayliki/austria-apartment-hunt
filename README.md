@@ -106,6 +106,57 @@ Or run the CLI directly:
 node ./apt-hunter/dist/cli.js --price-to 700 --area-from 30 --districts 1-9 --no-open
 ```
 
+## Swipe bot (Telegram)
+
+`swipe-bot/` turns the same willhaben + immoscout sources into a Telegram
+swipe-card experience: a background poller keeps a shared listing pool fresh
+(one poll every ~3h regardless of how many people use the bot — never scales
+requests with user count), and each person swipes 👍/👎 on cards with photos.
+The bot learns per-person preferences from swipe history using a deterministic
+Laplace-smoothed bucket score (district, price band, room count, size band,
+private/agency, has-photos) — no LLM calls, so it's cheap to share with friends.
+
+### Setup
+
+```bash
+cd swipe-bot
+cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN (from @BotFather)
+npm run build
+npm start               # or install the LaunchAgent for always-on:
+cp com.hq.swipe-bot.plist ~/Library/LaunchAgents/
+# edit the copied plist's TELEGRAM_BOT_TOKEN before loading
+launchctl load ~/Library/LaunchAgents/com.hq.swipe-bot.plist
+```
+
+### Usage
+
+DM the bot on Telegram: `/start` asks for budget, districts, rooms, and size,
+then starts sending cards. 👍 saves to `/shortlist`; 👍/👎 both advance to the
+next card. `/settings` re-runs the preference wizard. `/next` re-checks the
+queue on demand (useful right after a poll lands new listings).
+
+Runs entirely on your Mac — no inbound port needed (Telegram long-polling).
+The bot is offline while your Mac is off or asleep.
+
+### Swipe from a Claude Code conversation (MCP)
+
+The same engine is also exposed as an MCP server, registered by `install.sh` as
+`swipe-bot`. In any Claude Code session you can ask things like "show me the
+next apartment card" or "I liked that one, show the next" and Claude will call
+`swipe_next_card` / `swipe_record` / `swipe_shortlist` / `swipe_set_prefs`
+directly — no Telegram needed. MCP swiping uses its own fixed profile,
+independent from any Telegram chat's learned preferences, but reads from the
+same shared listing pool. Call `swipe_set_prefs` once before the first
+`swipe_next_card`.
+
+Note: the MCP server itself never polls willhaben/ImmoScout — it only reads
+and writes the shared database. Listings only populate while `swipe-bot`'s
+Telegram entrypoint (`swipe-bot/dist/index.js`, e.g. via the LaunchAgent from
+the Setup section above) is also running in the background. If you only want
+the MCP tools and don't care about the Telegram bot itself, you still need
+that process running purely for its polling loop, or `swipe_next_card` will
+report "No new listings right now" forever.
+
 ## Verified behavior
 
 Before publishing this, both MCP servers were driven directly over their stdio
