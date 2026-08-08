@@ -6,8 +6,7 @@
     <string>com.hq.swipe-bot</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>node</string>
+        <string>/opt/homebrew/bin/node</string>
         <string>/Users/ayliki/austria-apartment-hunt/swipe-bot/dist/index.js</string>
     </array>
     <key>EnvironmentVariables</key>
