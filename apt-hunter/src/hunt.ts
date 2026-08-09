@@ -10,6 +10,7 @@ import {
 } from './normalize.js';
 
 const WILLHABEN_ENRICH_CAP = 30;
+const IMMOSCOUT_ENRICH_CAP = 30;
 
 export interface HuntOptions {
   priceFrom?: number;
@@ -83,6 +84,7 @@ export async function huntWillhaben(opts: HuntOptions): Promise<NormalizedListin
   }
 }
 
+/** immoscout: search pages, then enrich each hit with get_listing (full images + description) — mirrors willhaben's enrichment shape. */
 export async function huntImmoscout(opts: HuntOptions): Promise<NormalizedListing[]> {
   const conn = new McpConnection(immoscoutSpec());
   await conn.connect();
@@ -98,7 +100,20 @@ export async function huntImmoscout(opts: HuntOptions): Promise<NormalizedListin
       max_pages: opts.maxPages,
     });
     const result = JSON.parse(text);
-    return (result.listings as unknown[]).map(normalizeImmoscout);
+    const hits = result.listings as { exposeId: string }[];
+
+    const out: NormalizedListing[] = [];
+    for (const hit of hits.slice(0, IMMOSCOUT_ENRICH_CAP)) {
+      let detail;
+      try {
+        detail = JSON.parse(await conn.callToolText('immoscout_get_listing', { id: hit.exposeId }));
+      } catch {
+        detail = undefined; // enrichment is best-effort; the hit still flows through with its search-result photo only
+      }
+      out.push(normalizeImmoscout(hit, detail));
+    }
+    for (const hit of hits.slice(IMMOSCOUT_ENRICH_CAP)) out.push(normalizeImmoscout(hit));
+    return out;
   } finally {
     await conn.close();
   }

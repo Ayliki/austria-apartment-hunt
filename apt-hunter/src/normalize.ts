@@ -15,6 +15,7 @@ export interface NormalizedListing {
   isPrivate: boolean | null;
   requiresWaitlistTicket: boolean;
   images: string[];
+  description: string | null;
   dateCreated: string | null;
   /** Set by score.ts. */
   valueFlag?: 'good' | 'fair' | 'premium' | null;
@@ -121,12 +122,19 @@ export function parseWillhabenDetailText(text: string): WillhabenDetail {
       else if (t.startsWith('... and') || t.startsWith('## ')) break;
     }
   }
+  // willhaben-mcp only emits "## Description" when the advertiser filled in
+  // the BODY_DYN attribute — absent on many listings, that's a data gap on
+  // willhaben's side, not something this parser can fabricate around.
+  const descSection = text.split(/^## Description\s*$/m)[1];
+  const description = descSection
+    ? descSection.split(/^## /m)[0].trim() || null
+    : null;
   return {
     lat: coords ? parseFloat(coords[1]) : null,
     lon: coords ? parseFloat(coords[2]) : null,
     address: address?.[1]?.trim() ?? null,
     images,
-    description: null, // free-text body is often absent on willhaben; not needed for the report
+    description,
   };
 }
 
@@ -148,12 +156,18 @@ export function normalizeWillhaben(hit: WillhabenSearchHit, detail?: WillhabenDe
     isPrivate: hit.sellerType == null ? null : hit.sellerType === 'private',
     requiresWaitlistTicket: detectWaitlistTicket(hit.title),
     images: detail?.images ?? [],
+    description: detail?.description ?? null,
     dateCreated: hit.dateCreated,
   };
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-export function normalizeImmoscout(raw: any): NormalizedListing {
+/**
+ * `raw` is one hit from immoscout_search_real_estate (one photo, no description).
+ * `detail`, if supplied, is the immoscout_get_listing JSON for the same id
+ * (full images + description) — mirrors willhaben's search-then-enrich shape.
+ */
+export function normalizeImmoscout(raw: any, detail?: any): NormalizedListing {
   return {
     source: 'immoscout',
     id: String(raw.exposeId),
@@ -170,7 +184,10 @@ export function normalizeImmoscout(raw: any): NormalizedListing {
     lon: raw.lon ?? null,
     isPrivate: typeof raw.isPrivate === 'boolean' ? raw.isPrivate : null,
     requiresWaitlistTicket: raw.isSocialHousing === true,
-    images: raw.imageUrl ? [raw.imageUrl] : [],
+    images: detail?.images
+      ? detail.images.map((i: { url: string }) => i.url)
+      : raw.imageUrl ? [raw.imageUrl] : [],
+    description: detail?.description ?? null,
     dateCreated: raw.dateCreated ?? null,
   };
 }

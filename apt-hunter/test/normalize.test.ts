@@ -69,10 +69,19 @@ const WH_DETAIL = `# Nächst Augarten! Sanierte Garconniere mit 2 Zimmer im 2. L
 - **Living Area:** 44
 - **Price/m²:** € 15,23
 
+## Description
+Schöne, sanierte Garconniere mit Blick auf den Augarten. Ruhige Lage, gute Anbindung an die U-Bahn.
+
 ## Images (11)
 https://cache.willhaben.at/mmo/9/195/730/1869_105792956.jpg
 https://cache.willhaben.at/mmo/9/195/730/1869_1686566767.jpg
 ... and 6 more`;
+
+// Real listings often have no BODY_DYN attribute filled in — description section absent entirely.
+const WH_DETAIL_NO_DESCRIPTION = WH_DETAIL.replace(
+  /## Description\nSchöne.*Anbindung an die U-Bahn\.\n\n/,
+  '',
+);
 
 test('parseWillhabenDetailText extracts coordinates, address and images', () => {
   const d = parseWillhabenDetailText(WH_DETAIL);
@@ -83,6 +92,19 @@ test('parseWillhabenDetailText extracts coordinates, address and images', () => 
     'https://cache.willhaben.at/mmo/9/195/730/1869_105792956.jpg',
     'https://cache.willhaben.at/mmo/9/195/730/1869_1686566767.jpg',
   ]);
+});
+
+test('parseWillhabenDetailText extracts the description when BODY_DYN is present', () => {
+  const d = parseWillhabenDetailText(WH_DETAIL);
+  assert.equal(
+    d.description,
+    'Schöne, sanierte Garconniere mit Blick auf den Augarten. Ruhige Lage, gute Anbindung an die U-Bahn.',
+  );
+});
+
+test('parseWillhabenDetailText returns null description when no Description section exists', () => {
+  const d = parseWillhabenDetailText(WH_DETAIL_NO_DESCRIPTION);
+  assert.equal(d.description, null);
 });
 
 test('normalizeWillhaben merges search hit + detail into NormalizedListing', () => {
@@ -96,6 +118,10 @@ test('normalizeWillhaben merges search hit + detail into NormalizedListing', () 
   assert.equal(n.isPrivate, false);
   assert.equal(n.requiresWaitlistTicket, false);
   assert.equal(n.district, 2);
+  assert.equal(
+    n.description,
+    'Schöne, sanierte Garconniere mit Blick auf den Augarten. Ruhige Lage, gute Anbindung an die U-Bahn.',
+  );
 });
 
 test('normalizeWillhaben works without detail (no coords/images)', () => {
@@ -103,6 +129,7 @@ test('normalizeWillhaben works without detail (no coords/images)', () => {
   assert.equal(n.lat, null);
   assert.deepEqual(n.images, []);
   assert.equal(n.isPrivate, true);
+  assert.equal(n.description, null);
 });
 
 test('detectWaitlistTicket catches municipal-housing keywords', () => {
@@ -135,6 +162,23 @@ test('normalizeImmoscout maps the immoscout-mcp JSON shape', () => {
   assert.equal(n.lat, 48.1686136);
   assert.deepEqual(n.images, ['https://pictures.immobilienscout24.de/thumb.webp']);
   assert.equal(n.requiresWaitlistTicket, false);
+  assert.equal(n.description, null);
+});
+
+test('normalizeImmoscout uses the full image set and description when a detail object is supplied', () => {
+  const detail = {
+    description: 'Helle 2-Zimmer-Wohnung mit Balkon und Einbauküche.',
+    images: [
+      { url: 'https://pictures.immobilienscout24.de/full1.webp', caption: null },
+      { url: 'https://pictures.immobilienscout24.de/full2.webp', caption: 'Grundriss' },
+    ],
+  };
+  const n = normalizeImmoscout(IS24_HIT, detail);
+  assert.equal(n.description, 'Helle 2-Zimmer-Wohnung mit Balkon und Einbauküche.');
+  assert.deepEqual(n.images, [
+    'https://pictures.immobilienscout24.de/full1.webp',
+    'https://pictures.immobilienscout24.de/full2.webp',
+  ]);
 });
 
 test('normalizeImmoscout flags social housing as waitlist-ticket, tolerates nulls', () => {
