@@ -11,7 +11,8 @@ function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
     source: 'willhaben', id: '1', url: 'https://x/1', title: 'Test flat',
     price: 650, pricePerSqm: 15, area: 43, rooms: 2, district: 6, zip: '1060',
     addressLine: null, lat: null, lon: null, isPrivate: true,
-    requiresWaitlistTicket: false, images: ['https://img/1.jpg'], dateCreated: '2026-08-01T00:00:00Z',
+    requiresWaitlistTicket: false, images: ['https://img/1.jpg'], description: 'A lovely flat.',
+    dateCreated: '2026-08-01T00:00:00Z',
     ...overrides,
   };
 }
@@ -27,6 +28,38 @@ test('upsertListing inserts new, ignores duplicate id', () => {
   assert.equal(upsertListing(db, listing({ id: '1', title: 'changed title' })), false);
   const rows = db.prepare('SELECT title FROM listings WHERE id = ?').all(listingKey(listing({ id: '1' })));
   assert.equal((rows[0] as { title: string }).title, 'Test flat'); // first insert wins, not overwritten
+});
+
+test('upsertListing persists description, getCandidateListings round-trips it', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, description: 'Sunny two-room flat near the park.' }));
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null };
+  const [row] = getCandidateListings(db, 1, prefs);
+  assert.equal(row.description, 'Sunny two-room flat near the park.');
+});
+
+test('upsertListing stores null description as null, not the string "null"', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, description: null }));
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null };
+  const [row] = getCandidateListings(db, 1, prefs);
+  assert.equal(row.description, null);
+});
+
+test('openDb migrates an older database file that predates the description column', () => {
+  const path = `/tmp/swipe-bot-migration-test-${Date.now()}.sqlite`;
+  // Simulate a pre-migration DB: create the listings table without `description`.
+  const preMigration = openDb(path);
+  preMigration.exec('ALTER TABLE listings DROP COLUMN description'); // requires SQLite 3.35+, matches better-sqlite3's bundled version
+  preMigration.close();
+
+  // Reopening through openDb must not throw, and must add the column back.
+  const migrated = openDb(path);
+  upsertListing(migrated, listing({ id: 'a', district: 6, description: 'Migrated fine.' }));
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null };
+  const [row] = getCandidateListings(migrated, 1, prefs);
+  assert.equal(row.description, 'Migrated fine.');
+  migrated.close();
 });
 
 test('listingKey namespaces by source', () => {

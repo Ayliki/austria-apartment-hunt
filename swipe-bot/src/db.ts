@@ -25,6 +25,7 @@ export interface ListingRow {
   district: number | null;
   isPrivate: boolean | null;
   images: string[];
+  description: string | null;
   url: string;
   valueFlag: 'good' | 'fair' | 'premium' | null;
   firstSeen: string;
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS listings (
   price REAL, price_per_sqm REAL, area REAL, rooms REAL,
   district INTEGER, is_private INTEGER,
   images TEXT NOT NULL,
+  description TEXT,
   url TEXT NOT NULL,
   value_flag TEXT,
   first_seen TEXT NOT NULL
@@ -72,7 +74,16 @@ export function openDb(path: string): DB {
   const db = new Database(path);
   db.pragma('journal_mode = WAL');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+/** CREATE TABLE IF NOT EXISTS never alters an existing table — new columns need an explicit migration. */
+function migrate(db: DB): void {
+  const columns = (db.prepare('PRAGMA table_info(listings)').all() as { name: string }[]).map((c) => c.name);
+  if (!columns.includes('description')) {
+    db.exec('ALTER TABLE listings ADD COLUMN description TEXT');
+  }
 }
 
 export function listingKey(l: NormalizedListing): string {
@@ -91,6 +102,7 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
     district: row.district as number | null,
     isPrivate: row.is_private == null ? null : Boolean(row.is_private),
     images: JSON.parse(row.images as string),
+    description: row.description as string | null,
     url: row.url as string,
     valueFlag: row.value_flag as 'good' | 'fair' | 'premium' | null,
     firstSeen: row.first_seen as string,
@@ -100,8 +112,8 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
 /** Returns true if this listing was newly inserted, false if it already existed (never overwritten). */
 export function upsertListing(db: DB, l: NormalizedListing): boolean {
   const result = db.prepare(`
-    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, url, value_flag, first_seen)
-    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @url, @valueFlag, @firstSeen)
+    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen)
+    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen)
   `).run({
     id: listingKey(l),
     source: l.source,
@@ -113,6 +125,7 @@ export function upsertListing(db: DB, l: NormalizedListing): boolean {
     district: l.district,
     isPrivate: l.isPrivate == null ? null : (l.isPrivate ? 1 : 0),
     images: JSON.stringify(l.images),
+    description: l.description,
     url: l.url,
     valueFlag: l.valueFlag ?? null,
     firstSeen: new Date().toISOString(),

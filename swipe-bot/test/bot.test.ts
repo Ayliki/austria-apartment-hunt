@@ -9,7 +9,7 @@ function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
     source: 'willhaben', id: '1', url: 'https://x/1', title: 'Flat',
     price: 650, pricePerSqm: 15, area: 43, rooms: 2, district: 6, zip: '1060',
     addressLine: null, lat: null, lon: null, isPrivate: true,
-    requiresWaitlistTicket: false, images: [], dateCreated: '2026-08-01T00:00:00Z',
+    requiresWaitlistTicket: false, images: [], description: null, dateCreated: '2026-08-01T00:00:00Z',
     ...overrides,
   };
 }
