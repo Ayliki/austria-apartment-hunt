@@ -23,6 +23,7 @@ export function formatCardPayload(l: ListingRow) {
     district: l.district,
     url: l.url,
     images: l.images,
+    description: l.description,
     valueFlag: l.valueFlag,
   };
 }

@@ -16,20 +16,22 @@ test('MCP_CHAT_ID is a fixed sentinel that can never collide with a real Telegra
   assert.equal(MCP_CHAT_ID, 0);
 });
 
-test('formatCardPayload exposes id, title, price, area, rooms, district, url, images, valueFlag', () => {
+test('formatCardPayload exposes id, title, price, area, rooms, district, url, images, description, valueFlag', () => {
   const payload = formatCardPayload(row({}));
   assert.deepEqual(payload, {
     id: 'willhaben:1', title: 'Flat', price: 650, area: 43, rooms: 2, district: 6,
-    url: 'https://x/1', images: ['https://img/1.jpg', 'https://img/2.jpg'], valueFlag: 'fair',
+    url: 'https://x/1', images: ['https://img/1.jpg', 'https://img/2.jpg'],
+    description: 'A lovely flat.', valueFlag: 'fair',
   });
 });
 
 test('formatCardPayload passes through nulls as-is (no fabricated defaults)', () => {
-  const payload = formatCardPayload(row({ price: null, area: null, rooms: null, district: null, valueFlag: null }));
+  const payload = formatCardPayload(row({ price: null, area: null, rooms: null, district: null, description: null, valueFlag: null }));
   assert.equal(payload.price, null);
   assert.equal(payload.area, null);
   assert.equal(payload.rooms, null);
   assert.equal(payload.district, null);
+  assert.equal(payload.description, null);
   assert.equal(payload.valueFlag, null);
 });
 

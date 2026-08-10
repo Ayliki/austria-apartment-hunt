@@ -75,13 +75,42 @@ export function nextCardFor(db: DB, chatId: number): ListingRow | null {
   return rankListings(candidates, swiped)[0];
 }
 
-function formatCaption(l: ListingRow): string {
+/** Telegram's hard cap on caption length for photos and media groups alike. */
+const MAX_CAPTION_LENGTH = 1024;
+
+function truncate(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 1).trimEnd() + '…';
+}
+
+/** Pure — builds the card caption (title, price/size/rooms/district, description, link). Exported for direct testing. */
+export function formatCaption(l: ListingRow): string {
   const price = l.price != null ? `€${l.price}` : 'price n/a';
   const area = l.area != null ? `${l.area}m²` : '';
   const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
   const district = l.district != null ? `district ${l.district}` : '';
   const details = [area, rooms, district].filter(Boolean).join(' · ');
-  return `${l.title}\n${price} · ${details}\n${l.url}`;
+  const base = `${l.title}\n${price} · ${details}\n${l.url}`;
+  const full = l.description ? `${base}\n\n${l.description}` : base;
+  return truncate(full, MAX_CAPTION_LENGTH);
+}
+
+/** Telegram's hard cap on items in a single sendMediaGroup call. */
+export const MAX_MEDIA_GROUP_ITEMS = 10;
+
+interface MediaGroupItem {
+  type: 'photo';
+  media: string;
+  caption?: string;
+}
+
+/** Pure — builds a sendMediaGroup payload, capped to Telegram's limit, caption attached to the first item only (Telegram renders it as the album's caption). */
+export function buildMediaGroup(images: string[], caption: string): MediaGroupItem[] {
+  return images.slice(0, MAX_MEDIA_GROUP_ITEMS).map((url, i) => ({
+    type: 'photo' as const,
+    media: url,
+    ...(i === 0 ? { caption } : {}),
+  }));
 }
 
 const onboardingState = new Map<number, string[]>();
@@ -92,12 +121,17 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
     await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
     return;
   }
+  const caption = formatCaption(card);
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
-  const caption = formatCaption(card);
-  if (card.images.length > 0) {
+
+  if (card.images.length >= 2) {
+    // sendMediaGroup can't carry an inline keyboard on any item — send the album, then the buttons separately.
+    await telegram.sendMediaGroup(chatId, buildMediaGroup(card.images, caption));
+    await telegram.sendMessage(chatId, '👍 or 👎?', buttons);
+  } else if (card.images.length === 1) {
     await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
   } else {
     await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
