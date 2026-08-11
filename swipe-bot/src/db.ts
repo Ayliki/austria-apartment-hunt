@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS shortlist (
   saved_at TEXT NOT NULL,
   PRIMARY KEY (chat_id, listing_id)
 );
+
+CREATE TABLE IF NOT EXISTS onboarding_state (
+  chat_id INTEGER PRIMARY KEY,
+  answers TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 export function openDb(path: string): DB {
@@ -175,6 +181,23 @@ export function setUserPrefs(db: DB, prefs: UserPrefs): void {
     areaTo: prefs.areaTo,
     updatedAt: new Date().toISOString(),
   });
+}
+
+/** In-progress onboarding wizard answers for a chat, or null if not mid-onboarding. Persisted so a process restart doesn't silently drop progress. */
+export function getOnboardingState(db: DB, chatId: number): string[] | null {
+  const row = db.prepare('SELECT answers FROM onboarding_state WHERE chat_id = ?').get(chatId) as { answers: string } | undefined;
+  return row ? JSON.parse(row.answers) : null;
+}
+
+export function setOnboardingState(db: DB, chatId: number, answers: string[]): void {
+  db.prepare(`
+    INSERT INTO onboarding_state (chat_id, answers, updated_at) VALUES (@chatId, @answers, @updatedAt)
+    ON CONFLICT(chat_id) DO UPDATE SET answers = excluded.answers, updated_at = excluded.updated_at
+  `).run({ chatId, answers: JSON.stringify(answers), updatedAt: new Date().toISOString() });
+}
+
+export function deleteOnboardingState(db: DB, chatId: number): void {
+  db.prepare('DELETE FROM onboarding_state WHERE chat_id = ?').run(chatId);
 }
 
 export function recordSwipe(db: DB, chatId: number, listingId: string, direction: 'like' | 'pass'): void {

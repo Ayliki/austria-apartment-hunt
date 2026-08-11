@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, MAX_MEDIA_GROUP_ITEMS } from '../src/bot.js';
-import { openDb, upsertListing, setUserPrefs, recordSwipe, type ListingRow } from '../src/db.js';
+import { createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, MAX_MEDIA_GROUP_ITEMS } from '../src/bot.js';
+import { openDb, upsertListing, setUserPrefs, getOnboardingState, recordSwipe, type ListingRow, type DB } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
+import { Telegram, type Telegraf } from 'telegraf';
 
 function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
   return {
@@ -98,4 +99,139 @@ test('buildMediaGroup caps at Telegram\'s 10-item limit', () => {
   const group = buildMediaGroup(images, 'caption');
   assert.equal(group.length, MAX_MEDIA_GROUP_ITEMS);
   assert.deepEqual(group.map((item) => item.media), images.slice(0, MAX_MEDIA_GROUP_ITEMS));
+});
+
+// --- Handler-level tests: drive createBot() through real Telegraf update dispatch, ---
+// --- stubbing only the outbound HTTP call. Covers the wiring the unit tests above skip. ---
+
+interface Call { method: string; payload: Record<string, unknown> }
+
+// Telegraf.handleUpdate constructs a brand-new Telegram instance per update (see telegraf.js:
+// `const tg = new Telegram(this.token, ...)`), so stubbing an instance's callApi is a no-op —
+// the prototype is the only stable interception point. `activeCalls` routes to whichever test
+// bot is currently mid-await; tests in this file run sequentially, so this is safe.
+let activeCalls: Call[] | null = null;
+(Telegram.prototype as unknown as { callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown> }).callApi =
+  async function callApi(method, payload) {
+    if (!activeCalls) throw new Error('callApi invoked outside a test bot context');
+    activeCalls.push({ method, payload });
+    if (method === 'sendMediaGroup') return [];
+    if (method === 'answerCallbackQuery') return true;
+    return { message_id: activeCalls.length, date: 0, chat: { id: (payload.chat_id as number) ?? 0, type: 'private' } };
+  };
+
+function createTestBot(db: DB): { bot: Telegraf; calls: Call[] } {
+  const bot = createBot(db, 'test-token');
+  (bot as unknown as { botInfo: unknown }).botInfo = { id: 1, is_bot: true, first_name: 'Test', username: 'testbot' };
+  const calls: Call[] = [];
+  activeCalls = calls;
+  return { bot, calls };
+}
+
+let nextUpdateId = 1;
+
+function textUpdate(chatId: number, text: string) {
+  const id = nextUpdateId++;
+  return {
+    update_id: id,
+    message: { message_id: id, date: 0, chat: { id: chatId, type: 'private' as const }, from: { id: chatId, is_bot: false, first_name: 'U' }, text },
+  };
+}
+
+function commandUpdate(chatId: number, command: string) {
+  const id = nextUpdateId++;
+  return {
+    update_id: id,
+    message: {
+      message_id: id, date: 0, chat: { id: chatId, type: 'private' as const }, from: { id: chatId, is_bot: false, first_name: 'U' },
+      text: command, entities: [{ offset: 0, length: command.length, type: 'bot_command' as const }],
+    },
+  };
+}
+
+function callbackUpdate(chatId: number, data: string) {
+  const id = nextUpdateId++;
+  return {
+    update_id: id,
+    callback_query: {
+      id: String(id), from: { id: chatId, is_bot: false, first_name: 'U' }, chat_instance: 'x', data,
+      message: { message_id: id, date: 0, chat: { id: chatId, type: 'private' as const } },
+    },
+  };
+}
+
+test('/start begins onboarding and asks the first question', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.match(texts[0] as string, /never transfer money/);
+  assert.equal(texts[1], 'What\'s your max budget (cold, in EUR)?');
+  assert.deepEqual(getOnboardingState(db, 1), []);
+});
+
+test('an invalid onboarding answer re-asks the same question without dropping prior progress', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  await bot.handleUpdate(textUpdate(1, 'not a number'));
+
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.match(texts.at(-1) as string, /doesn't look like a budget/);
+  // still waiting on question 0 — the bad answer was never recorded
+  assert.deepEqual(getOnboardingState(db, 1), []);
+});
+
+test('completing onboarding step by step saves prefs and reports no candidates yet', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+  assert.equal(getOnboardingState(db, 1), null);
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.match(texts.at(-2) as string, /Preferences saved/);
+  assert.match(texts.at(-1) as string, /No new listings right now/);
+});
+
+test('a restart mid-onboarding does not drop progress — this is the bug that shipped', async () => {
+  const db = openDb(':memory:');
+  const first = createTestBot(db);
+  await first.bot.handleUpdate(commandUpdate(42, '/start'));
+  await first.bot.handleUpdate(textUpdate(42, '800')); // answers the budget question
+
+  // simulate a process restart: a brand-new Telegraf instance, same on-disk db.
+  const second = createTestBot(db);
+  await second.bot.handleUpdate(textUpdate(42, 'skip')); // should continue onboarding, not be silently ignored
+
+  const texts = second.calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.equal(texts.length, 1, 'the post-restart reply should continue the wizard, not stay silent');
+  assert.equal(texts[0], 'Districts? e.g. "1-9" or "6,7,9", or "any"');
+  assert.deepEqual(getOnboardingState(db, 42), ['800', 'skip']);
+});
+
+test('/next before onboarding is complete tells the user to /start instead of a misleading "no listings"', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/next'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.match(texts[0] as string, /haven't set your preferences/);
+});
+
+test('free text outside onboarding is ignored, not echoed or errored', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(textUpdate(1, 'You here?'));
+  assert.equal(calls.length, 0);
+});
+
+test('a 👍 swipe records the shortlist entry and sends the next card', async () => {
+  const db = openDb(':memory:');
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));
+  assert.ok(calls.some((c) => c.method === 'answerCallbackQuery'));
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('No new listings')));
 });

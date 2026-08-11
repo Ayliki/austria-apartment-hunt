@@ -2,6 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import {
   type DB, type UserPrefs, type ListingRow,
   getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist,
+  getOnboardingState, setOnboardingState, deleteOnboardingState,
 } from './db.js';
 import { rankListings } from './scoring.js';
 
@@ -43,25 +44,42 @@ function parseDistrictsAnswer(s: string): number[] | null {
   return [...new Set(out)].sort((a, b) => a - b);
 }
 
+function parseBudgetMax(s: string): number {
+  const n = Number(s.trim());
+  if (!Number.isFinite(n)) throw new Error('that doesn\'t look like a budget — reply with a number, e.g. 800');
+  return n;
+}
+
+function parseBudgetMin(s: string): number | null {
+  const trimmed = s.trim().toLowerCase();
+  if (trimmed === 'skip' || trimmed === 'any') return null;
+  const n = Number(s.trim());
+  if (!Number.isFinite(n)) throw new Error('that doesn\'t look like a minimum budget — reply with a number or "skip"');
+  return n;
+}
+
+function parseRoomsOrSize(s: string): [number | null, number | null] {
+  if (s.trim().toLowerCase() === 'any') return [null, null];
+  return parseRange(s);
+}
+
+/** One parser per onboarding question, in order. Each throws Error with a user-facing message on invalid input. */
+const STEP_PARSERS: ((raw: string) => unknown)[] = [
+  parseBudgetMax, parseBudgetMin, parseDistrictsAnswer, parseRoomsOrSize, parseRoomsOrSize,
+];
+
+/** Validates a single onboarding answer against its question's parser. Throws on invalid input. */
+export function parseOnboardingStep(index: number, raw: string): void {
+  STEP_PARSERS[index](raw);
+}
+
 /** Pure parser for the 5-question onboarding wizard answers, in order. Throws Error with a user-facing message. */
 export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chatId'> {
-  const [budgetMaxRaw, budgetMinRaw, districtsRaw, roomsRaw, sizeRaw] = answers;
-
-  const priceTo = Number(budgetMaxRaw.trim());
-  if (!Number.isFinite(priceTo)) throw new Error('that doesn\'t look like a budget — reply with a number, e.g. 800');
-
-  const minTrimmed = budgetMinRaw.trim().toLowerCase();
-  const priceFrom = minTrimmed === 'skip' || minTrimmed === 'any' ? null : Number(budgetMinRaw.trim());
-  if (priceFrom != null && !Number.isFinite(priceFrom)) throw new Error('that doesn\'t look like a minimum budget — reply with a number or "skip"');
-
-  const districts = parseDistrictsAnswer(districtsRaw);
-
-  const roomsTrimmed = roomsRaw.trim().toLowerCase();
-  const [roomsFrom, roomsTo] = roomsTrimmed === 'any' ? [null, null] : parseRange(roomsRaw);
-
-  const sizeTrimmed = sizeRaw.trim().toLowerCase();
-  const [areaFrom, areaTo] = sizeTrimmed === 'any' ? [null, null] : parseRange(sizeRaw);
-
+  const priceTo = parseBudgetMax(answers[0]);
+  const priceFrom = parseBudgetMin(answers[1]);
+  const districts = parseDistrictsAnswer(answers[2]);
+  const [roomsFrom, roomsTo] = parseRoomsOrSize(answers[3]);
+  const [areaFrom, areaTo] = parseRoomsOrSize(answers[4]);
   return { priceFrom, priceTo, districts, roomsFrom, roomsTo, areaFrom, areaTo };
 }
 
@@ -113,9 +131,11 @@ export function buildMediaGroup(images: string[], caption: string): MediaGroupIt
   }));
 }
 
-const onboardingState = new Map<number, string[]>();
-
 async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
+  if (!getUserPrefs(db, chatId)) {
+    await telegram.sendMessage(chatId, 'You haven\'t set your preferences yet — send /start to get set up.');
+    return;
+  }
   const card = nextCardFor(db, chatId);
   if (!card) {
     await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
@@ -142,13 +162,13 @@ export function createBot(db: DB, token: string): Telegraf {
   const bot = new Telegraf(token);
 
   bot.start(async (ctx) => {
-    onboardingState.set(ctx.chat.id, []);
+    setOnboardingState(db, ctx.chat.id, []);
     await ctx.reply(SAFETY_NOTICE);
     await ctx.reply(QUESTIONS[0]);
   });
 
   bot.command('settings', async (ctx) => {
-    onboardingState.set(ctx.chat.id, []);
+    setOnboardingState(db, ctx.chat.id, []);
     await ctx.reply(QUESTIONS[0]);
   });
 
@@ -167,23 +187,29 @@ export function createBot(db: DB, token: string): Telegraf {
   });
 
   bot.on('text', async (ctx) => {
-    const answers = onboardingState.get(ctx.chat.id);
+    const chatId = ctx.chat.id;
+    const answers = getOnboardingState(db, chatId);
     if (!answers) return; // not mid-onboarding, ignore free text
+
+    try {
+      parseOnboardingStep(answers.length, ctx.message.text);
+    } catch (err) {
+      await ctx.reply((err as Error).message);
+      return; // keep the same question, don't advance or lose prior answers
+    }
+
     answers.push(ctx.message.text);
     if (answers.length < QUESTIONS.length) {
+      setOnboardingState(db, chatId, answers);
       await ctx.reply(QUESTIONS[answers.length]);
       return;
     }
-    onboardingState.delete(ctx.chat.id);
-    try {
-      const parsed = parseOnboardingAnswers(answers);
-      setUserPrefs(db, { chatId: ctx.chat.id, ...parsed });
-      await ctx.reply('Preferences saved. Here\'s your first card:');
-      await sendNextCard(ctx.telegram, ctx.chat.id, db);
-    } catch (err) {
-      await ctx.reply(`${(err as Error).message} — let's restart: ${QUESTIONS[0]}`);
-      onboardingState.set(ctx.chat.id, []);
-    }
+
+    deleteOnboardingState(db, chatId);
+    const parsed = parseOnboardingAnswers(answers);
+    setUserPrefs(db, { chatId, ...parsed });
+    await ctx.reply('Preferences saved. Here\'s your first card:');
+    await sendNextCard(ctx.telegram, chatId, db);
   });
 
   bot.action(/^(like|pass):(.+)$/, async (ctx) => {
