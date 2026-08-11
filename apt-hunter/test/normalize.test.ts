@@ -7,6 +7,7 @@ import {
   normalizeWillhaben,
   normalizeImmoscout,
   detectWaitlistTicket,
+  detectShortTerm,
 } from '../src/normalize.js';
 
 test('parseAustrianNumber handles Austrian formats', () => {
@@ -117,6 +118,7 @@ test('normalizeWillhaben merges search hit + detail into NormalizedListing', () 
   assert.equal(n.images.length, 2);
   assert.equal(n.isPrivate, false);
   assert.equal(n.requiresWaitlistTicket, false);
+  assert.equal(n.isShortTerm, false); // €15.22/m², a normal long-term rent
   assert.equal(n.district, 2);
   assert.equal(
     n.description,
@@ -137,6 +139,29 @@ test('detectWaitlistTicket catches municipal-housing keywords', () => {
   assert.equal(detectWaitlistTicket('Wohnung mit Vormerkschein abzugeben'), true);
   assert.equal(detectWaitlistTicket('nur mit Wiener Wohnticket!'), true);
   assert.equal(detectWaitlistTicket('Sanierte Garconniere im 2. Liftstock'), false);
+});
+
+test('detectShortTerm catches nightly/vacation-style title phrasing', () => {
+  assert.equal(detectShortTerm('NOTFALLWOHNUNG zur kurzfristigen Nutzung! - PROVISIONSFREI', 600, 45), true);
+  assert.equal(detectShortTerm('Gemütliche Ferienwohnung am Stadtrand', 900, 40), true);
+  assert.equal(detectShortTerm('Modernes Boardinghouse-Zimmer, tageweise buchbar', 700, 30), true);
+  assert.equal(detectShortTerm('Kurzzeitmiete möglich, voll möbliert', 1200, 50), true);
+  assert.equal(detectShortTerm('Sanierte Garconniere im 2. Liftstock', 650, 44), false);
+});
+
+test('detectShortTerm does not flag ordinary listings merely available soon ("kurzfristig beziehbar")', () => {
+  assert.equal(detectShortTerm('Helle 2-Zimmer-Wohnung, kurzfristig beziehbar', 800, 60), false);
+  assert.equal(detectShortTerm('WG Zimmer ab sofort verfügbar, kurzfristig frei', 559, 82), false);
+});
+
+test('detectShortTerm catches an implausibly low monthly price for the size, even without a title match', () => {
+  assert.equal(detectShortTerm('Voll ausgestattetes Appartement in guter Lage', 59.99, 45), true); // €1.33/m²
+  assert.equal(detectShortTerm('Sanierte Garconniere im 2. Liftstock', 650, 44), false); // €14.77/m², normal
+});
+
+test('detectShortTerm tolerates missing price/area (never flags on nulls alone)', () => {
+  assert.equal(detectShortTerm('Sanierte Garconniere im 2. Liftstock', null, null), false);
+  assert.equal(detectShortTerm('Sanierte Garconniere im 2. Liftstock', 650, null), false);
 });
 
 // Real immoscout_search_real_estate JSON element shape (from immoscout-mcp Task 3 output).
@@ -186,4 +211,10 @@ test('normalizeImmoscout flags social housing as waitlist-ticket, tolerates null
   assert.equal(n.requiresWaitlistTicket, true);
   assert.equal(n.lat, null);
   assert.deepEqual(n.images, []);
+});
+
+test('normalizeImmoscout flags short-term listings by title and by implausible price/m²', () => {
+  assert.equal(normalizeImmoscout({ ...IS24_HIT, title: 'Charmante Ferienwohnung im Zentrum' }).isShortTerm, true);
+  assert.equal(normalizeImmoscout({ ...IS24_HIT, price: 59.99, area: 45 }).isShortTerm, true);
+  assert.equal(normalizeImmoscout(IS24_HIT).isShortTerm, false); // €15.28/m², a normal long-term rent
 });

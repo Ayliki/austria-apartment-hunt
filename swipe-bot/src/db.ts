@@ -134,8 +134,13 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
   };
 }
 
-/** Returns true if this listing was newly inserted, false if it already existed (never overwritten). */
+/**
+ * Returns true if this listing was newly inserted, false if it already existed (never overwritten)
+ * or was a short-term/nightly rental (apt-hunter's detectShortTerm) — this bot is for long-term
+ * leases only, so those are dropped at the source instead of filtered downstream in three places.
+ */
 export function upsertListing(db: DB, l: NormalizedListing): boolean {
+  if (l.isShortTerm) return false;
   const result = db.prepare(`
     INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket)
     VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket)

@@ -12,7 +12,7 @@ function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
     source: 'willhaben', id: '1', url: 'https://x/1', title: 'Test flat',
     price: 650, pricePerSqm: 15, area: 43, rooms: 2, district: 6, zip: '1060',
     addressLine: null, lat: null, lon: null, isPrivate: true,
-    requiresWaitlistTicket: false, images: ['https://img/1.jpg'], description: 'A lovely flat.',
+    requiresWaitlistTicket: false, isShortTerm: false, images: ['https://img/1.jpg'], description: 'A lovely flat.',
     dateCreated: '2026-08-01T00:00:00Z',
     ...overrides,
   };
@@ -29,6 +29,13 @@ test('upsertListing inserts new, ignores duplicate id', () => {
   assert.equal(upsertListing(db, listing({ id: '1', title: 'changed title' })), false);
   const rows = db.prepare('SELECT title FROM listings WHERE id = ?').all(listingKey(listing({ id: '1' })));
   assert.equal((rows[0] as { title: string }).title, 'Test flat'); // first insert wins, not overwritten
+});
+
+test('upsertListing drops short-term/nightly listings at the source — this bot is long-term-lease only', () => {
+  const db = openDb(':memory:');
+  assert.equal(upsertListing(db, listing({ id: 'daily', isShortTerm: true })), false);
+  const rows = db.prepare('SELECT * FROM listings WHERE id = ?').all(listingKey(listing({ id: 'daily' })));
+  assert.equal(rows.length, 0); // never stored, not even flagged — no downstream filter can leak it back in
 });
 
 test('upsertListing persists description, getCandidateListings round-trips it', () => {

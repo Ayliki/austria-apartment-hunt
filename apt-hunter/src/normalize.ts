@@ -14,6 +14,7 @@ export interface NormalizedListing {
   lon: number | null;
   isPrivate: boolean | null;
   requiresWaitlistTicket: boolean;
+  isShortTerm: boolean;
   images: string[];
   description: string | null;
   dateCreated: string | null;
@@ -62,6 +63,26 @@ const WAITLIST_RE = /vormerkschein|wohnticket|gemeindewohnung/i;
 
 export function detectWaitlistTicket(title: string): boolean {
   return WAITLIST_RE.test(title);
+}
+
+// Deliberately excludes bare "kurzfristig" — "kurzfristig beziehbar/verfügbar" commonly means
+// "available soon", describing move-in timing on an ordinary long-term listing, not lease length.
+// Only phrases that unambiguously describe the tenancy itself as short-stay are matched.
+const SHORT_TERM_RE =
+  /notfallwohnung|kurzzeitmiete|kurzzeitvermietung|zwischenmiete|ferienwohnung|feriendomizil|boardinghouse|serviced apartment|tageweise|wochenweise|pro nacht|pro tag|zur kurzfristigen nutzung|auf zeit vermietet/i;
+
+/** Below this €/m² floor, a "monthly" price is almost certainly a mismarked nightly/weekly rate — genuine Vienna long-term rents don't go this low. */
+const IMPLAUSIBLE_MONTHLY_PRICE_PER_SQM = 3;
+
+/**
+ * Detects nightly/weekly/vacation-style rentals mixed in among long-term listings — by title
+ * phrasing, or by an implausibly low price for the size (a strong independent signal that the
+ * price is a per-night rate mislabeled as monthly rent).
+ */
+export function detectShortTerm(title: string, price: number | null, area: number | null): boolean {
+  if (SHORT_TERM_RE.test(title)) return true;
+  if (price != null && area != null && area > 0 && price / area < IMPLAUSIBLE_MONTHLY_PRICE_PER_SQM) return true;
+  return false;
 }
 
 /** "📍 Wien, 02. Bezirk, Leopoldstadt" -> 2 */
@@ -155,6 +176,7 @@ export function normalizeWillhaben(hit: WillhabenSearchHit, detail?: WillhabenDe
     lon: detail?.lon ?? null,
     isPrivate: hit.sellerType == null ? null : hit.sellerType === 'private',
     requiresWaitlistTicket: detectWaitlistTicket(hit.title),
+    isShortTerm: detectShortTerm(hit.title, hit.price, hit.area),
     images: detail?.images ?? [],
     description: detail?.description ?? null,
     dateCreated: hit.dateCreated,
@@ -184,6 +206,7 @@ export function normalizeImmoscout(raw: any, detail?: any): NormalizedListing {
     lon: raw.lon ?? null,
     isPrivate: typeof raw.isPrivate === 'boolean' ? raw.isPrivate : null,
     requiresWaitlistTicket: raw.isSocialHousing === true,
+    isShortTerm: detectShortTerm(raw.title ?? '', raw.price ?? null, raw.area ?? null),
     images: detail?.images
       ? detail.images.map((i: { url: string }) => i.url)
       : raw.imageUrl ? [raw.imageUrl] : [],
