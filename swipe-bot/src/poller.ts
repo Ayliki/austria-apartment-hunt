@@ -1,7 +1,7 @@
 import { huntBothSources, type HuntOptions } from 'apt-hunter/dist/hunt.js';
 import { dedupeListings } from 'apt-hunter/dist/dedupe.js';
 import { scoreValue } from 'apt-hunter/dist/score.js';
-import { type DB, type UserPrefs, getAllUserPrefs, upsertListing } from './db.js';
+import { type DB, type ListingRow, type UserPrefs, getAllUserPrefs, getListingsByIds, listingKey, upsertListing } from './db.js';
 
 /** Loosest bound across all users — never restricts a poll to less than any single user needs. */
 export function widestFilter(allPrefs: UserPrefs[]): HuntOptions | null {
@@ -21,19 +21,20 @@ export function widestFilter(allPrefs: UserPrefs[]): HuntOptions | null {
   return { priceFrom, priceTo, areaFrom, areaTo, roomsFrom, roomsTo, districts, location: 'Wien', maxPages: 6 };
 }
 
-export async function runPoll(db: DB, opts: { maxPages?: number } = {}): Promise<{ inserted: number; warnings: string[] }> {
+/** Newly inserted listings from this poll (never seen before by anyone), plus any warnings. */
+export async function runPoll(db: DB, opts: { maxPages?: number } = {}): Promise<{ inserted: ListingRow[]; warnings: string[] }> {
   const allPrefs = getAllUserPrefs(db);
   const filter = widestFilter(allPrefs);
-  if (!filter) return { inserted: 0, warnings: [] };
+  if (!filter) return { inserted: [], warnings: [] };
   if (opts.maxPages != null) filter.maxPages = opts.maxPages;
 
   const { listings, warnings } = await huntBothSources(filter);
   const { merged } = dedupeListings(listings);
   scoreValue(merged);
 
-  let inserted = 0;
+  const insertedIds: string[] = [];
   for (const l of merged) {
-    if (upsertListing(db, l)) inserted++;
+    if (upsertListing(db, l)) insertedIds.push(listingKey(l));
   }
-  return { inserted, warnings };
+  return { inserted: getListingsByIds(db, insertedIds), warnings };
 }

@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb } from './db.js';
 import { createBot } from './bot.js';
 import { runPoll } from './poller.js';
+import { notifyNewMatches } from './notify.js';
 
 const POLL_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3h, matches apt-hunter's LaunchAgent cadence
 
@@ -13,12 +14,14 @@ async function main(): Promise<void> {
   const here = dirname(fileURLToPath(import.meta.url)); // swipe-bot/dist
   const dbPath = process.env.SWIPE_BOT_DB_PATH ?? join(here, '..', 'data', 'bot.sqlite');
   const db = openDb(dbPath);
+  const bot = createBot(db, token);
 
   const poll = async () => {
     try {
       const { inserted, warnings } = await runPoll(db);
       for (const w of warnings) console.error('WARNING:', w);
-      console.log(`poll: ${inserted} new listings`);
+      console.log(`poll: ${inserted.length} new listings`);
+      await notifyNewMatches(bot.telegram, db, inserted);
     } catch (err) {
       console.error('poll failed:', err);
     }
@@ -26,8 +29,6 @@ async function main(): Promise<void> {
 
   await poll(); // seed the DB immediately on startup, then on the interval
   setInterval(poll, POLL_INTERVAL_MS);
-
-  const bot = createBot(db, token);
 
   // Register signal handlers before launching: launch() in long-polling mode
   // never resolves while the bot is running, so handlers registered after

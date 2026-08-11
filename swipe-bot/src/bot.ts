@@ -135,16 +135,8 @@ export function buildMediaGroup(images: string[], caption: string): MediaGroupIt
   }));
 }
 
-async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
-  if (!getUserPrefs(db, chatId)) {
-    await telegram.sendMessage(chatId, 'You haven\'t set your preferences yet — send /start to get set up.');
-    return;
-  }
-  const card = nextCardFor(db, chatId);
-  if (!card) {
-    await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
-    return;
-  }
+/** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
+export async function sendCard(telegram: Telegraf['telegram'], chatId: number, card: ListingRow): Promise<void> {
   const caption = formatCaption(card);
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
@@ -160,6 +152,19 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
   } else {
     await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
   }
+}
+
+async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
+  if (!getUserPrefs(db, chatId)) {
+    await telegram.sendMessage(chatId, 'You haven\'t set your preferences yet — send /start to get set up.');
+    return;
+  }
+  const card = nextCardFor(db, chatId);
+  if (!card) {
+    await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
+    return;
+  }
+  await sendCard(telegram, chatId, card);
 }
 
 export function createBot(db: DB, token: string): Telegraf {

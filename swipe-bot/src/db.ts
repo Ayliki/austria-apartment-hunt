@@ -3,6 +3,9 @@ import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
 export type DB = Database.Database;
 
+/** Fixed chatId used by the MCP server's stateless tool calls — never a real Telegram chat, so pushes must skip it. */
+export const MCP_CHAT_ID = 0;
+
 export interface UserPrefs {
   chatId: number;
   priceFrom: number | null;
@@ -236,6 +239,29 @@ export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): 
 
   const rows = db.prepare(`SELECT l.* FROM listings l WHERE ${clauses.join(' AND ')}`).all(params) as Record<string, unknown>[];
   return rows.map(rowToListing);
+}
+
+export function getListingsByIds(db: DB, ids: string[]): ListingRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map((_, i) => `@id${i}`).join(', ');
+  const params: Record<string, unknown> = {};
+  ids.forEach((id, i) => { params[`id${i}`] = id; });
+  const rows = db.prepare(`SELECT * FROM listings WHERE id IN (${placeholders})`).all(params) as Record<string, unknown>[];
+  return rows.map(rowToListing);
+}
+
+/** Pure equivalent of getCandidateListings's WHERE clause, for filtering an in-memory batch (e.g. a poll's fresh inserts) without a query per listing. Mirrors its null-handling exactly: a null listing field always passes price/area/rooms bounds, but a null district fails a district restriction. */
+export function matchesPrefs(l: ListingRow, prefs: UserPrefs): boolean {
+  if (prefs.priceFrom != null && l.price != null && l.price < prefs.priceFrom) return false;
+  if (prefs.priceTo != null && l.price != null && l.price > prefs.priceTo) return false;
+  if (prefs.areaFrom != null && l.area != null && l.area < prefs.areaFrom) return false;
+  if (prefs.areaTo != null && l.area != null && l.area > prefs.areaTo) return false;
+  if (prefs.roomsFrom != null && l.rooms != null && l.rooms < prefs.roomsFrom) return false;
+  if (prefs.roomsTo != null && l.rooms != null && l.rooms > prefs.roomsTo) return false;
+  if (prefs.districts != null && prefs.districts.length > 0) {
+    if (l.district == null || !prefs.districts.includes(l.district)) return false;
+  }
+  return true;
 }
 
 export function getSwipedWithDirection(db: DB, chatId: number): { listing: ListingRow; direction: 'like' | 'pass' }[] {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
   recordSwipe, getShortlist, getCandidateListings, getSwipedWithDirection,
+  getListingsByIds, matchesPrefs, type ListingRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
@@ -125,4 +126,50 @@ test('getSwipedWithDirection returns listing + direction pairs', () => {
   assert.equal(swiped.length, 1);
   assert.equal(swiped[0].direction, 'like');
   assert.equal(swiped[0].listing.district, 6);
+});
+
+test('getListingsByIds returns only the requested rows, in no particular guaranteed order', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
+  upsertListing(db, listing({ id: 'b' }));
+  upsertListing(db, listing({ id: 'c' }));
+  const rows = getListingsByIds(db, ['willhaben:a', 'willhaben:c']);
+  assert.deepEqual(rows.map((r) => r.id).sort(), ['willhaben:a', 'willhaben:c']);
+});
+
+test('getListingsByIds returns an empty array for an empty id list, without querying', () => {
+  const db = openDb(':memory:');
+  assert.deepEqual(getListingsByIds(db, []), []);
+});
+
+function row(overrides: Partial<ListingRow>): ListingRow {
+  return {
+    id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
+    area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
+    description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+test('matchesPrefs: a null listing field always passes price/area/rooms bounds', () => {
+  const prefs = { chatId: 1, priceFrom: 500, priceTo: 800, districts: null, roomsFrom: 1, roomsTo: 3, areaFrom: 30, areaTo: 60 };
+  assert.equal(matchesPrefs(row({ price: null, area: null, rooms: null }), prefs), true);
+});
+
+test('matchesPrefs: an out-of-range price/area/rooms fails', () => {
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null };
+  assert.equal(matchesPrefs(row({ price: 900 }), prefs), false);
+  assert.equal(matchesPrefs(row({ price: 700 }), prefs), true);
+});
+
+test('matchesPrefs: a null district FAILS a district restriction (mirrors the SQL IN clause, no OR-NULL escape hatch)', () => {
+  const prefs = { chatId: 1, priceFrom: null, priceTo: null, districts: [6, 7], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null };
+  assert.equal(matchesPrefs(row({ district: null }), prefs), false);
+  assert.equal(matchesPrefs(row({ district: 6 }), prefs), true);
+  assert.equal(matchesPrefs(row({ district: 9 }), prefs), false);
+});
+
+test('matchesPrefs: unrestricted prefs (all null) match anything', () => {
+  const prefs = { chatId: 1, priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null };
+  assert.equal(matchesPrefs(row({ price: 5000, area: 5, rooms: 10, district: 23 }), prefs), true);
 });

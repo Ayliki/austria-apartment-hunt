@@ -6,12 +6,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   type DB, type ListingRow, type UserPrefs,
-  openDb, recordSwipe, getShortlist, getUserPrefs, setUserPrefs,
+  openDb, recordSwipe, getShortlist, getUserPrefs, setUserPrefs, MCP_CHAT_ID,
 } from './db.js';
 import { nextCardFor } from './bot.js';
 
-/** Telegram chat ids are never 0 — this sentinel can never collide with a real Telegram user's profile. */
-export const MCP_CHAT_ID = 0;
+export { MCP_CHAT_ID };
 
 export function formatCardPayload(l: ListingRow) {
   return {

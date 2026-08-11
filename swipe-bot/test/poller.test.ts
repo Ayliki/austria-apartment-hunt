@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { widestFilter } from '../src/poller.js';
-import type { UserPrefs } from '../src/db.js';
+import { widestFilter, runPoll } from '../src/poller.js';
+import { openDb, type UserPrefs } from '../src/db.js';
 
 function prefs(overrides: Partial<UserPrefs>): UserPrefs {
   return { chatId: 1, priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, ...overrides };
@@ -49,4 +49,11 @@ test('widestFilter always sets location=Wien and a generous maxPages', () => {
   const filter = widestFilter([prefs({})]);
   assert.equal(filter!.location, 'Wien');
   assert.ok(filter!.maxPages >= 6);
+});
+
+test('runPoll returns an empty inserted list without hitting the network when there are no users yet', async () => {
+  const db = openDb(':memory:');
+  const { inserted, warnings } = await runPoll(db);
+  assert.deepEqual(inserted, []);
+  assert.deepEqual(warnings, []);
 });
