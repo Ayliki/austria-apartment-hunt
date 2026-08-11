@@ -28,13 +28,28 @@ async function main(): Promise<void> {
   };
 
   await poll(); // seed the DB immediately on startup, then on the interval
-  setInterval(poll, POLL_INTERVAL_MS);
+  const pollTimer = setInterval(poll, POLL_INTERVAL_MS);
 
   // Register signal handlers before launching: launch() in long-polling mode
   // never resolves while the bot is running, so handlers registered after
   // `await`ing it would only take effect once the bot has already stopped.
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  //
+  // The interval above keeps the event loop alive forever, so bot.stop()
+  // alone never lets the process exit — systemd's SIGTERM then times out
+  // after 90s and SIGKILLs it, and the next deploy's fresh getUpdates call
+  // collides with the still-dying old one (409 Conflict). Clear the timer
+  // and exit explicitly so shutdown is immediate.
+  const shutdown = (signal: string) => {
+    clearInterval(pollTimer);
+    try {
+      bot.stop(signal);
+    } catch (err) {
+      console.error('bot.stop failed during shutdown:', err);
+    }
+    process.exit(0);
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
 
   // Don't await: use the onLaunch callback for the startup log instead, and
   // an explicit .catch() so startup failures (e.g. bad token, network error
