@@ -11,6 +11,10 @@ export const SAFETY_NOTICE =
   'Avoid international transfers and escrow/Treuhand arrangements. ' +
   'Only use the listing\'s official contact channel.';
 
+export const ONBOARDING_INTRO =
+  'Quick 5-question setup. Reply with just the value in the format shown in each question ' +
+  '(e.g. "800", not "my budget is 800 euros") — free text won\'t parse.';
+
 const QUESTIONS = [
   'What\'s your max budget (cold, in EUR)?',
   'Min budget? (number, or "skip")',
@@ -164,11 +168,13 @@ export function createBot(db: DB, token: string): Telegraf {
   bot.start(async (ctx) => {
     setOnboardingState(db, ctx.chat.id, []);
     await ctx.reply(SAFETY_NOTICE);
+    await ctx.reply(ONBOARDING_INTRO);
     await ctx.reply(QUESTIONS[0]);
   });
 
   bot.command('settings', async (ctx) => {
     setOnboardingState(db, ctx.chat.id, []);
+    await ctx.reply(ONBOARDING_INTRO);
     await ctx.reply(QUESTIONS[0]);
   });
 

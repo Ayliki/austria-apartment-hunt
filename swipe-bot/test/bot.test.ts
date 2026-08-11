@@ -166,7 +166,8 @@ test('/start begins onboarding and asks the first question', async () => {
   await bot.handleUpdate(commandUpdate(1, '/start'));
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
   assert.match(texts[0] as string, /never transfer money/);
-  assert.equal(texts[1], 'What\'s your max budget (cold, in EUR)?');
+  assert.match(texts[1] as string, /free text won't parse/);
+  assert.equal(texts[2], 'What\'s your max budget (cold, in EUR)?');
   assert.deepEqual(getOnboardingState(db, 1), []);
 });
 
