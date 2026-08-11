@@ -20,38 +20,40 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Sunny two-room flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: ['https://img/1.jpg'],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
+    requiresWaitlistTicket: false,
     ...overrides,
   };
 }
 
-test('parseOnboardingAnswers parses budget, districts, rooms, size answers', () => {
-  const prefs = parseOnboardingAnswers(['800', '400', '1-9', '1-2', '30-60']);
+test('parseOnboardingAnswers parses budget, districts, rooms, size, waitlist-housing answers', () => {
+  const prefs = parseOnboardingAnswers(['800', '400', '1-9', '1-2', '30-60', 'no']);
   assert.deepEqual(prefs, {
     priceTo: 800, priceFrom: 400, districts: [1, 2, 3, 4, 5, 6, 7, 8, 9],
-    roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60,
+    roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60, includeWaitlistHousing: false,
   });
 });
 
 test('parseOnboardingAnswers treats "skip"/"any" as unbounded for optional answers', () => {
-  const prefs = parseOnboardingAnswers(['800', 'skip', 'any', 'any', 'any']);
+  const prefs = parseOnboardingAnswers(['800', 'skip', 'any', 'any', 'any', 'yes']);
   assert.deepEqual(prefs, {
     priceTo: 800, priceFrom: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
+    includeWaitlistHousing: true,
   });
 });
 
 test('parseOnboardingAnswers rejects a non-numeric required budget', () => {
-  assert.throws(() => parseOnboardingAnswers(['not a number', 'skip', 'any', 'any', 'any']), /budget/i);
+  assert.throws(() => parseOnboardingAnswers(['not a number', 'skip', 'any', 'any', 'any', 'yes']), /budget/i);
 });
 
 test('nextCardFor returns null when the candidate queue is empty', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   assert.equal(nextCardFor(db, 1), null);
 });
 
 test('nextCardFor returns the top-ranked candidate, excluding already-swiped', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   upsertListing(db, listing({ id: 'b', price: 700 }));
   recordSwipe(db, 1, 'willhaben:a', 'pass');
@@ -82,6 +84,14 @@ test('formatCaption truncates to Telegram\'s 1024-char caption limit instead of 
   const caption = formatCaption(row({ description: longDescription }));
   assert.ok(caption.length <= 1024, `caption was ${caption.length} chars`);
   assert.ok(caption.endsWith('…'));
+});
+
+test('formatCaption flags municipal/waitlist housing, and only when it actually requires one', () => {
+  const flagged = formatCaption(row({ requiresWaitlistTicket: true }));
+  assert.match(flagged, /⚠️ Municipal\/waitlist housing/);
+
+  const unflagged = formatCaption(row({ requiresWaitlistTicket: false }));
+  assert.doesNotMatch(unflagged, /⚠️/);
 });
 
 test('buildMediaGroup attaches the caption to only the first item', () => {
@@ -187,13 +197,40 @@ test('completing onboarding step by step saves prefs and reports no candidates y
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
   assert.equal(getOnboardingState(db, 1), null);
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
   assert.match(texts.at(-2) as string, /Preferences saved/);
   assert.match(texts.at(-1) as string, /No new listings right now/);
+});
+
+test('an invalid answer to the waitlist-housing question re-asks it without losing the first five answers', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+  await bot.handleUpdate(textUpdate(1, 'maybe'));
+
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.match(texts.at(-1) as string, /reply with "yes" or "no"/);
+  assert.deepEqual(getOnboardingState(db, 1), ['800', 'skip', 'any', 'any', 'any']);
+});
+
+test('opting out of waitlist housing during onboarding excludes it from the pushed queue', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'gemeindewohnung', price: 500, requiresWaitlistTicket: true }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'no']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /No new listings right now/); // the only listing was waitlist housing, excluded
 });
 
 test('a restart mid-onboarding does not drop progress — this is the bug that shipped', async () => {
@@ -229,7 +266,7 @@ test('free text outside onboarding is ignored, not echoed or errored', async () 
 
 test('a 👍 swipe records the shortlist entry and sends the next card', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));

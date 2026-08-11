@@ -9,6 +9,7 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
+    requiresWaitlistTicket: false,
     ...overrides,
   };
 }
@@ -34,7 +35,7 @@ function testTelegram(): { telegram: Telegram; calls: Call[] } {
 
 test('notifyNewMatches does nothing when there are no new listings', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   const { telegram, calls } = testTelegram();
   await notifyNewMatches(telegram, db, []);
   assert.equal(calls.length, 0);
@@ -42,7 +43,7 @@ test('notifyNewMatches does nothing when there are no new listings', async () =>
 
 test('notifyNewMatches pushes a matching listing to a user whose prefs it satisfies', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })]);
@@ -53,7 +54,7 @@ test('notifyNewMatches pushes a matching listing to a user whose prefs it satisf
 
 test('notifyNewMatches skips a user whose prefs the listing does not satisfy', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 900 })]);
@@ -63,7 +64,7 @@ test('notifyNewMatches skips a user whose prefs the listing does not satisfy', a
 
 test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: MCP_CHAT_ID, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: MCP_CHAT_ID, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })]);
@@ -73,7 +74,7 @@ test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
 
 test('notifyNewMatches caps the burst per user and mentions the remainder', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   const { telegram, calls } = testTelegram();
 
   const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
@@ -87,10 +88,20 @@ test('notifyNewMatches caps the burst per user and mentions the remainder', asyn
   assert.equal(cardMessages.length, MAX_PUSH_PER_USER);
 });
 
+test('notifyNewMatches never pushes municipal/waitlist housing to a user who opted out', async () => {
+  const db = openDb(':memory:');
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false });
+  const { telegram, calls } = testTelegram();
+
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, requiresWaitlistTicket: true })]);
+
+  assert.equal(calls.length, 0);
+});
+
 test('notifyNewMatches sends separate, independent pushes to different matching users', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
-  setUserPrefs(db, { chatId: 2, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
+  setUserPrefs(db, { chatId: 2, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })]);

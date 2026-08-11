@@ -12,7 +12,7 @@ export const SAFETY_NOTICE =
   'Only use the listing\'s official contact channel.';
 
 export const ONBOARDING_INTRO =
-  'Quick 5-question setup. Reply with just the value in the format shown in each question ' +
+  'Quick 6-question setup. Reply with just the value in the format shown in each question ' +
   '(e.g. "800", not "my budget is 800 euros") — free text won\'t parse.';
 
 const QUESTIONS = [
@@ -21,6 +21,8 @@ const QUESTIONS = [
   'Districts? e.g. "1-9" or "6,7,9", or "any"',
   'Rooms, min-max? e.g. "1-2", or "any"',
   'Size in m², min-max? e.g. "30-60", or "any"',
+  'Include municipal/waitlist housing (Gemeindewohnung, Genossenschaft, Direktvergabe)? ' +
+  'These usually need a Vormerkschein, Wohnticket, or Wiener Wohnen registration — not everyone qualifies. Reply "yes" or "no".',
 ];
 
 function parseRange(s: string): [number | null, number | null] {
@@ -67,9 +69,16 @@ function parseRoomsOrSize(s: string): [number | null, number | null] {
   return parseRange(s);
 }
 
+function parseYesNo(s: string): boolean {
+  const trimmed = s.trim().toLowerCase();
+  if (['yes', 'y', 'ja', 'j'].includes(trimmed)) return true;
+  if (['no', 'n', 'nein'].includes(trimmed)) return false;
+  throw new Error('reply with "yes" or "no"');
+}
+
 /** One parser per onboarding question, in order. Each throws Error with a user-facing message on invalid input. */
 const STEP_PARSERS: ((raw: string) => unknown)[] = [
-  parseBudgetMax, parseBudgetMin, parseDistrictsAnswer, parseRoomsOrSize, parseRoomsOrSize,
+  parseBudgetMax, parseBudgetMin, parseDistrictsAnswer, parseRoomsOrSize, parseRoomsOrSize, parseYesNo,
 ];
 
 /** Validates a single onboarding answer against its question's parser. Throws on invalid input. */
@@ -77,14 +86,15 @@ export function parseOnboardingStep(index: number, raw: string): void {
   STEP_PARSERS[index](raw);
 }
 
-/** Pure parser for the 5-question onboarding wizard answers, in order. Throws Error with a user-facing message. */
+/** Pure parser for the 6-question onboarding wizard answers, in order. Throws Error with a user-facing message. */
 export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chatId'> {
   const priceTo = parseBudgetMax(answers[0]);
   const priceFrom = parseBudgetMin(answers[1]);
   const districts = parseDistrictsAnswer(answers[2]);
   const [roomsFrom, roomsTo] = parseRoomsOrSize(answers[3]);
   const [areaFrom, areaTo] = parseRoomsOrSize(answers[4]);
-  return { priceFrom, priceTo, districts, roomsFrom, roomsTo, areaFrom, areaTo };
+  const includeWaitlistHousing = parseYesNo(answers[5]);
+  return { priceFrom, priceTo, districts, roomsFrom, roomsTo, areaFrom, areaTo, includeWaitlistHousing };
 }
 
 /** Top-ranked, not-yet-swiped listing for this user, or null if the queue is empty. */
@@ -105,14 +115,17 @@ function truncate(s: string, maxLen: number): string {
   return s.slice(0, maxLen - 1).trimEnd() + '…';
 }
 
-/** Pure — builds the card caption (title, price/size/rooms/district, description, link). Exported for direct testing. */
+/** Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, description, link). Exported for direct testing. */
 export function formatCaption(l: ListingRow): string {
   const price = l.price != null ? `€${l.price}` : 'price n/a';
   const area = l.area != null ? `${l.area}m²` : '';
   const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
   const district = l.district != null ? `district ${l.district}` : '';
   const details = [area, rooms, district].filter(Boolean).join(' · ');
-  const base = `${l.title}\n${price} · ${details}\n${l.url}`;
+  const flag = l.requiresWaitlistTicket
+    ? '\n⚠️ Municipal/waitlist housing — needs a Vormerkschein, Wohnticket, or Wiener Wohnen registration.'
+    : '';
+  const base = `${l.title}\n${price} · ${details}${flag}\n${l.url}`;
   const full = l.description ? `${base}\n\n${l.description}` : base;
   return truncate(full, MAX_CAPTION_LENGTH);
 }

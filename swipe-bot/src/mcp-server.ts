@@ -24,6 +24,7 @@ export function formatCardPayload(l: ListingRow) {
     images: l.images,
     description: l.description,
     valueFlag: l.valueFlag,
+    requiresWaitlistTicket: l.requiresWaitlistTicket,
   };
 }
 
@@ -35,6 +36,7 @@ interface PrefsArgs {
   rooms_to?: number;
   area_from?: number;
   area_to?: number;
+  include_waitlist_housing?: boolean;
 }
 
 export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId'> {
@@ -46,6 +48,7 @@ export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId'> {
     roomsTo: args.rooms_to ?? null,
     areaFrom: args.area_from ?? null,
     areaTo: args.area_to ?? null,
+    includeWaitlistHousing: args.include_waitlist_housing ?? true,
   };
 }
 
@@ -129,6 +132,11 @@ function buildServer(db: DB): McpServer {
         rooms_to: z.number().optional(),
         area_from: z.number().optional().describe('Min size in m²'),
         area_to: z.number().optional().describe('Max size in m²'),
+        include_waitlist_housing: z.boolean().optional().describe(
+          'Include municipal/non-profit housing that requires a Vormerkschein, Wohnticket, or Wiener ' +
+          'Wohnen registration (Gemeindewohnung, Genossenschaft, Direktvergabe)? Not everyone is eligible ' +
+          'for these. Defaults to true.'
+        ),
       },
     },
     async (args) => {
