@@ -214,7 +214,10 @@ export function createBot(db: DB, token: string): Telegraf {
     deleteOnboardingState(db, chatId);
     const parsed = parseOnboardingAnswers(answers);
     setUserPrefs(db, { chatId, ...parsed });
-    await ctx.reply('Preferences saved. Here\'s your first card:');
+    await ctx.reply(
+      'Preferences saved. New listings get checked every ~3h, not instantly — ' +
+      'I\'ll message you here as soon as something matches. Anything I already have queued up:'
+    );
     await sendNextCard(ctx.telegram, chatId, db);
   });
 
