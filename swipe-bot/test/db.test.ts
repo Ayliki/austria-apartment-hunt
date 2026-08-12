@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
   recordSwipe, getShortlist, getCandidateListings, getSwipedWithDirection,
-  getListingsByIds, matchesPrefs, getCommuteTimes, setCommuteTimes, type ListingRow,
+  getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, type ListingRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
@@ -37,6 +37,18 @@ test('upsertListing drops short-term/nightly listings at the source — this bot
   assert.equal(upsertListing(db, listing({ id: 'daily', isShortTerm: true })), false);
   const rows = db.prepare('SELECT * FROM listings WHERE id = ?').all(listingKey(listing({ id: 'daily' })));
   assert.equal(rows.length, 0); // never stored, not even flagged — no downstream filter can leak it back in
+});
+
+test('getAllListingIds returns every stored id, prefixed by source', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: '1', source: 'willhaben' }));
+  upsertListing(db, listing({ id: '1', source: 'immoscout' }));
+  assert.deepEqual([...getAllListingIds(db)].sort(), ['immoscout:1', 'willhaben:1']);
+});
+
+test('getAllListingIds returns an empty set for a fresh db', () => {
+  const db = openDb(':memory:');
+  assert.deepEqual(getAllListingIds(db), new Set());
 });
 
 test('upsertListing persists description, getCandidateListings round-trips it', () => {

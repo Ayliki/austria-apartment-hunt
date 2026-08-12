@@ -308,6 +308,12 @@ export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): 
   return rows.map(rowToListing);
 }
 
+/** All known listing ids (e.g. 'willhaben:123'), for deciding what's genuinely new before an expensive enrichment call. */
+export function getAllListingIds(db: DB): Set<string> {
+  const rows = db.prepare('SELECT id FROM listings').all() as { id: string }[];
+  return new Set(rows.map((r) => r.id));
+}
+
 export function getListingsByIds(db: DB, ids: string[]): ListingRow[] {
   if (ids.length === 0) return [];
   const placeholders = ids.map((_, i) => `@id${i}`).join(', ');

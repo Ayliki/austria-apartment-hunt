@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { widestFilter, runPoll } from '../src/poller.js';
+import { widestFilter, runPoll, isNewListingPredicate } from '../src/poller.js';
 import { openDb, type UserPrefs } from '../src/db.js';
 
 function prefs(overrides: Partial<UserPrefs>): UserPrefs {
@@ -59,4 +59,21 @@ test('runPoll returns an empty inserted list without hitting the network when th
   const { inserted, warnings } = await runPoll(db);
   assert.deepEqual(inserted, []);
   assert.deepEqual(warnings, []);
+});
+
+test('isNewListingPredicate rejects ids already stored under that source', () => {
+  const isNew = isNewListingPredicate(new Set(['willhaben:1', 'immoscout:2']));
+  assert.equal(isNew('willhaben', '1'), false);
+  assert.equal(isNew('immoscout', '2'), false);
+});
+
+test('isNewListingPredicate accepts an id not yet stored, including across sources', () => {
+  const isNew = isNewListingPredicate(new Set(['willhaben:1']));
+  assert.equal(isNew('willhaben', '2'), true);
+  assert.equal(isNew('immoscout', '1'), true); // same numeric id, different source — not a match
+});
+
+test('widestFilter itself stays agnostic of "new" — runPoll layers isNewListing on top per-poll, using current DB state', () => {
+  const filter = widestFilter([{ chatId: 1, priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true } as UserPrefs])!;
+  assert.equal(filter.isNewListing, undefined);
 });

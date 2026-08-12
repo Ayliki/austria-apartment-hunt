@@ -22,6 +22,25 @@ export interface HuntOptions {
   districts?: number[];
   location: string;
   maxPages: number;
+  /**
+   * Lets the caller mark which hits are worth spending an enrichment call on (e.g. "not already in my DB").
+   * Without it, enrichment just takes the first `cap` hits in search order — fine for a one-off CLI search,
+   * but in a recurring poll that's almost always the same already-known cheapest listings, starving new ones.
+   */
+  isNewListing?: (source: 'willhaben' | 'immoscout', id: string) => boolean;
+}
+
+/**
+ * Which ids to spend the enrichment cap on. With no `isNew` predicate, just the first `cap` ids in order
+ * (the original one-shot-search behavior). With one, ids `isNew` accepts go first, so a recurring poll's
+ * cap is spent on genuinely fresh listings instead of re-confirming ones it has already enriched before —
+ * the remainder pads out any leftover cap so it's never wasted.
+ */
+export function selectEnrichIds(ids: string[], cap: number, isNew?: (id: string) => boolean): Set<string> {
+  if (!isNew) return new Set(ids.slice(0, cap));
+  const fresh = ids.filter((id) => isNew(id));
+  const stale = ids.filter((id) => !isNew(id));
+  return new Set([...fresh, ...stale].slice(0, cap));
 }
 
 export interface HuntResult {
@@ -67,8 +86,18 @@ export async function huntWillhaben(opts: HuntOptions): Promise<NormalizedListin
       ? hits.filter((h) => h.district != null && opts.districts!.includes(h.district))
       : hits;
 
+    const enrichIds = selectEnrichIds(
+      kept.map((h) => h.id),
+      WILLHABEN_ENRICH_CAP,
+      opts.isNewListing ? (id) => opts.isNewListing!('willhaben', id) : undefined,
+    );
+
     const out: NormalizedListing[] = [];
-    for (const hit of kept.slice(0, WILLHABEN_ENRICH_CAP)) {
+    for (const hit of kept) {
+      if (!enrichIds.has(hit.id)) {
+        out.push(normalizeWillhaben(hit));
+        continue;
+      }
       let detail;
       try {
         detail = parseWillhabenDetailText(await conn.callToolText('willhaben_get_listing', { id: hit.id }));
@@ -77,7 +106,6 @@ export async function huntWillhaben(opts: HuntOptions): Promise<NormalizedListin
       }
       out.push(normalizeWillhaben(hit, detail));
     }
-    for (const hit of kept.slice(WILLHABEN_ENRICH_CAP)) out.push(normalizeWillhaben(hit));
     return out;
   } finally {
     await conn.close();
@@ -102,8 +130,18 @@ export async function huntImmoscout(opts: HuntOptions): Promise<NormalizedListin
     const result = JSON.parse(text);
     const hits = result.listings as { exposeId: string }[];
 
+    const enrichIds = selectEnrichIds(
+      hits.map((h) => h.exposeId),
+      IMMOSCOUT_ENRICH_CAP,
+      opts.isNewListing ? (id) => opts.isNewListing!('immoscout', id) : undefined,
+    );
+
     const out: NormalizedListing[] = [];
-    for (const hit of hits.slice(0, IMMOSCOUT_ENRICH_CAP)) {
+    for (const hit of hits) {
+      if (!enrichIds.has(hit.exposeId)) {
+        out.push(normalizeImmoscout(hit));
+        continue;
+      }
       let detail;
       try {
         detail = JSON.parse(await conn.callToolText('immoscout_get_listing', { id: hit.exposeId }));
@@ -112,7 +150,6 @@ export async function huntImmoscout(opts: HuntOptions): Promise<NormalizedListin
       }
       out.push(normalizeImmoscout(hit, detail));
     }
-    for (const hit of hits.slice(IMMOSCOUT_ENRICH_CAP)) out.push(normalizeImmoscout(hit));
     return out;
   } finally {
     await conn.close();

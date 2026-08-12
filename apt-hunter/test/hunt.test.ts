@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { combineHuntResults } from '../src/hunt.js';
+import { combineHuntResults, selectEnrichIds } from '../src/hunt.js';
 import type { NormalizedListing } from '../src/normalize.js';
 
 function listing(id: string): NormalizedListing {
@@ -35,4 +35,28 @@ test('combineHuntResults returns empty listings with two warnings when both fail
   const result = combineHuntResults(wh, is24);
   assert.deepEqual(result.listings, []);
   assert.equal(result.warnings.length, 2);
+});
+
+test('selectEnrichIds takes the first `cap` ids in order when there is no isNew predicate', () => {
+  const result = selectEnrichIds(['a', 'b', 'c', 'd'], 2);
+  assert.deepEqual([...result].sort(), ['a', 'b']);
+});
+
+test('selectEnrichIds prioritizes ids the predicate marks as new over already-known ones', () => {
+  // 'c' and 'd' are new but sort last in search order; a cap-2 slice-in-order would starve them entirely.
+  const isNew = (id: string) => id === 'c' || id === 'd';
+  const result = selectEnrichIds(['a', 'b', 'c', 'd'], 2, isNew);
+  assert.deepEqual([...result].sort(), ['c', 'd']);
+});
+
+test('selectEnrichIds pads out leftover cap with already-known ids once all new ones are included', () => {
+  const isNew = (id: string) => id === 'c';
+  const result = selectEnrichIds(['a', 'b', 'c', 'd'], 2, isNew);
+  assert.equal(result.size, 2);
+  assert.ok(result.has('c')); // the one genuinely new id is never dropped
+});
+
+test('selectEnrichIds enriches everything when there are fewer ids than the cap', () => {
+  const result = selectEnrichIds(['a', 'b'], 30, () => true);
+  assert.deepEqual([...result].sort(), ['a', 'b']);
 });

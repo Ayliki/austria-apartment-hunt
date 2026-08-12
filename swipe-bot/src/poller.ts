@@ -1,7 +1,12 @@
 import { huntBothSources, type HuntOptions } from 'apt-hunter/dist/hunt.js';
 import { dedupeListings } from 'apt-hunter/dist/dedupe.js';
 import { scoreValue } from 'apt-hunter/dist/score.js';
-import { type DB, type ListingRow, type UserPrefs, getAllUserPrefs, getListingsByIds, listingKey, upsertListing } from './db.js';
+import { type DB, type ListingRow, type UserPrefs, getAllListingIds, getAllUserPrefs, getListingsByIds, listingKey, upsertListing } from './db.js';
+
+/** A hit is worth an enrichment call (coords + images) only if we haven't stored it yet — re-enriching known listings wastes the per-poll cap on data we already have. */
+export function isNewListingPredicate(existingIds: Set<string>): (source: 'willhaben' | 'immoscout', id: string) => boolean {
+  return (source, id) => !existingIds.has(`${source}:${id}`);
+}
 
 /** Loosest bound across all users — never restricts a poll to less than any single user needs. */
 export function widestFilter(allPrefs: UserPrefs[]): HuntOptions | null {
@@ -27,6 +32,7 @@ export async function runPoll(db: DB, opts: { maxPages?: number } = {}): Promise
   const filter = widestFilter(allPrefs);
   if (!filter) return { inserted: [], warnings: [] };
   if (opts.maxPages != null) filter.maxPages = opts.maxPages;
+  filter.isNewListing = isNewListingPredicate(getAllListingIds(db));
 
   const { listings, warnings } = await huntBothSources(filter);
   const { merged } = dedupeListings(listings);
