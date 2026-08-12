@@ -11,7 +11,7 @@ function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
     source: 'willhaben', id: '1', url: 'https://x/1', title: 'Flat',
     price: 650, pricePerSqm: 15, area: 43, rooms: 2, district: 6, zip: '1060',
     addressLine: null, lat: null, lon: null, isPrivate: true,
-    requiresWaitlistTicket: false, isShortTerm: false, images: [], description: null, dateCreated: '2026-08-01T00:00:00Z',
+    requiresWaitlistTicket: false, isShortTerm: false, isWg: false, images: [], description: null, dateCreated: '2026-08-01T00:00:00Z',
     ...overrides,
   };
 }
@@ -21,40 +21,40 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Sunny two-room flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: ['https://img/1.jpg'],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, lat: null, lon: null,
     ...overrides,
   };
 }
 
-test('parseOnboardingAnswers parses budget, districts, rooms, size, waitlist-housing answers', () => {
-  const prefs = parseOnboardingAnswers(['800', '400', '1-9', '1-2', '30-60', 'no']);
+test('parseOnboardingAnswers parses budget, districts, rooms, size, waitlist-housing, WG answers', () => {
+  const prefs = parseOnboardingAnswers(['800', '400', '1-9', '1-2', '30-60', 'no', 'yes']);
   assert.deepEqual(prefs, {
     priceTo: 800, priceFrom: 400, districts: [1, 2, 3, 4, 5, 6, 7, 8, 9],
-    roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60, includeWaitlistHousing: false,
+    roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60, includeWaitlistHousing: false, includeWg: true,
   });
 });
 
 test('parseOnboardingAnswers treats "skip"/"any" as unbounded for optional answers', () => {
-  const prefs = parseOnboardingAnswers(['800', 'skip', 'any', 'any', 'any', 'yes']);
+  const prefs = parseOnboardingAnswers(['800', 'skip', 'any', 'any', 'any', 'yes', 'no']);
   assert.deepEqual(prefs, {
     priceTo: 800, priceFrom: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
-    includeWaitlistHousing: true,
+    includeWaitlistHousing: true, includeWg: false,
   });
 });
 
 test('parseOnboardingAnswers rejects a non-numeric required budget', () => {
-  assert.throws(() => parseOnboardingAnswers(['not a number', 'skip', 'any', 'any', 'any', 'yes']), /budget/i);
+  assert.throws(() => parseOnboardingAnswers(['not a number', 'skip', 'any', 'any', 'any', 'yes', 'no']), /budget/i);
 });
 
 test('nextCardFor returns null when the candidate queue is empty', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   assert.equal(nextCardFor(db, 1), null);
 });
 
 test('nextCardFor returns the top-ranked candidate, excluding already-swiped', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   upsertListing(db, listing({ id: 'b', price: 700 }));
   recordSwipe(db, 1, 'willhaben:a', 'pass');
@@ -93,6 +93,14 @@ test('formatCaption flags municipal/waitlist housing, and only when it actually 
 
   const unflagged = formatCaption(row({ requiresWaitlistTicket: false }));
   assert.doesNotMatch(unflagged, /⚠️/);
+});
+
+test('formatCaption tags WG/shared-flat listings, and only those', () => {
+  const flagged = formatCaption(row({ isWg: true }));
+  assert.match(flagged, /🚪 WG/);
+
+  const unflagged = formatCaption(row({ isWg: false }));
+  assert.doesNotMatch(unflagged, /🚪/);
 });
 
 test('formatCaption appends the commute line when given one, omits it entirely otherwise', () => {
@@ -211,7 +219,7 @@ test('completing onboarding step by step saves prefs and reports no candidates y
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'skip']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
   assert.equal(getOnboardingState(db, 1), null);
@@ -239,12 +247,46 @@ test('opting out of waitlist housing during onboarding excludes it from the push
   upsertListing(db, listing({ id: 'gemeindewohnung', price: 500, requiresWaitlistTicket: true }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'no', 'skip']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'no', 'no', 'skip']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.match(texts.at(-1) as string, /No new listings right now/); // the only listing was waitlist housing, excluded
+});
+
+test('an invalid answer to the WG question re-asks it without losing the first six answers', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+  await bot.handleUpdate(textUpdate(1, 'maybe'));
+
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
+  assert.match(texts.at(-1) as string, /reply with "yes" or "no"/);
+  assert.deepEqual(getOnboardingState(db, 1), ['800', 'skip', 'any', 'any', 'any', 'yes']);
+});
+
+test('opting out of WG/shared-flat listings during onboarding excludes them from the pushed queue, opting in includes them', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'wg-room', price: 500, title: 'WG-Zimmer frei', isWg: true }));
+  const { bot: optOutBot, calls: optOutCalls } = createTestBot(db);
+  await optOutBot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
+    await optOutBot.handleUpdate(textUpdate(1, answer));
+  }
+  const optOutTexts = optOutCalls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(optOutTexts.at(-1) as string, /No new listings right now/); // the only listing was a WG room, excluded
+
+  const { bot: optInBot, calls: optInCalls } = createTestBot(db);
+  await optInBot.handleUpdate(commandUpdate(2, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'yes', 'skip']) {
+    await optInBot.handleUpdate(textUpdate(2, answer));
+  }
+  const optInTexts = optInCalls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(optInTexts.at(-1) as string, /🚪 WG/);
 });
 
 test('a successfully geocoded commute destination is saved and shown on the next card', async () => {
@@ -255,7 +297,7 @@ test('a successfully geocoded commute destination is saved and shown on the next
     computeCommute: async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' }),
   });
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'TU Wien']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'TU Wien']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
@@ -268,11 +310,11 @@ test('an unresolvable commute destination re-asks the question instead of saving
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'nowhere']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'nowhere']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
-  assert.equal(getOnboardingState(db, 1)?.length, 6); // still mid-onboarding, waiting on the commute question
+  assert.equal(getOnboardingState(db, 1)?.length, 7); // still mid-onboarding, waiting on the commute question
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.match(texts.at(-1) as string, /couldn't find that location/);
 });
@@ -282,7 +324,7 @@ test('"skip" on the commute question saves no destination and shows no commute l
   upsertListing(db, listing({ id: 'a', price: 500, lat: 48.19, lon: 16.37 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'skip']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
@@ -293,7 +335,7 @@ test('"skip" on the commute question saves no destination and shows no commute l
 
 test('getCommuteLineFor returns null when the user has no commute destination, or the listing has no coordinates', async () => {
   const db = openDb(':memory:');
-  const noDestPrefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const noDestPrefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(await getCommuteLineFor(db, 1, row({ lat: 48.19, lon: 16.37 }), noDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null })), null);
 
   const withDestPrefs = { ...noDestPrefs, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
@@ -302,7 +344,7 @@ test('getCommuteLineFor returns null when the user has no commute destination, o
 
 test('getCommuteLineFor caches the computed result and does not recompute on a second call', async () => {
   const db = openDb(':memory:');
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
   let calls = 0;
   const computeCommute = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 12, transitMinutes: null, transitSummary: null }; };
 
@@ -347,7 +389,7 @@ test('free text outside onboarding is ignored, not echoed or errored', async () 
 
 test('a 👍 swipe records the shortlist entry and sends the next card', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));

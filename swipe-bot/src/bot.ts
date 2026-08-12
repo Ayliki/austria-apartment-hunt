@@ -21,11 +21,11 @@ export const SAFETY_NOTICE =
   'Only use the listing\'s official contact channel.';
 
 export const ONBOARDING_INTRO =
-  'Quick 7-question setup. Reply with just the value in the format shown in each question ' +
+  'Quick 8-question setup. Reply with just the value in the format shown in each question ' +
   '(e.g. "800", not "my budget is 800 euros") — free text won\'t parse.';
 
 /** Index of the commute-destination question — handled separately in bot.on('text') since it needs an async geocoding call, unlike every other step's synchronous parser. */
-const COMMUTE_STEP_INDEX = 6;
+const COMMUTE_STEP_INDEX = 7;
 
 const QUESTIONS = [
   'What\'s your max budget (cold, in EUR)?',
@@ -35,6 +35,7 @@ const QUESTIONS = [
   'Size in m², min-max? e.g. "30-60", or "any"',
   'Include municipal/waitlist housing (Gemeindewohnung, Genossenschaft, Direktvergabe)? ' +
   'These usually need a Vormerkschein, Wohnticket, or Wiener Wohnen registration — not everyone qualifies. Reply "yes" or "no".',
+  'Include WG/shared-flat rooms, co-living, and student rooms? Reply "yes" or "no".',
   'Daily commute destination? e.g. "TU Wien" or an address — I\'ll show walk/transit times to it on every card. Reply "skip" for none.',
 ];
 
@@ -91,7 +92,7 @@ function parseYesNo(s: string): boolean {
 
 /** One parser per onboarding question, in order. Each throws Error with a user-facing message on invalid input. */
 const STEP_PARSERS: ((raw: string) => unknown)[] = [
-  parseBudgetMax, parseBudgetMin, parseDistrictsAnswer, parseRoomsOrSize, parseRoomsOrSize, parseYesNo,
+  parseBudgetMax, parseBudgetMin, parseDistrictsAnswer, parseRoomsOrSize, parseRoomsOrSize, parseYesNo, parseYesNo,
 ];
 
 /** Validates a single onboarding answer against its question's parser. Throws on invalid input. */
@@ -107,7 +108,8 @@ export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chat
   const [roomsFrom, roomsTo] = parseRoomsOrSize(answers[3]);
   const [areaFrom, areaTo] = parseRoomsOrSize(answers[4]);
   const includeWaitlistHousing = parseYesNo(answers[5]);
-  return { priceFrom, priceTo, districts, roomsFrom, roomsTo, areaFrom, areaTo, includeWaitlistHousing };
+  const includeWg = parseYesNo(answers[6]);
+  return { priceFrom, priceTo, districts, roomsFrom, roomsTo, areaFrom, areaTo, includeWaitlistHousing, includeWg };
 }
 
 /** Top-ranked, not-yet-swiped listing for this user, or null if the queue is empty. */
@@ -138,8 +140,9 @@ export function formatCaption(l: ListingRow, commuteLine?: string | null): strin
   const flag = l.requiresWaitlistTicket
     ? '\n⚠️ Municipal/waitlist housing — needs a Vormerkschein, Wohnticket, or Wiener Wohnen registration.'
     : '';
+  const wgFlag = l.isWg ? '\n🚪 WG — shared flat / co-living / student room, not a whole apartment.' : '';
   const commute = commuteLine ? `\n${commuteLine}` : '';
-  const base = `${l.title}\n${price} · ${details}${flag}${commute}\n${l.url}`;
+  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${commute}\n${l.url}`;
   const full = l.description ? `${base}\n\n${l.description}` : base;
   return truncate(full, MAX_CAPTION_LENGTH);
 }

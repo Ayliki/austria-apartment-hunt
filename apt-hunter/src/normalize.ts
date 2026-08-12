@@ -15,6 +15,7 @@ export interface NormalizedListing {
   isPrivate: boolean | null;
   requiresWaitlistTicket: boolean;
   isShortTerm: boolean;
+  isWg: boolean;
   images: string[];
   description: string | null;
   dateCreated: string | null;
@@ -83,6 +84,21 @@ export function detectShortTerm(title: string, price: number | null, area: numbe
   if (SHORT_TERM_RE.test(title)) return true;
   if (price != null && area != null && area > 0 && price / area < IMPLAUSIBLE_MONTHLY_PRICE_PER_SQM) return true;
   return false;
+}
+
+// Phrases that describe a whole apartment as merely *suitable* for a WG, not a room being let
+// within one — stripped before matching so they can't trigger a false positive below.
+const WG_SUITABLE_RE = /wg-geeignet|wg-tauglich|wg-fähig|statt\s+wg/gi;
+
+// Only matches after WG_SUITABLE_RE has stripped the "suitable for" phrasing above.
+const WG_RE = /\bwg\b|wg-zimmer|\d+er-wg|wohngemeinschaft|co-living|studenten(zimmer|-wg)|studentinnen(zimmer|-wg)/i;
+
+/**
+ * Detects a room in a shared flat (WG-Zimmer), a co-living room, or a student room — title only,
+ * since descriptions routinely mention "ideal für eine Studenten-WG" about ordinary whole flats.
+ */
+export function detectWG(title: string): boolean {
+  return WG_RE.test(title.replace(WG_SUITABLE_RE, ''));
 }
 
 /** "📍 Wien, 02. Bezirk, Leopoldstadt" -> 2 */
@@ -177,6 +193,7 @@ export function normalizeWillhaben(hit: WillhabenSearchHit, detail?: WillhabenDe
     isPrivate: hit.sellerType == null ? null : hit.sellerType === 'private',
     requiresWaitlistTicket: detectWaitlistTicket(hit.title),
     isShortTerm: detectShortTerm(hit.title, hit.price, hit.area),
+    isWg: detectWG(hit.title),
     images: detail?.images ?? [],
     description: detail?.description ?? null,
     dateCreated: hit.dateCreated,
@@ -207,6 +224,7 @@ export function normalizeImmoscout(raw: any, detail?: any): NormalizedListing {
     isPrivate: typeof raw.isPrivate === 'boolean' ? raw.isPrivate : null,
     requiresWaitlistTicket: raw.isSocialHousing === true,
     isShortTerm: detectShortTerm(raw.title ?? '', raw.price ?? null, raw.area ?? null),
+    isWg: detectWG(raw.title ?? ''),
     images: detail?.images
       ? detail.images.map((i: { url: string }) => i.url)
       : raw.imageUrl ? [raw.imageUrl] : [],

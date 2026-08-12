@@ -6,7 +6,7 @@ import { openDb, type UserPrefs } from '../src/db.js';
 function prefs(overrides: Partial<UserPrefs>): UserPrefs {
   return {
     chatId: 1, priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
-    includeWaitlistHousing: true, ...overrides,
+    includeWaitlistHousing: true, includeWg: true, ...overrides,
   };
 }
 

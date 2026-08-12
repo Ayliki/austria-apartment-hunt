@@ -8,6 +8,7 @@ import {
   normalizeImmoscout,
   detectWaitlistTicket,
   detectShortTerm,
+  detectWG,
 } from '../src/normalize.js';
 
 test('parseAustrianNumber handles Austrian formats', () => {
@@ -162,6 +163,23 @@ test('detectShortTerm catches an implausibly low monthly price for the size, eve
 test('detectShortTerm tolerates missing price/area (never flags on nulls alone)', () => {
   assert.equal(detectShortTerm('Sanierte Garconniere im 2. Liftstock', null, null), false);
   assert.equal(detectShortTerm('Sanierte Garconniere im 2. Liftstock', 650, null), false);
+});
+
+test('detectWG catches explicit WG-room, co-living, and student-room titles', () => {
+  assert.equal(detectWG('WG-Zimmer frei'), true);
+  assert.equal(detectWG('Zimmer in 3er-WG nur für 1 Dame, möbliert, ab sofort'), true);
+  assert.equal(detectWG('Ladies Frauen WG - Zimmer'), true);
+  assert.equal(detectWG('CO-LIVING 1070 - die neue Art der Wohngemeinschaft!'), true);
+  assert.equal(detectWG('Studenten-Zimmer in WG! 649EUR inklusive Strom'), true);
+  assert.equal(detectWG('20qm WG-Studentenzimmer, Uni-Nähe, 1090 Wien für Studentinnen'), true);
+});
+
+test('detectWG does not flag whole apartments merely described as WG-suitable', () => {
+  assert.equal(detectWG('2-Zimmer-Wohnung, sehr schön und ruhig, WG-geeignet. U-Bahn'), false);
+  assert.equal(detectWG('TAUSCHWOHNUNG Wohnung in Wien Meidling: Top-Anbindung & WG-tauglich'), false);
+  assert.equal(detectWG('Privat wohnen statt WG-Chaos: Apartments ab € 750,-'), false);
+  assert.equal(detectWG('RUHIGE 1 ZIMMER INNENHOF-WOHNUNG IM 1.OG IN U-BAHN NÄHE'), false);
+  assert.equal(detectWG('Sanierte Garconniere im 2. Liftstock'), false);
 });
 
 // Real immoscout_search_real_estate JSON element shape (from immoscout-mcp Task 3 output).

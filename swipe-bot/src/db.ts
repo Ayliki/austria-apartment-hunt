@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
+import { detectWG } from 'apt-hunter/dist/normalize.js';
 
 export type DB = Database.Database;
 
@@ -17,6 +18,8 @@ export interface UserPrefs {
   areaTo: number | null;
   /** False excludes listings that require a waitlist/registration (Gemeindewohnung etc.) — not everyone is eligible for those. */
   includeWaitlistHousing: boolean;
+  /** False (the default) excludes WG-Zimmer, co-living, and student-room listings (apt-hunter's detectWG). */
+  includeWg: boolean;
   /** Free-text label for the geocoded commute destination (e.g. "TU Wien"), or null if none set. */
   commuteDestination: string | null;
   commuteLat: number | null;
@@ -40,6 +43,8 @@ export interface ListingRow {
   firstSeen: string;
   /** Municipal/non-profit housing requiring a Vormerkschein, Wohnticket, or Wiener Wohnen registration — not open to everyone. */
   requiresWaitlistTicket: boolean;
+  /** A room in a shared flat, co-living, or student housing (apt-hunter's detectWG) — not a whole apartment. */
+  isWg: boolean;
   lat: number | null;
   lon: number | null;
 }
@@ -57,6 +62,7 @@ CREATE TABLE IF NOT EXISTS listings (
   value_flag TEXT,
   first_seen TEXT NOT NULL,
   requires_waitlist_ticket INTEGER NOT NULL DEFAULT 0,
+  is_wg INTEGER NOT NULL DEFAULT 0,
   lat REAL, lon REAL
 );
 
@@ -67,6 +73,7 @@ CREATE TABLE IF NOT EXISTS user_prefs (
   rooms_from REAL, rooms_to REAL,
   area_from REAL, area_to REAL,
   include_waitlist_housing INTEGER NOT NULL DEFAULT 1,
+  include_wg INTEGER NOT NULL DEFAULT 0,
   commute_destination TEXT, commute_lat REAL, commute_lon REAL,
   updated_at TEXT NOT NULL
 );
@@ -124,11 +131,26 @@ function migrate(db: DB): void {
     db.exec('ALTER TABLE listings ADD COLUMN lat REAL');
     db.exec('ALTER TABLE listings ADD COLUMN lon REAL');
   }
+  if (!listingColumns.includes('is_wg')) {
+    db.exec('ALTER TABLE listings ADD COLUMN is_wg INTEGER NOT NULL DEFAULT 0');
+    // Backfill from titles already in the DB — otherwise WG listings stored before this
+    // migration would never get flagged (they're only re-checked on insert, not on read).
+    const rows = db.prepare('SELECT id, title FROM listings').all() as { id: string; title: string }[];
+    const update = db.prepare('UPDATE listings SET is_wg = ? WHERE id = ?');
+    const backfill = db.transaction((rows: { id: string; title: string }[]) => {
+      for (const r of rows) update.run(detectWG(r.title) ? 1 : 0, r.id);
+    });
+    backfill(rows);
+  }
 
   const prefsColumns = (db.prepare('PRAGMA table_info(user_prefs)').all() as { name: string }[]).map((c) => c.name);
   if (!prefsColumns.includes('include_waitlist_housing')) {
     // Default existing users to true (include) — matches pre-migration behavior of showing everything.
     db.exec('ALTER TABLE user_prefs ADD COLUMN include_waitlist_housing INTEGER NOT NULL DEFAULT 1');
+  }
+  if (!prefsColumns.includes('include_wg')) {
+    // Default existing users to false (hide) — unlike waitlist housing, hiding WGs is the point of this feature.
+    db.exec('ALTER TABLE user_prefs ADD COLUMN include_wg INTEGER NOT NULL DEFAULT 0');
   }
   if (!prefsColumns.includes('commute_destination')) {
     db.exec('ALTER TABLE user_prefs ADD COLUMN commute_destination TEXT');
@@ -158,6 +180,7 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
     valueFlag: row.value_flag as 'good' | 'fair' | 'premium' | null,
     firstSeen: row.first_seen as string,
     requiresWaitlistTicket: Boolean(row.requires_waitlist_ticket),
+    isWg: Boolean(row.is_wg),
     lat: row.lat as number | null,
     lon: row.lon as number | null,
   };
@@ -171,8 +194,8 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
 export function upsertListing(db: DB, l: NormalizedListing): boolean {
   if (l.isShortTerm) return false;
   const result = db.prepare(`
-    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, lat, lon)
-    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @lat, @lon)
+    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, is_wg, lat, lon)
+    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @isWg, @lat, @lon)
   `).run({
     id: listingKey(l),
     source: l.source,
@@ -189,6 +212,7 @@ export function upsertListing(db: DB, l: NormalizedListing): boolean {
     valueFlag: l.valueFlag ?? null,
     firstSeen: new Date().toISOString(),
     requiresWaitlistTicket: l.requiresWaitlistTicket ? 1 : 0,
+    isWg: l.isWg ? 1 : 0,
     lat: l.lat,
     lon: l.lon,
   });
@@ -211,6 +235,7 @@ function rowToPrefs(row: Record<string, unknown>): UserPrefs {
     areaFrom: row.area_from as number | null,
     areaTo: row.area_to as number | null,
     includeWaitlistHousing: Boolean(row.include_waitlist_housing),
+    includeWg: Boolean(row.include_wg),
     commuteDestination: row.commute_destination as string | null,
     commuteLat: row.commute_lat as number | null,
     commuteLon: row.commute_lon as number | null,
@@ -224,13 +249,14 @@ export function getUserPrefs(db: DB, chatId: number): UserPrefs | null {
 
 export function setUserPrefs(db: DB, prefs: UserPrefs): void {
   db.prepare(`
-    INSERT INTO user_prefs (chat_id, price_from, price_to, districts, rooms_from, rooms_to, area_from, area_to, include_waitlist_housing, commute_destination, commute_lat, commute_lon, updated_at)
-    VALUES (@chatId, @priceFrom, @priceTo, @districts, @roomsFrom, @roomsTo, @areaFrom, @areaTo, @includeWaitlistHousing, @commuteDestination, @commuteLat, @commuteLon, @updatedAt)
+    INSERT INTO user_prefs (chat_id, price_from, price_to, districts, rooms_from, rooms_to, area_from, area_to, include_waitlist_housing, include_wg, commute_destination, commute_lat, commute_lon, updated_at)
+    VALUES (@chatId, @priceFrom, @priceTo, @districts, @roomsFrom, @roomsTo, @areaFrom, @areaTo, @includeWaitlistHousing, @includeWg, @commuteDestination, @commuteLat, @commuteLon, @updatedAt)
     ON CONFLICT(chat_id) DO UPDATE SET
       price_from = excluded.price_from, price_to = excluded.price_to, districts = excluded.districts,
       rooms_from = excluded.rooms_from, rooms_to = excluded.rooms_to,
       area_from = excluded.area_from, area_to = excluded.area_to,
       include_waitlist_housing = excluded.include_waitlist_housing,
+      include_wg = excluded.include_wg,
       commute_destination = excluded.commute_destination, commute_lat = excluded.commute_lat, commute_lon = excluded.commute_lon,
       updated_at = excluded.updated_at
   `).run({
@@ -243,6 +269,7 @@ export function setUserPrefs(db: DB, prefs: UserPrefs): void {
     areaFrom: prefs.areaFrom,
     areaTo: prefs.areaTo,
     includeWaitlistHousing: prefs.includeWaitlistHousing ? 1 : 0,
+    includeWg: prefs.includeWg ? 1 : 0,
     commuteDestination: prefs.commuteDestination,
     commuteLat: prefs.commuteLat,
     commuteLon: prefs.commuteLon,
@@ -303,6 +330,9 @@ export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): 
   if (!prefs.includeWaitlistHousing) {
     clauses.push('l.requires_waitlist_ticket = 0');
   }
+  if (!prefs.includeWg) {
+    clauses.push('l.is_wg = 0');
+  }
 
   const rows = db.prepare(`SELECT l.* FROM listings l WHERE ${clauses.join(' AND ')}`).all(params) as Record<string, unknown>[];
   return rows.map(rowToListing);
@@ -335,6 +365,7 @@ export function matchesPrefs(l: ListingRow, prefs: UserPrefs): boolean {
     if (l.district == null || !prefs.districts.includes(l.district)) return false;
   }
   if (!prefs.includeWaitlistHousing && l.requiresWaitlistTicket) return false;
+  if (!prefs.includeWg && l.isWg) return false;
   return true;
 }
 

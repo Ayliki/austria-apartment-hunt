@@ -31,6 +31,7 @@ export function formatCardPayload(l: ListingRow, commuteLine?: string | null) {
     description: l.description,
     valueFlag: l.valueFlag,
     requiresWaitlistTicket: l.requiresWaitlistTicket,
+    isWg: l.isWg,
     commute: commuteLine ?? null,
   };
 }
@@ -44,6 +45,7 @@ interface PrefsArgs {
   area_from?: number;
   area_to?: number;
   include_waitlist_housing?: boolean;
+  include_wg?: boolean;
 }
 
 /** Maps the non-commute fields; commute_destination needs an async geocode call, handled separately in the swipe_set_prefs handler. */
@@ -57,6 +59,7 @@ export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId' | 'commu
     areaFrom: args.area_from ?? null,
     areaTo: args.area_to ?? null,
     includeWaitlistHousing: args.include_waitlist_housing ?? true,
+    includeWg: args.include_wg ?? false,
   };
 }
 
@@ -150,6 +153,10 @@ function buildServer(db: DB, deps: McpDeps): McpServer {
           'Include municipal/non-profit housing that requires a Vormerkschein, Wohnticket, or Wiener ' +
           'Wohnen registration (Gemeindewohnung, Genossenschaft, Direktvergabe)? Not everyone is eligible ' +
           'for these. Defaults to true.'
+        ),
+        include_wg: z.boolean().optional().describe(
+          'Include WG-Zimmer (shared-flat rooms), co-living, and student rooms — not whole apartments? ' +
+          'Defaults to false.'
         ),
         commute_destination: z.string().optional().describe(
           'Daily commute destination, e.g. "TU Wien" or an address. Geocoded server-side; every future ' +
