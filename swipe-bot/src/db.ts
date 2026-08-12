@@ -17,6 +17,10 @@ export interface UserPrefs {
   areaTo: number | null;
   /** False excludes listings that require a waitlist/registration (Gemeindewohnung etc.) — not everyone is eligible for those. */
   includeWaitlistHousing: boolean;
+  /** Free-text label for the geocoded commute destination (e.g. "TU Wien"), or null if none set. */
+  commuteDestination: string | null;
+  commuteLat: number | null;
+  commuteLon: number | null;
 }
 
 export interface ListingRow {
@@ -36,6 +40,8 @@ export interface ListingRow {
   firstSeen: string;
   /** Municipal/non-profit housing requiring a Vormerkschein, Wohnticket, or Wiener Wohnen registration — not open to everyone. */
   requiresWaitlistTicket: boolean;
+  lat: number | null;
+  lon: number | null;
 }
 
 const SCHEMA = `
@@ -50,7 +56,8 @@ CREATE TABLE IF NOT EXISTS listings (
   url TEXT NOT NULL,
   value_flag TEXT,
   first_seen TEXT NOT NULL,
-  requires_waitlist_ticket INTEGER NOT NULL DEFAULT 0
+  requires_waitlist_ticket INTEGER NOT NULL DEFAULT 0,
+  lat REAL, lon REAL
 );
 
 CREATE TABLE IF NOT EXISTS user_prefs (
@@ -60,7 +67,18 @@ CREATE TABLE IF NOT EXISTS user_prefs (
   rooms_from REAL, rooms_to REAL,
   area_from REAL, area_to REAL,
   include_waitlist_housing INTEGER NOT NULL DEFAULT 1,
+  commute_destination TEXT, commute_lat REAL, commute_lon REAL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS commute_cache (
+  chat_id INTEGER NOT NULL,
+  listing_id TEXT NOT NULL,
+  walk_minutes INTEGER,
+  transit_minutes INTEGER,
+  transit_summary TEXT,
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY (chat_id, listing_id)
 );
 
 CREATE TABLE IF NOT EXISTS swipes (
@@ -102,11 +120,20 @@ function migrate(db: DB): void {
   if (!listingColumns.includes('requires_waitlist_ticket')) {
     db.exec('ALTER TABLE listings ADD COLUMN requires_waitlist_ticket INTEGER NOT NULL DEFAULT 0');
   }
+  if (!listingColumns.includes('lat')) {
+    db.exec('ALTER TABLE listings ADD COLUMN lat REAL');
+    db.exec('ALTER TABLE listings ADD COLUMN lon REAL');
+  }
 
   const prefsColumns = (db.prepare('PRAGMA table_info(user_prefs)').all() as { name: string }[]).map((c) => c.name);
   if (!prefsColumns.includes('include_waitlist_housing')) {
     // Default existing users to true (include) — matches pre-migration behavior of showing everything.
     db.exec('ALTER TABLE user_prefs ADD COLUMN include_waitlist_housing INTEGER NOT NULL DEFAULT 1');
+  }
+  if (!prefsColumns.includes('commute_destination')) {
+    db.exec('ALTER TABLE user_prefs ADD COLUMN commute_destination TEXT');
+    db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lat REAL');
+    db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lon REAL');
   }
 }
 
@@ -131,6 +158,8 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
     valueFlag: row.value_flag as 'good' | 'fair' | 'premium' | null,
     firstSeen: row.first_seen as string,
     requiresWaitlistTicket: Boolean(row.requires_waitlist_ticket),
+    lat: row.lat as number | null,
+    lon: row.lon as number | null,
   };
 }
 
@@ -142,8 +171,8 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
 export function upsertListing(db: DB, l: NormalizedListing): boolean {
   if (l.isShortTerm) return false;
   const result = db.prepare(`
-    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket)
-    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket)
+    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, lat, lon)
+    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @lat, @lon)
   `).run({
     id: listingKey(l),
     source: l.source,
@@ -160,6 +189,8 @@ export function upsertListing(db: DB, l: NormalizedListing): boolean {
     valueFlag: l.valueFlag ?? null,
     firstSeen: new Date().toISOString(),
     requiresWaitlistTicket: l.requiresWaitlistTicket ? 1 : 0,
+    lat: l.lat,
+    lon: l.lon,
   });
   return result.changes > 0;
 }
@@ -180,6 +211,9 @@ function rowToPrefs(row: Record<string, unknown>): UserPrefs {
     areaFrom: row.area_from as number | null,
     areaTo: row.area_to as number | null,
     includeWaitlistHousing: Boolean(row.include_waitlist_housing),
+    commuteDestination: row.commute_destination as string | null,
+    commuteLat: row.commute_lat as number | null,
+    commuteLon: row.commute_lon as number | null,
   };
 }
 
@@ -190,13 +224,15 @@ export function getUserPrefs(db: DB, chatId: number): UserPrefs | null {
 
 export function setUserPrefs(db: DB, prefs: UserPrefs): void {
   db.prepare(`
-    INSERT INTO user_prefs (chat_id, price_from, price_to, districts, rooms_from, rooms_to, area_from, area_to, include_waitlist_housing, updated_at)
-    VALUES (@chatId, @priceFrom, @priceTo, @districts, @roomsFrom, @roomsTo, @areaFrom, @areaTo, @includeWaitlistHousing, @updatedAt)
+    INSERT INTO user_prefs (chat_id, price_from, price_to, districts, rooms_from, rooms_to, area_from, area_to, include_waitlist_housing, commute_destination, commute_lat, commute_lon, updated_at)
+    VALUES (@chatId, @priceFrom, @priceTo, @districts, @roomsFrom, @roomsTo, @areaFrom, @areaTo, @includeWaitlistHousing, @commuteDestination, @commuteLat, @commuteLon, @updatedAt)
     ON CONFLICT(chat_id) DO UPDATE SET
       price_from = excluded.price_from, price_to = excluded.price_to, districts = excluded.districts,
       rooms_from = excluded.rooms_from, rooms_to = excluded.rooms_to,
       area_from = excluded.area_from, area_to = excluded.area_to,
-      include_waitlist_housing = excluded.include_waitlist_housing, updated_at = excluded.updated_at
+      include_waitlist_housing = excluded.include_waitlist_housing,
+      commute_destination = excluded.commute_destination, commute_lat = excluded.commute_lat, commute_lon = excluded.commute_lon,
+      updated_at = excluded.updated_at
   `).run({
     chatId: prefs.chatId,
     priceFrom: prefs.priceFrom,
@@ -207,6 +243,9 @@ export function setUserPrefs(db: DB, prefs: UserPrefs): void {
     areaFrom: prefs.areaFrom,
     areaTo: prefs.areaTo,
     includeWaitlistHousing: prefs.includeWaitlistHousing ? 1 : 0,
+    commuteDestination: prefs.commuteDestination,
+    commuteLat: prefs.commuteLat,
+    commuteLon: prefs.commuteLon,
     updatedAt: new Date().toISOString(),
   });
 }
@@ -291,6 +330,38 @@ export function matchesPrefs(l: ListingRow, prefs: UserPrefs): boolean {
   }
   if (!prefs.includeWaitlistHousing && l.requiresWaitlistTicket) return false;
   return true;
+}
+
+export interface CommuteTimes {
+  walkMinutes: number | null;
+  transitMinutes: number | null;
+  transitSummary: string | null;
+}
+
+/** Cached commute times for a (chat, listing) pair — Routes API calls cost quota, so each pair is computed once and reused across /next, pushes, and repeat views. */
+export function getCommuteTimes(db: DB, chatId: number, listingId: string): CommuteTimes | null {
+  const row = db.prepare('SELECT walk_minutes, transit_minutes, transit_summary FROM commute_cache WHERE chat_id = ? AND listing_id = ?')
+    .get(chatId, listingId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    walkMinutes: row.walk_minutes as number | null,
+    transitMinutes: row.transit_minutes as number | null,
+    transitSummary: row.transit_summary as string | null,
+  };
+}
+
+export function setCommuteTimes(db: DB, chatId: number, listingId: string, times: CommuteTimes): void {
+  db.prepare(`
+    INSERT INTO commute_cache (chat_id, listing_id, walk_minutes, transit_minutes, transit_summary, computed_at)
+    VALUES (@chatId, @listingId, @walkMinutes, @transitMinutes, @transitSummary, @computedAt)
+    ON CONFLICT(chat_id, listing_id) DO UPDATE SET
+      walk_minutes = excluded.walk_minutes, transit_minutes = excluded.transit_minutes,
+      transit_summary = excluded.transit_summary, computed_at = excluded.computed_at
+  `).run({
+    chatId, listingId,
+    walkMinutes: times.walkMinutes, transitMinutes: times.transitMinutes, transitSummary: times.transitSummary,
+    computedAt: new Date().toISOString(),
+  });
 }
 
 export function getSwipedWithDirection(db: DB, chatId: number): { listing: ListingRow; direction: 'like' | 'pass' }[] {

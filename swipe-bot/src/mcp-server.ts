@@ -8,11 +8,17 @@ import {
   type DB, type ListingRow, type UserPrefs,
   openDb, recordSwipe, getShortlist, getUserPrefs, setUserPrefs, MCP_CHAT_ID,
 } from './db.js';
-import { nextCardFor } from './bot.js';
+import { nextCardFor, getCommuteLineFor, type GeocodeFn, type ComputeCommuteFn } from './bot.js';
+import { geocode as realGeocode, computeCommute as realComputeCommute } from './commute.js';
 
 export { MCP_CHAT_ID };
 
-export function formatCardPayload(l: ListingRow) {
+export interface McpDeps {
+  geocode: GeocodeFn;
+  computeCommute: ComputeCommuteFn;
+}
+
+export function formatCardPayload(l: ListingRow, commuteLine?: string | null) {
   return {
     id: l.id,
     title: l.title,
@@ -25,6 +31,7 @@ export function formatCardPayload(l: ListingRow) {
     description: l.description,
     valueFlag: l.valueFlag,
     requiresWaitlistTicket: l.requiresWaitlistTicket,
+    commute: commuteLine ?? null,
   };
 }
 
@@ -39,7 +46,8 @@ interface PrefsArgs {
   include_waitlist_housing?: boolean;
 }
 
-export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId'> {
+/** Maps the non-commute fields; commute_destination needs an async geocode call, handled separately in the swipe_set_prefs handler. */
+export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId' | 'commuteDestination' | 'commuteLat' | 'commuteLon'> {
   return {
     priceTo: args.price_to,
     priceFrom: args.price_from ?? null,
@@ -60,7 +68,13 @@ function errorResult(err: unknown) {
   return { content: [{ type: 'text' as const, text: `Error: ${(err as Error).message}` }], isError: true };
 }
 
-function buildServer(db: DB): McpServer {
+async function cardWithCommute(db: DB, deps: McpDeps, card: ListingRow) {
+  const prefs = getUserPrefs(db, MCP_CHAT_ID);
+  const commuteLine = prefs ? await getCommuteLineFor(db, MCP_CHAT_ID, card, prefs, deps.computeCommute) : null;
+  return formatCardPayload(card, commuteLine);
+}
+
+function buildServer(db: DB, deps: McpDeps): McpServer {
   const server = new McpServer({ name: 'swipe-bot', version: '0.1.0' });
 
   server.registerTool(
@@ -78,7 +92,7 @@ function buildServer(db: DB): McpServer {
         }
         const card = nextCardFor(db, MCP_CHAT_ID);
         if (!card) return jsonResult({ message: 'No new listings right now — check back after the next poll (every ~3h).' });
-        return jsonResult(formatCardPayload(card));
+        return jsonResult(await cardWithCommute(db, deps, card));
       } catch (err) {
         return errorResult(err);
       }
@@ -100,7 +114,7 @@ function buildServer(db: DB): McpServer {
         const next = nextCardFor(db, MCP_CHAT_ID);
         return jsonResult({
           recorded: { listing_id, direction },
-          next: next ? formatCardPayload(next) : { message: 'No more listings right now.' },
+          next: next ? await cardWithCommute(db, deps, next) : { message: 'No more listings right now.' },
         });
       } catch (err) {
         return errorResult(err);
@@ -113,7 +127,7 @@ function buildServer(db: DB): McpServer {
     { description: 'List all listings you have liked (👍) via swipe-bot.', inputSchema: {} },
     async () => {
       try {
-        return jsonResult(getShortlist(db, MCP_CHAT_ID).map(formatCardPayload));
+        return jsonResult(getShortlist(db, MCP_CHAT_ID).map((l) => formatCardPayload(l)));
       } catch (err) {
         return errorResult(err);
       }
@@ -123,7 +137,7 @@ function buildServer(db: DB): McpServer {
   server.registerTool(
     'swipe_set_prefs',
     {
-      description: 'Set or update your Vienna apartment search preferences for swipe-bot.',
+      description: 'Set or update your Vienna apartment search preferences for swipe-bot. Overwrites all fields each call — omitted optional fields reset to unset, so include everything you want to keep, not just what changed.',
       inputSchema: {
         price_to: z.number().describe('Max monthly rent (cold) in EUR'),
         price_from: z.number().optional().describe('Min monthly rent in EUR'),
@@ -137,11 +151,22 @@ function buildServer(db: DB): McpServer {
           'Wohnen registration (Gemeindewohnung, Genossenschaft, Direktvergabe)? Not everyone is eligible ' +
           'for these. Defaults to true.'
         ),
+        commute_destination: z.string().optional().describe(
+          'Daily commute destination, e.g. "TU Wien" or an address. Geocoded server-side; every future ' +
+          'card will show walk/transit ETAs to it. Omit to clear any previously set destination.'
+        ),
       },
     },
     async (args) => {
       try {
-        setUserPrefs(db, { chatId: MCP_CHAT_ID, ...mapPrefsArgs(args) });
+        let commute: { commuteDestination: string | null; commuteLat: number | null; commuteLon: number | null } =
+          { commuteDestination: null, commuteLat: null, commuteLon: null };
+        if (args.commute_destination) {
+          const point = await deps.geocode(args.commute_destination);
+          if (!point) return errorResult(new Error(`couldn't find location "${args.commute_destination}"`));
+          commute = { commuteDestination: args.commute_destination, commuteLat: point.lat, commuteLon: point.lon };
+        }
+        setUserPrefs(db, { chatId: MCP_CHAT_ID, ...mapPrefsArgs(args), ...commute });
         return jsonResult({ saved: true });
       } catch (err) {
         return errorResult(err);
@@ -155,7 +180,17 @@ function buildServer(db: DB): McpServer {
 const isMain = process.argv[1] && fileURLToPath(import.meta.url).endsWith(process.argv[1].replace(/\.ts$/, '.js'));
 if (isMain) {
   const here = dirname(fileURLToPath(import.meta.url)); // swipe-bot/dist
+  try {
+    process.loadEnvFile(join(here, '..', '.env')); // Claude Code launches this MCP server without an env file of its own
+  } catch {
+    // .env is optional — GOOGLE_MAPS_API_KEY just won't be set, and commute calls degrade to nulls
+  }
   const dbPath = process.env.SWIPE_BOT_DB_PATH ?? join(here, '..', 'data', 'bot.sqlite');
   const db = openDb(dbPath);
-  await buildServer(db).connect(new StdioServerTransport());
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY ?? '';
+  const deps: McpDeps = {
+    geocode: (address) => realGeocode(address, apiKey),
+    computeCommute: (origin, destination) => realComputeCommute(origin, destination, apiKey),
+  };
+  await buildServer(db, deps).connect(new StdioServerTransport());
 }

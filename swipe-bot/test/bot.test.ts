@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, MAX_MEDIA_GROUP_ITEMS } from '../src/bot.js';
-import { openDb, upsertListing, setUserPrefs, getOnboardingState, recordSwipe, type ListingRow, type DB } from '../src/db.js';
+import { createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor, MAX_MEDIA_GROUP_ITEMS, type BotDeps } from '../src/bot.js';
+import type { CommuteTimes } from '../src/db.js';
+import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, type ListingRow, type DB } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -20,7 +21,7 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Sunny two-room flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: ['https://img/1.jpg'],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false,
+    requiresWaitlistTicket: false, lat: null, lon: null,
     ...overrides,
   };
 }
@@ -47,13 +48,13 @@ test('parseOnboardingAnswers rejects a non-numeric required budget', () => {
 
 test('nextCardFor returns null when the candidate queue is empty', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   assert.equal(nextCardFor(db, 1), null);
 });
 
 test('nextCardFor returns the top-ranked candidate, excluding already-swiped', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   upsertListing(db, listing({ id: 'b', price: 700 }));
   recordSwipe(db, 1, 'willhaben:a', 'pass');
@@ -94,6 +95,14 @@ test('formatCaption flags municipal/waitlist housing, and only when it actually 
   assert.doesNotMatch(unflagged, /⚠️/);
 });
 
+test('formatCaption appends the commute line when given one, omits it entirely otherwise', () => {
+  const withCommute = formatCaption(row({}), '📍 18 min walk · 7 min by tram D to TU Wien');
+  assert.match(withCommute, /📍 18 min walk · 7 min by tram D to TU Wien/);
+
+  assert.doesNotMatch(formatCaption(row({}), null), /📍/);
+  assert.doesNotMatch(formatCaption(row({})), /📍/);
+});
+
 test('buildMediaGroup attaches the caption to only the first item', () => {
   const group = buildMediaGroup(['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg'], 'my caption');
   assert.equal(group.length, 3);
@@ -130,8 +139,13 @@ let activeCalls: Call[] | null = null;
     return { message_id: activeCalls.length, date: 0, chat: { id: (payload.chat_id as number) ?? 0, type: 'private' } };
   };
 
-function createTestBot(db: DB): { bot: Telegraf; calls: Call[] } {
-  const bot = createBot(db, 'test-token');
+const DEFAULT_TEST_DEPS: BotDeps = {
+  geocode: async (address) => (address.trim().toLowerCase() === 'nowhere' ? null : { lat: 48.1986, lon: 16.3695 }),
+  computeCommute: async () => ({ walkMinutes: null, transitMinutes: null, transitSummary: null }),
+};
+
+function createTestBot(db: DB, deps: Partial<BotDeps> = {}): { bot: Telegraf; calls: Call[] } {
+  const bot = createBot(db, 'test-token', { ...DEFAULT_TEST_DEPS, ...deps });
   (bot as unknown as { botInfo: unknown }).botInfo = { id: 1, is_bot: true, first_name: 'Test', username: 'testbot' };
   const calls: Call[] = [];
   activeCalls = calls;
@@ -197,7 +211,7 @@ test('completing onboarding step by step saves prefs and reports no candidates y
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'skip']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
   assert.equal(getOnboardingState(db, 1), null);
@@ -225,12 +239,79 @@ test('opting out of waitlist housing during onboarding excludes it from the push
   upsertListing(db, listing({ id: 'gemeindewohnung', price: 500, requiresWaitlistTicket: true }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'no']) {
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'no', 'skip']) {
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.match(texts.at(-1) as string, /No new listings right now/); // the only listing was waitlist housing, excluded
+});
+
+test('a successfully geocoded commute destination is saved and shown on the next card', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500, lat: 48.19, lon: 16.37 }));
+  const { bot, calls } = createTestBot(db, {
+    geocode: async () => ({ lat: 48.1986, lon: 16.3695 }),
+    computeCommute: async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' }),
+  });
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'TU Wien']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+
+  assert.equal(getUserPrefs(db, 1)!.commuteDestination, 'TU Wien');
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /18 min walk · 7 min by tram D to TU Wien/);
+});
+
+test('an unresolvable commute destination re-asks the question instead of saving garbage', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'nowhere']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+
+  assert.equal(getOnboardingState(db, 1)?.length, 6); // still mid-onboarding, waiting on the commute question
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /couldn't find that location/);
+});
+
+test('"skip" on the commute question saves no destination and shows no commute line', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500, lat: 48.19, lon: 16.37 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'skip']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+
+  assert.equal(getUserPrefs(db, 1)!.commuteDestination, null);
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.doesNotMatch(texts.at(-1) as string, /📍/);
+});
+
+test('getCommuteLineFor returns null when the user has no commute destination, or the listing has no coordinates', async () => {
+  const db = openDb(':memory:');
+  const noDestPrefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  assert.equal(await getCommuteLineFor(db, 1, row({ lat: 48.19, lon: 16.37 }), noDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null })), null);
+
+  const withDestPrefs = { ...noDestPrefs, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  assert.equal(await getCommuteLineFor(db, 1, row({ lat: null, lon: null }), withDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null })), null);
+});
+
+test('getCommuteLineFor caches the computed result and does not recompute on a second call', async () => {
+  const db = openDb(':memory:');
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  let calls = 0;
+  const computeCommute = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 12, transitMinutes: null, transitSummary: null }; };
+
+  const listingRow = row({ id: 'willhaben:cached', lat: 48.19, lon: 16.37 });
+  const first = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute);
+  const second = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute);
+
+  assert.equal(first, second);
+  assert.equal(calls, 1);
 });
 
 test('a restart mid-onboarding does not drop progress — this is the bug that shipped', async () => {
@@ -266,7 +347,7 @@ test('free text outside onboarding is ignored, not echoed or errored', async () 
 
 test('a 👍 swipe records the shortlist entry and sends the next card', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));

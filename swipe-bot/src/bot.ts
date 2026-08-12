@@ -1,10 +1,19 @@
 import { Telegraf, Markup } from 'telegraf';
 import {
-  type DB, type UserPrefs, type ListingRow,
+  type DB, type UserPrefs, type ListingRow, type CommuteTimes,
   getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist,
-  getOnboardingState, setOnboardingState, deleteOnboardingState,
+  getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes,
 } from './db.js';
 import { rankListings } from './scoring.js';
+import { formatCommuteLine, type GeoPoint } from './commute.js';
+
+export type GeocodeFn = (address: string) => Promise<GeoPoint | null>;
+export type ComputeCommuteFn = (origin: GeoPoint, destination: GeoPoint) => Promise<CommuteTimes>;
+
+export interface BotDeps {
+  geocode: GeocodeFn;
+  computeCommute: ComputeCommuteFn;
+}
 
 export const SAFETY_NOTICE =
   'Standing safety rule: never transfer money or pay a deposit before an in-person viewing. ' +
@@ -12,8 +21,11 @@ export const SAFETY_NOTICE =
   'Only use the listing\'s official contact channel.';
 
 export const ONBOARDING_INTRO =
-  'Quick 6-question setup. Reply with just the value in the format shown in each question ' +
+  'Quick 7-question setup. Reply with just the value in the format shown in each question ' +
   '(e.g. "800", not "my budget is 800 euros") — free text won\'t parse.';
+
+/** Index of the commute-destination question — handled separately in bot.on('text') since it needs an async geocoding call, unlike every other step's synchronous parser. */
+const COMMUTE_STEP_INDEX = 6;
 
 const QUESTIONS = [
   'What\'s your max budget (cold, in EUR)?',
@@ -23,6 +35,7 @@ const QUESTIONS = [
   'Size in m², min-max? e.g. "30-60", or "any"',
   'Include municipal/waitlist housing (Gemeindewohnung, Genossenschaft, Direktvergabe)? ' +
   'These usually need a Vormerkschein, Wohnticket, or Wiener Wohnen registration — not everyone qualifies. Reply "yes" or "no".',
+  'Daily commute destination? e.g. "TU Wien" or an address — I\'ll show walk/transit times to it on every card. Reply "skip" for none.',
 ];
 
 function parseRange(s: string): [number | null, number | null] {
@@ -86,8 +99,8 @@ export function parseOnboardingStep(index: number, raw: string): void {
   STEP_PARSERS[index](raw);
 }
 
-/** Pure parser for the 6-question onboarding wizard answers, in order. Throws Error with a user-facing message. */
-export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chatId'> {
+/** Pure parser for the first 6 (of 7) onboarding answers. The 7th (commute destination) needs an async geocode call and is resolved separately in finishOnboarding. Throws Error with a user-facing message. */
+export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chatId' | 'commuteDestination' | 'commuteLat' | 'commuteLon'> {
   const priceTo = parseBudgetMax(answers[0]);
   const priceFrom = parseBudgetMin(answers[1]);
   const districts = parseDistrictsAnswer(answers[2]);
@@ -115,8 +128,8 @@ function truncate(s: string, maxLen: number): string {
   return s.slice(0, maxLen - 1).trimEnd() + '…';
 }
 
-/** Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, description, link). Exported for direct testing. */
-export function formatCaption(l: ListingRow): string {
+/** Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, commute line, description, link). Exported for direct testing. */
+export function formatCaption(l: ListingRow, commuteLine?: string | null): string {
   const price = l.price != null ? `€${l.price}` : 'price n/a';
   const area = l.area != null ? `${l.area}m²` : '';
   const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
@@ -125,7 +138,8 @@ export function formatCaption(l: ListingRow): string {
   const flag = l.requiresWaitlistTicket
     ? '\n⚠️ Municipal/waitlist housing — needs a Vormerkschein, Wohnticket, or Wiener Wohnen registration.'
     : '';
-  const base = `${l.title}\n${price} · ${details}${flag}\n${l.url}`;
+  const commute = commuteLine ? `\n${commuteLine}` : '';
+  const base = `${l.title}\n${price} · ${details}${flag}${commute}\n${l.url}`;
   const full = l.description ? `${base}\n\n${l.description}` : base;
   return truncate(full, MAX_CAPTION_LENGTH);
 }
@@ -149,8 +163,10 @@ export function buildMediaGroup(images: string[], caption: string): MediaGroupIt
 }
 
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
-export async function sendCard(telegram: Telegraf['telegram'], chatId: number, card: ListingRow): Promise<void> {
-  const caption = formatCaption(card);
+export async function sendCard(
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine?: string | null,
+): Promise<void> {
+  const caption = formatCaption(card, commuteLine);
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
@@ -167,8 +183,28 @@ export async function sendCard(telegram: Telegraf['telegram'], chatId: number, c
   }
 }
 
-async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
-  if (!getUserPrefs(db, chatId)) {
+/**
+ * Cached-or-computed commute line for one (chat, listing) pair — null if the user has no commute
+ * destination set, the listing has no coordinates, or the Routes API call failed. Cached in the DB
+ * since Routes API calls cost quota and the same listing gets re-shown across /next, pushes, and swipes.
+ */
+export async function getCommuteLineFor(
+  db: DB, chatId: number, listing: ListingRow, prefs: UserPrefs, computeCommute: ComputeCommuteFn,
+): Promise<string | null> {
+  if (prefs.commuteDestination == null || prefs.commuteLat == null || prefs.commuteLon == null) return null;
+  if (listing.lat == null || listing.lon == null) return null;
+
+  let times = getCommuteTimes(db, chatId, listing.id);
+  if (!times) {
+    times = await computeCommute({ lat: listing.lat, lon: listing.lon }, { lat: prefs.commuteLat, lon: prefs.commuteLon });
+    setCommuteTimes(db, chatId, listing.id, times);
+  }
+  return formatCommuteLine(times, prefs.commuteDestination);
+}
+
+async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB, deps: BotDeps): Promise<void> {
+  const prefs = getUserPrefs(db, chatId);
+  if (!prefs) {
     await telegram.sendMessage(chatId, 'You haven\'t set your preferences yet — send /start to get set up.');
     return;
   }
@@ -177,10 +213,30 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
     await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
     return;
   }
-  await sendCard(telegram, chatId, card);
+  const commuteLine = await getCommuteLineFor(db, chatId, card, prefs, deps.computeCommute);
+  await sendCard(telegram, chatId, card, commuteLine);
 }
 
-export function createBot(db: DB, token: string): Telegraf {
+/** Finishes onboarding: saves prefs (base fields + resolved commute destination), confirms, and shows what's already queued up. */
+async function finishOnboarding(
+  telegram: Telegraf['telegram'], db: DB, chatId: number, answers: string[],
+  commute: { destination: string | null; lat: number | null; lon: number | null }, deps: BotDeps,
+): Promise<void> {
+  deleteOnboardingState(db, chatId);
+  const parsed = parseOnboardingAnswers(answers);
+  setUserPrefs(db, {
+    chatId, ...parsed,
+    commuteDestination: commute.destination, commuteLat: commute.lat, commuteLon: commute.lon,
+  });
+  await telegram.sendMessage(
+    chatId,
+    'Preferences saved. New listings get checked every ~3h, not instantly — ' +
+    'I\'ll message you here as soon as something matches. Anything I already have queued up:'
+  );
+  await sendNextCard(telegram, chatId, db, deps);
+}
+
+export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   const bot = new Telegraf(token);
 
   bot.start(async (ctx) => {
@@ -207,36 +263,40 @@ export function createBot(db: DB, token: string): Telegraf {
   });
 
   bot.command('next', async (ctx) => {
-    await sendNextCard(ctx.telegram, ctx.chat.id, db);
+    await sendNextCard(ctx.telegram, ctx.chat.id, db, deps);
   });
 
   bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
     const answers = getOnboardingState(db, chatId);
     if (!answers) return; // not mid-onboarding, ignore free text
+    const raw = ctx.message.text;
+
+    if (answers.length === COMMUTE_STEP_INDEX) {
+      const trimmed = raw.trim();
+      if (trimmed.toLowerCase() === 'skip') {
+        await finishOnboarding(ctx.telegram, db, chatId, answers, { destination: null, lat: null, lon: null }, deps);
+        return;
+      }
+      const point = await deps.geocode(trimmed);
+      if (!point) {
+        await ctx.reply('couldn\'t find that location — try being more specific, or reply "skip"');
+        return; // keep the same question, don't advance or lose prior answers
+      }
+      await finishOnboarding(ctx.telegram, db, chatId, answers, { destination: trimmed, lat: point.lat, lon: point.lon }, deps);
+      return;
+    }
 
     try {
-      parseOnboardingStep(answers.length, ctx.message.text);
+      parseOnboardingStep(answers.length, raw);
     } catch (err) {
       await ctx.reply((err as Error).message);
       return; // keep the same question, don't advance or lose prior answers
     }
 
-    answers.push(ctx.message.text);
-    if (answers.length < QUESTIONS.length) {
-      setOnboardingState(db, chatId, answers);
-      await ctx.reply(QUESTIONS[answers.length]);
-      return;
-    }
-
-    deleteOnboardingState(db, chatId);
-    const parsed = parseOnboardingAnswers(answers);
-    setUserPrefs(db, { chatId, ...parsed });
-    await ctx.reply(
-      'Preferences saved. New listings get checked every ~3h, not instantly — ' +
-      'I\'ll message you here as soon as something matches. Anything I already have queued up:'
-    );
-    await sendNextCard(ctx.telegram, chatId, db);
+    answers.push(raw);
+    setOnboardingState(db, chatId, answers);
+    await ctx.reply(QUESTIONS[answers.length]);
   });
 
   bot.action(/^(like|pass):(.+)$/, async (ctx) => {
@@ -244,7 +304,7 @@ export function createBot(db: DB, token: string): Telegraf {
     const chatId = ctx.chat!.id;
     recordSwipe(db, chatId, listingId, direction as 'like' | 'pass');
     await ctx.answerCbQuery(direction === 'like' ? 'Saved to shortlist 👍' : 'Passed 👎');
-    await sendNextCard(ctx.telegram, chatId, db);
+    await sendNextCard(ctx.telegram, chatId, db, deps);
   });
 
   return bot;

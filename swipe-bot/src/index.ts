@@ -1,27 +1,34 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.js';
-import { createBot } from './bot.js';
+import { createBot, type BotDeps } from './bot.js';
 import { runPoll } from './poller.js';
 import { notifyNewMatches } from './notify.js';
+import { geocode, computeCommute } from './commute.js';
 
 const POLL_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3h, matches apt-hunter's LaunchAgent cadence
 
 async function main(): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN env var is required');
+  // Commute times are best-effort: an unset key just means every card ships without them (see commute.ts's error handling).
+  const mapsApiKey = process.env.GOOGLE_MAPS_API_KEY ?? '';
 
   const here = dirname(fileURLToPath(import.meta.url)); // swipe-bot/dist
   const dbPath = process.env.SWIPE_BOT_DB_PATH ?? join(here, '..', 'data', 'bot.sqlite');
   const db = openDb(dbPath);
-  const bot = createBot(db, token);
+  const deps: BotDeps = {
+    geocode: (address) => geocode(address, mapsApiKey),
+    computeCommute: (origin, destination) => computeCommute(origin, destination, mapsApiKey),
+  };
+  const bot = createBot(db, token, deps);
 
   const poll = async () => {
     try {
       const { inserted, warnings } = await runPoll(db);
       for (const w of warnings) console.error('WARNING:', w);
       console.log(`poll: ${inserted.length} new listings`);
-      await notifyNewMatches(bot.telegram, db, inserted);
+      await notifyNewMatches(bot.telegram, db, inserted, deps.computeCommute);
     } catch (err) {
       console.error('poll failed:', err);
     }

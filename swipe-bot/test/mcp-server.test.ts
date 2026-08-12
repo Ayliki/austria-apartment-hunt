@@ -8,7 +8,7 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: ['https://img/1.jpg', 'https://img/2.jpg'],
     description: 'A lovely flat.', url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false,
+    requiresWaitlistTicket: false, lat: null, lon: null,
     ...overrides,
   };
 }
@@ -17,13 +17,18 @@ test('MCP_CHAT_ID is a fixed sentinel that can never collide with a real Telegra
   assert.equal(MCP_CHAT_ID, 0);
 });
 
-test('formatCardPayload exposes id, title, price, area, rooms, district, url, images, description, valueFlag, requiresWaitlistTicket', () => {
+test('formatCardPayload exposes id, title, price, area, rooms, district, url, images, description, valueFlag, requiresWaitlistTicket, commute', () => {
   const payload = formatCardPayload(row({}));
   assert.deepEqual(payload, {
     id: 'willhaben:1', title: 'Flat', price: 650, area: 43, rooms: 2, district: 6,
     url: 'https://x/1', images: ['https://img/1.jpg', 'https://img/2.jpg'],
-    description: 'A lovely flat.', valueFlag: 'fair', requiresWaitlistTicket: false,
+    description: 'A lovely flat.', valueFlag: 'fair', requiresWaitlistTicket: false, commute: null,
   });
+});
+
+test('formatCardPayload includes the commute line when given one', () => {
+  const payload = formatCardPayload(row({}), '📍 18 min walk · 7 min by tram D to TU Wien');
+  assert.equal(payload.commute, '📍 18 min walk · 7 min by tram D to TU Wien');
 });
 
 test('formatCardPayload passes through nulls as-is (no fabricated defaults)', () => {
