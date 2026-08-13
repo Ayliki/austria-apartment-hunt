@@ -32,13 +32,16 @@ export const HELP_TEXT =
   'I find Vienna rental apartments matching your preferences and let you swipe through them, ' +
   'like a dating app.\n\n' +
   'How it works: every ~3h I check willhaben and immobilienscout24 for new matches and send them ' +
-  'here as cards — reply 👍 to save one to your shortlist, or 👎 to pass. The more you swipe, the ' +
+  'here as cards — reply 👍 to save one to your shortlist, or 👎 to pass. Swiped the wrong way? Each ' +
+  'card keeps an ↩️ Undo button until you swipe the next one. The more you swipe, the ' +
   'better matches get: I learn which price/size/district combos you tend to like.\n\n' +
   'Commands:\n' +
   '/next — see another listing right now, without waiting for the next poll\n' +
   '/shortlist — browse everything you\'ve liked, with a 🗑️ Remove button on each\n' +
   '/settings — change your budget, districts, or other preferences\n' +
   '/start — redo the setup questions from scratch\n\n' +
+  'The ⏭ Next / 📋 Shortlist / ⚙️ Settings buttons below the message box do the same as the ' +
+  'matching commands, one tap instead of typing.\n\n' +
   SAFETY_NOTICE;
 
 /** Registered via setMyCommands (in index.ts's startup, not here — createBot stays synchronous) so Telegram shows a persistent ☰ menu. */
@@ -386,7 +389,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   });
 
   bot.command('help', async (ctx) => {
-    await ctx.reply(HELP_TEXT);
+    await ctx.reply(HELP_TEXT, MAIN_KEYBOARD);
   });
 
   bot.command('shortlist', async (ctx) => {

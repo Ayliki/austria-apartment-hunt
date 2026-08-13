@@ -267,6 +267,15 @@ test('/help explains the bot without requiring prefs to already be set', async (
   assert.match(texts[0], /\/settings/);
 });
 
+test('/help attaches the persistent nav keyboard', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/help'));
+  const reply = calls.find((c) => c.method === 'sendMessage');
+  const keyboard = (reply!.payload.reply_markup as { keyboard: string[][] }).keyboard;
+  assert.deepEqual(keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
 test('an invalid onboarding answer re-asks the same question without dropping prior progress', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
