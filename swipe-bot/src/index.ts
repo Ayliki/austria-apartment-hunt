@@ -50,6 +50,9 @@ async function main(): Promise<void> {
       await immoscoutConn.connect();
       const summary = await refreshAllListings(db, { willhaben: willhabenConn, immoscout: immoscoutConn });
       console.log('refresh:', JSON.stringify(summary));
+      if (summary.deletionSkippedFor.length > 0) {
+        console.error(`refresh: BLAST RADIUS GUARD TRIPPED for ${summary.deletionSkippedFor.join(', ')} — skipped this cycle's delete pass, investigate before the next sweep`);
+      }
     } catch (err) {
       console.error('refresh failed:', err);
     } finally {
@@ -61,7 +64,7 @@ async function main(): Promise<void> {
   await poll(); // seed the DB immediately on startup, then on the interval
   const pollTimer = setInterval(poll, POLL_INTERVAL_MS);
 
-  await refresh(); // backfill on first start; standing cleanup on the interval below
+  refresh(); // fire-and-forget: backfill on first start, but must never block bot.launch() — a full-DB sweep can take minutes and refresh() already has its own internal try/catch, never throws
   const refreshTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
 
   // Register signal handlers before launching: launch() in long-polling mode
