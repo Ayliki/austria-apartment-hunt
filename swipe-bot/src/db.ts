@@ -409,6 +409,33 @@ export function recordSwipe(db: DB, chatId: number, listingId: string, direction
   return true;
 }
 
+export interface LastSwipe {
+  listingId: string;
+  direction: 'like' | 'pass';
+}
+
+/** The most recent swipe recorded for a chat, or null if they haven't swiped yet. */
+export function getLastSwipe(db: DB, chatId: number): LastSwipe | null {
+  const row = db.prepare('SELECT listing_id, direction FROM swipes WHERE chat_id = ? ORDER BY swiped_at DESC, ROWID DESC LIMIT 1')
+    .get(chatId) as { listing_id: string; direction: 'like' | 'pass' } | undefined;
+  return row ? { listingId: row.listing_id, direction: row.direction } : null;
+}
+
+/**
+ * Reverses a swipe — but ONLY if `listingId` is still that chat's most recent swipe (an Undo button
+ * always targets one specific listing, but "undo" as a concept only ever means "undo the last one" —
+ * this guards a stale button tap after several more swipes happened in between). Deletes the `swipes`
+ * row (making the listing eligible for /next again) and, if it was a 'like', the `shortlist` row it
+ * created. Returns false (no-op, nothing changed) if the check fails.
+ */
+export function undoSwipe(db: DB, chatId: number, listingId: string): boolean {
+  const last = getLastSwipe(db, chatId);
+  if (!last || last.listingId !== listingId) return false;
+  db.prepare('DELETE FROM swipes WHERE chat_id = ? AND listing_id = ?').run(chatId, listingId);
+  db.prepare('DELETE FROM shortlist WHERE chat_id = ? AND listing_id = ?').run(chatId, listingId);
+  return true;
+}
+
 export function getShortlist(db: DB, chatId: number): ListingRow[] {
   const rows = db.prepare(`
     SELECT l.* FROM shortlist s JOIN listings l ON l.id = s.listing_id

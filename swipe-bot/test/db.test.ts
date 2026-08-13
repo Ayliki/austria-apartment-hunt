@@ -4,7 +4,8 @@ import {
   openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
   recordSwipe, getShortlist, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
   getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, setListingCoords,
-  getListingsBySource, applyListingRefresh, setListingDelisted, deleteDelistedUnshortlisted, type ListingRow,
+  getListingsBySource, applyListingRefresh, setListingDelisted, deleteDelistedUnshortlisted,
+  getLastSwipe, undoSwipe, type ListingRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
@@ -228,6 +229,56 @@ test('removeFromShortlist is per-user — removing for one chat does not affect 
 
   assert.equal(getShortlist(db, 1).length, 0);
   assert.equal(getShortlist(db, 2).length, 1);
+});
+
+test('getLastSwipe returns null when nothing has been swiped', () => {
+  const db = openDb(':memory:');
+  assert.equal(getLastSwipe(db, 1), null);
+});
+
+test('getLastSwipe returns the most recently swiped listing', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  upsertListing(db, listing({ id: 'b', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:a', 'pass');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  assert.deepEqual(getLastSwipe(db, 1), { listingId: 'willhaben:b', direction: 'like' });
+});
+
+test('undoSwipe reverses a like: deletes the swipe and the shortlist entry, making the listing eligible for /next again', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  assert.equal(undoSwipe(db, 1, 'willhaben:a'), true);
+  assert.equal(getShortlist(db, 1).length, 0);
+  const candidates = getCandidateListings(db, 1, defaultPrefs(1));
+  assert.deepEqual(candidates.map((c) => c.id), ['willhaben:a']);
+});
+
+test('undoSwipe reverses a pass: deletes the swipe, no shortlist entry to touch', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:a', 'pass');
+  assert.equal(undoSwipe(db, 1, 'willhaben:a'), true);
+  const candidates = getCandidateListings(db, 1, defaultPrefs(1));
+  assert.deepEqual(candidates.map((c) => c.id), ['willhaben:a']);
+});
+
+test('undoSwipe refuses to undo anything but the chat\'s most recent swipe', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  upsertListing(db, listing({ id: 'b', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'pass');
+  assert.equal(undoSwipe(db, 1, 'willhaben:a'), false); // 'a' is no longer the last swipe
+  assert.equal(getShortlist(db, 1).length, 1); // untouched
+  const candidates = getCandidateListings(db, 1, defaultPrefs(1));
+  assert.deepEqual(candidates.map((c) => c.id), []); // both still excluded
+});
+
+test('undoSwipe on a chat with no swipes at all is a no-op', () => {
+  const db = openDb(':memory:');
+  assert.equal(undoSwipe(db, 1, 'willhaben:a'), false);
 });
 
 test('getCandidateListings excludes already-swiped and filters by prefs', () => {
