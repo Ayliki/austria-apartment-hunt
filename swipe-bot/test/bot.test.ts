@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
-  appendSwipeStatus, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, type BotDeps,
+  appendSwipeStatus, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, type BotDeps,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, type ListingRow, type DB } from '../src/db.js';
@@ -114,6 +114,11 @@ test('formatCaption appends the commute line when given one, omits it entirely o
   assert.doesNotMatch(formatCaption(row({})), /📍/);
 });
 
+test('BOT_COMMANDS lists start, next, shortlist, settings, help, each with a non-empty description', () => {
+  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'settings', 'help']);
+  assert.ok(BOT_COMMANDS.every((c) => c.description.length > 0 && c.description.length <= 256)); // Telegram's setMyCommands description limit
+});
+
 test('appendSwipeStatus replaces a group-companion placeholder wholesale, rather than appending to it', () => {
   assert.equal(appendSwipeStatus('👍 or 👎?', '✅ Added to shortlist'), '✅ Added to shortlist');
   assert.equal(appendSwipeStatus('🗑️ to remove', '🗑️ Removed'), '🗑️ Removed');
@@ -216,6 +221,28 @@ test('/start begins onboarding and asks the first question', async () => {
   assert.match(texts[1] as string, /free text won't parse/);
   assert.equal(texts[2], 'What\'s your max budget (cold, in EUR)?');
   assert.deepEqual(getOnboardingState(db, 1), []);
+});
+
+test('onboarding intro explains what happens after setup, not just how to answer', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts[1], /~3h/); // poll cadence
+  assert.match(texts[1], /shortlist/i); // swiping builds a shortlist
+});
+
+test('/help explains the bot without requiring prefs to already be set', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/help'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /👍|👎/); // explains swiping
+  assert.match(texts[0], /~3h/); // explains poll cadence
+  assert.match(texts[0], /never transfer money/); // includes the safety notice
+  assert.match(texts[0], /\/shortlist/);
+  assert.match(texts[0], /\/settings/);
 });
 
 test('an invalid onboarding answer re-asks the same question without dropping prior progress', async () => {

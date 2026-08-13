@@ -21,8 +21,34 @@ export const SAFETY_NOTICE =
   'Only use the listing\'s official contact channel.';
 
 export const ONBOARDING_INTRO =
-  'Quick 8-question setup. Reply with just the value in the format shown in each question ' +
+  'I\'ll ask 8 quick questions to learn your budget, districts, size, and a few other preferences. ' +
+  'After that, I check willhaben and immobilienscout24 every ~3h and message you here as soon as ' +
+  'something matches — swipe 👍/👎 on each card to build your shortlist, and I\'ll learn what you ' +
+  'like over time. Preferences and shortlist are always editable later via /settings and /shortlist.\n\n' +
+  'Reply with just the value in the format shown in each question ' +
   '(e.g. "800", not "my budget is 800 euros") — free text won\'t parse.';
+
+export const HELP_TEXT =
+  'I find Vienna rental apartments matching your preferences and let you swipe through them, ' +
+  'like a dating app.\n\n' +
+  'How it works: every ~3h I check willhaben and immobilienscout24 for new matches and send them ' +
+  'here as cards — reply 👍 to save one to your shortlist, or 👎 to pass. The more you swipe, the ' +
+  'better matches get: I learn which price/size/district combos you tend to like.\n\n' +
+  'Commands:\n' +
+  '/next — see another listing right now, without waiting for the next poll\n' +
+  '/shortlist — browse everything you\'ve liked, with a 🗑️ Remove button on each\n' +
+  '/settings — change your budget, districts, or other preferences\n' +
+  '/start — redo the setup questions from scratch\n\n' +
+  SAFETY_NOTICE;
+
+/** Registered via setMyCommands (in index.ts's startup, not here — createBot stays synchronous) so Telegram shows a persistent ☰ menu. */
+export const BOT_COMMANDS: { command: string; description: string }[] = [
+  { command: 'start', description: 'Set up (or redo) your search preferences' },
+  { command: 'next', description: 'See another listing right now' },
+  { command: 'shortlist', description: 'Browse everything you\'ve liked' },
+  { command: 'settings', description: 'Change your preferences' },
+  { command: 'help', description: 'How this bot works' },
+];
 
 /** Index of the commute-destination question — handled separately in bot.on('text') since it needs an async geocoding call, unlike every other step's synchronous parser. */
 const COMMUTE_STEP_INDEX = 7;
@@ -308,6 +334,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     setOnboardingState(db, ctx.chat.id, []);
     await ctx.reply(ONBOARDING_INTRO);
     await ctx.reply(QUESTIONS[0]);
+  });
+
+  bot.command('help', async (ctx) => {
+    await ctx.reply(HELP_TEXT);
   });
 
   bot.command('shortlist', async (ctx) => {

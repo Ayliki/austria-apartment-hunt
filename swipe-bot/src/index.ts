@@ -1,7 +1,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.js';
-import { createBot, type BotDeps } from './bot.js';
+import { createBot, BOT_COMMANDS, type BotDeps } from './bot.js';
 import { runPoll } from './poller.js';
 import { notifyNewMatches } from './notify.js';
 import { geocode, computeCommute } from './commute.js';
@@ -22,6 +22,7 @@ async function main(): Promise<void> {
     computeCommute: (origin, destination) => computeCommute(origin, destination, mapsApiKey),
   };
   const bot = createBot(db, token, deps);
+  await bot.telegram.setMyCommands(BOT_COMMANDS); // populates Telegram's persistent ☰ menu
 
   const poll = async () => {
     try {
