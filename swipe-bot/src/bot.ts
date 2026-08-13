@@ -418,9 +418,14 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   bot.action(/^(like|pass):(.+)$/, async (ctx) => {
     const [, direction, listingId] = ctx.match;
     const chatId = ctx.chat!.id;
-    recordSwipe(db, chatId, listingId, direction as 'like' | 'pass');
-    await ctx.answerCbQuery(direction === 'like' ? 'Saved to shortlist 👍' : 'Passed 👎');
-    await clearSwipedCardButtons(ctx, direction === 'like' ? '✅ Added to shortlist' : '👎 Passed');
+    const saved = recordSwipe(db, chatId, listingId, direction as 'like' | 'pass');
+    if (direction === 'like' && !saved) {
+      await ctx.answerCbQuery('This listing is no longer available.');
+      await clearSwipedCardButtons(ctx, '⚠️ No longer available');
+    } else {
+      await ctx.answerCbQuery(direction === 'like' ? 'Saved to shortlist 👍' : 'Passed 👎');
+      await clearSwipedCardButtons(ctx, direction === 'like' ? '✅ Added to shortlist' : '👎 Passed');
+    }
     await sendNextCard(ctx.telegram, chatId, db, deps);
   });
 

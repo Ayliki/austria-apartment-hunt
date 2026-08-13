@@ -494,8 +494,27 @@ test('a 👍 swipe records the shortlist entry and sends the next card', async (
   assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('No new listings')));
 });
 
+test('a 👍 swipe on a listing deleted mid-flight (e.g. by the refresh sweep) tells the user instead of silently losing the like', async () => {
+  const db = openDb(':memory:');
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  // Note: no upsertListing — 'willhaben:a' doesn't exist, simulating one hard-deleted between card send and swipe.
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));
+
+  const answer = calls.find((c) => c.method === 'answerCallbackQuery');
+  assert.ok(answer, 'expected an answerCallbackQuery call');
+  assert.equal(answer!.payload.text, 'This listing is no longer available.');
+  assert.notEqual(answer!.payload.text, 'Saved to shortlist 👍');
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.match(edit!.payload.text as string, /⚠️ No longer available/);
+
+  assert.equal(getShortlist(db, 1).length, 0);
+});
+
 test('a swipe on a no-photo text card clears its buttons and appends a status line, instead of leaving it swipeable forever', async () => {
   const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));
 
@@ -516,6 +535,7 @@ test('a pass on a no-photo text card shows "Passed", not "Added to shortlist"', 
 
 test('a swipe on the media-group companion placeholder replaces it wholesale with the status', async () => {
   const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: '👍 or 👎?' }));
 
@@ -525,6 +545,7 @@ test('a swipe on the media-group companion placeholder replaces it wholesale wit
 
 test('a swipe on a photo card edits the caption (not the text), leaving the photo itself alone', async () => {
   const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { photo: [{ file_id: 'x', file_unique_id: 'x', width: 1, height: 1 }], caption: 'Sunny flat\n€650 · 43m²\nhttps://x/1' }));
 

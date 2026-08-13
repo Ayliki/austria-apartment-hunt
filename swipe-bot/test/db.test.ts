@@ -182,6 +182,28 @@ test('recordSwipe(like) adds to shortlist, recordSwipe(pass) does not', () => {
   assert.equal(shortlist[0].id, 'willhaben:a');
 });
 
+test('recordSwipe returns true and saves to shortlist for a like on an existing listing', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
+  const saved = recordSwipe(db, 1, 'willhaben:a', 'like');
+  assert.equal(saved, true);
+  assert.equal(getShortlist(db, 1).length, 1);
+});
+
+test('recordSwipe returns true for a pass regardless of whether the listing exists', () => {
+  const db = openDb(':memory:');
+  const saved = recordSwipe(db, 1, 'willhaben:never-existed', 'pass');
+  assert.equal(saved, true);
+  assert.equal(getShortlist(db, 1).length, 0);
+});
+
+test('recordSwipe returns false and does not save to shortlist for a like on a listing that no longer exists (e.g. deleted by the refresh sweep between card send and swipe)', () => {
+  const db = openDb(':memory:');
+  const saved = recordSwipe(db, 1, 'willhaben:deleted-mid-flight', 'like');
+  assert.equal(saved, false);
+  assert.equal(getShortlist(db, 1).length, 0);
+});
+
 test('removeFromShortlist deletes the shortlist entry but leaves the swipe (like) intact, so the listing never resurfaces in /next', () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', district: 6 }));

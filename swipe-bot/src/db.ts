@@ -389,14 +389,24 @@ export function deleteOnboardingState(db: DB, chatId: number): void {
   db.prepare('DELETE FROM onboarding_state WHERE chat_id = ?').run(chatId);
 }
 
-export function recordSwipe(db: DB, chatId: number, listingId: string, direction: 'like' | 'pass'): void {
+/**
+ * Records a swipe. For a 'like', only adds it to the shortlist if the listing still exists in
+ * `listings` — a listing can be deleted by the delisting-cleanup sweep between being sent to a user
+ * and being swiped on, and getShortlist's INNER JOIN would otherwise make that shortlist row
+ * permanently invisible with no error shown to the user. Returns false only for that one case (a
+ * 'like' on a since-deleted listing, meaning nothing was saved); true otherwise, including every
+ * 'pass'.
+ */
+export function recordSwipe(db: DB, chatId: number, listingId: string, direction: 'like' | 'pass'): boolean {
   const now = new Date().toISOString();
   db.prepare('INSERT OR IGNORE INTO swipes (chat_id, listing_id, direction, swiped_at) VALUES (?, ?, ?, ?)')
     .run(chatId, listingId, direction, now);
-  if (direction === 'like') {
-    db.prepare('INSERT OR IGNORE INTO shortlist (chat_id, listing_id, saved_at) VALUES (?, ?, ?)')
-      .run(chatId, listingId, now);
-  }
+  if (direction === 'pass') return true;
+  const exists = db.prepare('SELECT 1 FROM listings WHERE id = ?').get(listingId);
+  if (!exists) return false;
+  db.prepare('INSERT OR IGNORE INTO shortlist (chat_id, listing_id, saved_at) VALUES (?, ?, ?)')
+    .run(chatId, listingId, now);
+  return true;
 }
 
 export function getShortlist(db: DB, chatId: number): ListingRow[] {
