@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { combineHuntResults, selectEnrichIds } from '../src/hunt.js';
+import { combineHuntResults, selectEnrichIds, willhabenSpec, immoscoutSpec } from '../src/hunt.js';
 import type { NormalizedListing } from '../src/normalize.js';
 
 function listing(id: string): NormalizedListing {
@@ -59,4 +59,26 @@ test('selectEnrichIds pads out leftover cap with already-known ids once all new 
 test('selectEnrichIds enriches everything when there are fewer ids than the cap', () => {
   const result = selectEnrichIds(['a', 'b'], 30, () => true);
   assert.deepEqual([...result].sort(), ['a', 'b']);
+});
+
+test('willhabenSpec defaults to the vendored patched package, respects WILLHABEN_MCP_PATH override', () => {
+  delete process.env.WILLHABEN_MCP_PATH;
+  const spec = willhabenSpec();
+  assert.equal(spec.command, 'node');
+  assert.match(spec.args[0], /willhaben-mcp-patched\/dist\/index\.js$/);
+
+  process.env.WILLHABEN_MCP_PATH = '/custom/willhaben.js';
+  assert.deepEqual(willhabenSpec().args, ['/custom/willhaben.js']);
+  delete process.env.WILLHABEN_MCP_PATH;
+});
+
+test('immoscoutSpec defaults to the local immoscout-mcp build, respects IMMOSCOUT_MCP_PATH override', () => {
+  delete process.env.IMMOSCOUT_MCP_PATH;
+  const spec = immoscoutSpec();
+  assert.equal(spec.command, 'node');
+  assert.match(spec.args[0], /immoscout-mcp\/dist\/index\.js$/);
+
+  process.env.IMMOSCOUT_MCP_PATH = '/custom/immoscout.js';
+  assert.deepEqual(immoscoutSpec().args, ['/custom/immoscout.js']);
+  delete process.env.IMMOSCOUT_MCP_PATH;
 });

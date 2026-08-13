@@ -48,7 +48,7 @@ export interface HuntResult {
   warnings: string[];
 }
 
-function immoscoutSpec(): McpServerSpec {
+export function immoscoutSpec(): McpServerSpec {
   const here = dirname(fileURLToPath(import.meta.url)); // apt-hunter/dist
   const entry = process.env.IMMOSCOUT_MCP_PATH ?? resolve(here, '../../immoscout-mcp/dist/index.js');
   return { command: 'node', args: [entry] };
@@ -61,7 +61,7 @@ function immoscoutSpec(): McpServerSpec {
  * instead (see willhaben-mcp-patched/dist/index.js's PATCHED comment). No upstream fix exists as
  * of v1.0.2, the latest published version.
  */
-function willhabenSpec(): McpServerSpec {
+export function willhabenSpec(): McpServerSpec {
   const here = dirname(fileURLToPath(import.meta.url)); // apt-hunter/dist
   const entry = process.env.WILLHABEN_MCP_PATH ?? resolve(here, '../../willhaben-mcp-patched/dist/index.js');
   return { command: 'node', args: [entry] };
