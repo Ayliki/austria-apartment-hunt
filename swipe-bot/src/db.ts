@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
-import { detectWG } from 'apt-hunter/dist/normalize.js';
+import { detectWG, detectWaitlistTicket } from 'apt-hunter/dist/normalize.js';
 
 export type DB = Database.Database;
 
@@ -152,11 +152,33 @@ function migrate(db: DB): void {
     // Default existing users to false (hide) — unlike waitlist housing, hiding WGs is the point of this feature.
     db.exec('ALTER TABLE user_prefs ADD COLUMN include_wg INTEGER NOT NULL DEFAULT 0');
   }
+  repairMissedWaitlistFlags(db);
+
   if (!prefsColumns.includes('commute_destination')) {
     db.exec('ALTER TABLE user_prefs ADD COLUMN commute_destination TEXT');
     db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lat REAL');
     db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lon REAL');
   }
+}
+
+/**
+ * Self-heals rows whose requires_waitlist_ticket was missed at insert time — upsertListing never
+ * re-checks an already-stored row, so a title that clearly needs a waitlist ticket but was stored
+ * as requires_waitlist_ticket=0 (e.g. a batch inserted before the detector was correctly wired up)
+ * would otherwise stay wrong forever. Runs on every startup, not gated behind a schema check: it's
+ * a cheap no-op UPDATE...WHERE when nothing is mismatched, and re-running it is exactly what makes
+ * it self-healing against any future detector improvement too. Only ever flips 0 -> 1, never the
+ * reverse, so it can't accidentally hide a listing someone already sees as fine.
+ */
+function repairMissedWaitlistFlags(db: DB): void {
+  const rows = db.prepare('SELECT id, title FROM listings WHERE requires_waitlist_ticket = 0').all() as { id: string; title: string }[];
+  const mismatched = rows.filter((r) => detectWaitlistTicket(r.title));
+  if (mismatched.length === 0) return;
+  const update = db.prepare('UPDATE listings SET requires_waitlist_ticket = 1 WHERE id = ?');
+  const repair = db.transaction((rows: { id: string }[]) => {
+    for (const r of rows) update.run(r.id);
+  });
+  repair(mismatched);
 }
 
 export function listingKey(l: NormalizedListing): string {

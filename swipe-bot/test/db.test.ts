@@ -99,6 +99,33 @@ test('openDb migrates an older database predating requires_waitlist_ticket / inc
   migrated.close();
 });
 
+test('openDb repairs a listing whose requires_waitlist_ticket was missed at insert time, self-healing on every startup rather than being stuck wrong forever', () => {
+  const path = `/tmp/swipe-bot-waitlist-repair-test-${Date.now()}.sqlite`;
+  const preMigration = openDb(path);
+  // Simulates the real bug found in prod: a title that clearly needs a waitlist ticket, stored with
+  // requires_waitlist_ticket=0 (upsertListing never re-checks an already-stored row, so without a
+  // repair pass this stays wrong forever).
+  upsertListing(preMigration, listing({ id: 'a', district: 6, title: 'Gemeindewohnung zur Direktvergabe, Vormerkschein nötig', requiresWaitlistTicket: false }));
+  preMigration.close();
+
+  const migrated = openDb(path);
+  const [row] = getListingsByIds(migrated, ['willhaben:a']);
+  assert.equal(row.requiresWaitlistTicket, true); // repaired from the title alone, on reopen
+  migrated.close();
+});
+
+test('openDb\'s waitlist-ticket repair never flips an already-correctly-unflagged listing', () => {
+  const path = `/tmp/swipe-bot-waitlist-repair-test2-${Date.now()}.sqlite`;
+  const preMigration = openDb(path);
+  upsertListing(preMigration, listing({ id: 'a', district: 6, title: 'Sanierte Garconniere im 2. Liftstock', requiresWaitlistTicket: false }));
+  preMigration.close();
+
+  const migrated = openDb(path);
+  const [row] = getListingsByIds(migrated, ['willhaben:a']);
+  assert.equal(row.requiresWaitlistTicket, false);
+  migrated.close();
+});
+
 test('openDb migrates an older database predating listings.lat/lon and user_prefs.commute_destination', () => {
   const path = `/tmp/swipe-bot-migration-test-commute-${Date.now()}.sqlite`;
   const preMigration = openDb(path);
