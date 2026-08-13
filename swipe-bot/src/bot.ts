@@ -50,6 +50,9 @@ export const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: 'help', description: 'How this bot works' },
 ];
 
+/** Always-visible bottom keyboard for one-tap navigation — sent once (onboarding completion, or /start on an already-configured chat) and Telegram keeps it visible under the input field from then on. */
+export const MAIN_KEYBOARD = Markup.keyboard([['⏭ Next', '📋 Shortlist', '⚙️ Settings']]).resize();
+
 /** Index of the commute-destination question — handled separately in bot.on('text') since it needs an async geocoding call, unlike every other step's synchronous parser. */
 const COMMUTE_STEP_INDEX = 7;
 
@@ -329,9 +332,33 @@ async function finishOnboarding(
   await telegram.sendMessage(
     chatId,
     'Preferences saved. New listings get checked every ~3h, not instantly — ' +
-    'I\'ll message you here as soon as something matches. Anything I already have queued up:'
+    'I\'ll message you here as soon as something matches. Anything I already have queued up:',
+    MAIN_KEYBOARD,
   );
   await sendNextCard(telegram, chatId, db, deps);
+}
+
+/** Sends the shortlist (or its empty-state message). Shared by /shortlist and the "📋 Shortlist" keyboard button. */
+async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
+  const items = getShortlist(db, chatId);
+  if (items.length === 0) {
+    await telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
+    return;
+  }
+  const shown = items.slice(0, MAX_SHORTLIST_CARDS);
+  for (const item of shown) {
+    await sendShortlistCard(telegram, chatId, item);
+  }
+  if (items.length > MAX_SHORTLIST_CARDS) {
+    await telegram.sendMessage(chatId, `...and ${items.length - MAX_SHORTLIST_CARDS} more — narrow your prefs with /settings to see fewer at a time.`);
+  }
+}
+
+/** Restarts the onboarding wizard from question 0. Shared by /settings and the "⚙️ Settings" keyboard button. */
+async function startSettingsFor(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
+  setOnboardingState(db, chatId, []);
+  await telegram.sendMessage(chatId, ONBOARDING_INTRO);
+  await telegram.sendMessage(chatId, QUESTIONS[0]);
 }
 
 export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
@@ -342,7 +369,8 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     if (getUserPrefs(db, chatId)) {
       await ctx.reply(
         'You\'re already set up. /next for a listing, /shortlist to browse what you\'ve liked, ' +
-        'or /settings to redo your preferences from scratch.'
+        'or /settings to redo your preferences from scratch.',
+        MAIN_KEYBOARD,
       );
       return;
     }
@@ -353,9 +381,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   });
 
   bot.command('settings', async (ctx) => {
-    setOnboardingState(db, ctx.chat.id, []);
-    await ctx.reply(ONBOARDING_INTRO);
-    await ctx.reply(QUESTIONS[0]);
+    await startSettingsFor(ctx.telegram, ctx.chat.id, db);
   });
 
   bot.command('help', async (ctx) => {
@@ -363,19 +389,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   });
 
   bot.command('shortlist', async (ctx) => {
-    const chatId = ctx.chat.id;
-    const items = getShortlist(db, chatId);
-    if (items.length === 0) {
-      await ctx.reply('Your shortlist is empty — 👍 a card to save it here.');
-      return;
-    }
-    const shown = items.slice(0, MAX_SHORTLIST_CARDS);
-    for (const item of shown) {
-      await sendShortlistCard(ctx.telegram, chatId, item);
-    }
-    if (items.length > MAX_SHORTLIST_CARDS) {
-      await ctx.reply(`...and ${items.length - MAX_SHORTLIST_CARDS} more — narrow your prefs with /settings to see fewer at a time.`);
-    }
+    await sendShortlistTo(ctx.telegram, ctx.chat.id, db);
   });
 
   bot.command('next', async (ctx) => {
@@ -385,7 +399,15 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
     const answers = getOnboardingState(db, chatId);
-    if (!answers) return; // not mid-onboarding, ignore free text
+    if (!answers) {
+      // Not mid-onboarding: route the three persistent-keyboard button labels to the same logic
+      // their matching commands run. Anything else falls through unchanged (silently ignored).
+      const text = ctx.message.text;
+      if (text === '⏭ Next') { await sendNextCard(ctx.telegram, chatId, db, deps); return; }
+      if (text === '📋 Shortlist') { await sendShortlistTo(ctx.telegram, chatId, db); return; }
+      if (text === '⚙️ Settings') { await startSettingsFor(ctx.telegram, chatId, db); return; }
+      return;
+    }
     const raw = ctx.message.text;
 
     if (answers.length === COMMUTE_STEP_INDEX) {

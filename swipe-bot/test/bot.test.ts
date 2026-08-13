@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
-  appendSwipeStatus, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, type BotDeps, type GeocodeFn,
+  appendSwipeStatus, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
@@ -290,6 +290,71 @@ test('completing onboarding step by step saves prefs and reports no candidates y
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
   assert.match(texts.at(-2) as string, /Preferences saved/);
   assert.match(texts.at(-1) as string, /No new listings right now/);
+});
+
+test('finishing onboarding attaches the persistent nav keyboard to the confirmation message', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+  const confirmation = calls.find((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('Preferences saved'));
+  assert.ok(confirmation, 'expected the confirmation message');
+  const keyboard = (confirmation!.payload.reply_markup as { keyboard: string[][] }).keyboard;
+  assert.deepEqual(keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('/start on an already-configured chat also attaches the persistent nav keyboard', async () => {
+  const db = openDb(':memory:');
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  const reply = calls.find((c) => c.method === 'sendMessage');
+  const keyboard = (reply!.payload.reply_markup as { keyboard: string[][] }).keyboard;
+  assert.deepEqual(keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('tapping "⏭ Next" on the persistent keyboard sends the next card, same as /next', async () => {
+  const db = openDb(':memory:');
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(textUpdate(1, '⏭ Next'));
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€500')));
+});
+
+test('tapping "📋 Shortlist" on the persistent keyboard sends the shortlist, same as /shortlist', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(textUpdate(1, '📋 Shortlist'));
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€500')));
+});
+
+test('tapping "⚙️ Settings" on the persistent keyboard restarts onboarding, same as /settings', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes(ONBOARDING_INTRO)));
+  assert.deepEqual(getOnboardingState(db, 1), []);
+});
+
+test('mid-onboarding text always wins over a coincidentally-matching keyboard label', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  for (const answer of ['800', 'skip', 'any', 'any', 'any']) {
+    await bot.handleUpdate(textUpdate(1, answer));
+  }
+  // Onboarding is now waiting on the waitlist-housing yes/no question — send a keyboard-label-shaped
+  // string instead of "yes"/"no" and confirm it's rejected as an invalid onboarding answer, not routed
+  // to Settings (which would silently reset onboarding progress).
+  await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /reply with "yes" or "no"/);
+  assert.deepEqual(getOnboardingState(db, 1), ['800', 'skip', 'any', 'any', 'any']); // unchanged, not reset
 });
 
 test('an invalid answer to the waitlist-housing question re-asks it without losing the first five answers', async () => {
