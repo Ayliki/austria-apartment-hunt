@@ -167,8 +167,9 @@ export function formatCaption(l: ListingRow, commuteLine?: string | null): strin
     ? '\n⚠️ Municipal/waitlist housing — needs a Vormerkschein, Wohnticket, or Wiener Wohnen registration.'
     : '';
   const wgFlag = l.isWg ? '\n🚪 WG — shared flat / co-living / student room, not a whole apartment.' : '';
+  const delistedFlag = l.isDelisted ? '\n⚠️ No longer listed — likely taken down by the advertiser.' : '';
   const commute = commuteLine ? `\n${commuteLine}` : '';
-  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${commute}\n${l.url}`;
+  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${delistedFlag}${commute}\n${l.url}`;
   const full = l.description ? `${base}\n\n${l.description}` : base;
   return truncate(full, MAX_CAPTION_LENGTH);
 }

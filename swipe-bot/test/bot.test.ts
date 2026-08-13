@@ -24,7 +24,7 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Sunny two-room flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: ['https://img/1.jpg'],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, isWg: false, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, lat: null, lon: null, isDelisted: false,
     ...overrides,
   };
 }
@@ -104,6 +104,14 @@ test('formatCaption tags WG/shared-flat listings, and only those', () => {
 
   const unflagged = formatCaption(row({ isWg: false }));
   assert.doesNotMatch(unflagged, /🚪/);
+});
+
+test('formatCaption flags a delisted listing, and only when it actually is', () => {
+  const flagged = formatCaption(row({ isDelisted: true }));
+  assert.match(flagged, /⚠️ No longer listed/);
+
+  const unflagged = formatCaption(row({ isDelisted: false }));
+  assert.doesNotMatch(unflagged, /No longer listed/);
 });
 
 test('formatCaption appends the commute line when given one, omits it entirely otherwise', () => {
