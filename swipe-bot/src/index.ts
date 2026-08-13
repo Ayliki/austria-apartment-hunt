@@ -1,12 +1,16 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { McpConnection } from 'apt-hunter/dist/mcp-client.js';
+import { willhabenSpec, immoscoutSpec } from 'apt-hunter/dist/hunt.js';
 import { openDb } from './db.js';
 import { createBot, BOT_COMMANDS, type BotDeps } from './bot.js';
 import { runPoll } from './poller.js';
+import { refreshAllListings } from './refresh.js';
 import { notifyNewMatches } from './notify.js';
 import { geocode, computeCommute } from './commute.js';
 
 const POLL_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3h, matches apt-hunter's LaunchAgent cadence
+const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day is plenty at this DB's size (hundreds of rows, not thousands)
 
 async function main(): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -35,8 +39,30 @@ async function main(): Promise<void> {
     }
   };
 
+  // Refreshes photos/address for every stored listing and flags/cleans up ones taken off the site.
+  // The first run after this ships (right here, at startup) doubles as the one-time backfill for
+  // rows inserted before this feature existed — there's no separate backfill script.
+  const refresh = async () => {
+    const willhabenConn = new McpConnection(willhabenSpec());
+    const immoscoutConn = new McpConnection(immoscoutSpec());
+    try {
+      await willhabenConn.connect();
+      await immoscoutConn.connect();
+      const summary = await refreshAllListings(db, { willhaben: willhabenConn, immoscout: immoscoutConn });
+      console.log('refresh:', JSON.stringify(summary));
+    } catch (err) {
+      console.error('refresh failed:', err);
+    } finally {
+      await willhabenConn.close().catch((err) => console.error('willhaben conn close failed:', err));
+      await immoscoutConn.close().catch((err) => console.error('immoscout conn close failed:', err));
+    }
+  };
+
   await poll(); // seed the DB immediately on startup, then on the interval
   const pollTimer = setInterval(poll, POLL_INTERVAL_MS);
+
+  await refresh(); // backfill on first start; standing cleanup on the interval below
+  const refreshTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
 
   // Register signal handlers before launching: launch() in long-polling mode
   // never resolves while the bot is running, so handlers registered after
@@ -49,6 +75,7 @@ async function main(): Promise<void> {
   // and exit explicitly so shutdown is immediate.
   const shutdown = (signal: string) => {
     clearInterval(pollTimer);
+    clearInterval(refreshTimer);
     try {
       bot.stop(signal);
     } catch (err) {
