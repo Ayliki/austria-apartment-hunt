@@ -54,11 +54,22 @@ function immoscoutSpec(): McpServerSpec {
   return { command: 'node', args: [entry] };
 }
 
-const WILLHABEN_SPEC: McpServerSpec = { command: 'npx', args: ['-y', 'willhaben-mcp'] };
+/**
+ * A vendored, patched copy of the third-party willhaben-mcp (MIT) — the published package
+ * hardcodes get_listing's image list to the first 5, capping every card at 5 photos regardless
+ * of how many the listing actually has. Patched to Telegram's own sendMediaGroup ceiling of 10
+ * instead (see willhaben-mcp-patched/dist/index.js's PATCHED comment). No upstream fix exists as
+ * of v1.0.2, the latest published version.
+ */
+function willhabenSpec(): McpServerSpec {
+  const here = dirname(fileURLToPath(import.meta.url)); // apt-hunter/dist
+  const entry = process.env.WILLHABEN_MCP_PATH ?? resolve(here, '../../willhaben-mcp-patched/dist/index.js');
+  return { command: 'node', args: [entry] };
+}
 
 /** willhaben: search pages, district-filter, then enrich each hit with get_listing (coords + images). */
 export async function huntWillhaben(opts: HuntOptions): Promise<NormalizedListing[]> {
-  const conn = new McpConnection(WILLHABEN_SPEC);
+  const conn = new McpConnection(willhabenSpec());
   await conn.connect();
   try {
     const baseArgs: Record<string, unknown> = {

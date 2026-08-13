@@ -3,3 +3,8 @@ dist/
 apt-hunter/reports/
 swipe-bot/data/
 .env
+
+# willhaben-mcp-patched/dist is vendored, hand-patched source (see THIRD_PARTY_LICENSES),
+# not a build artifact of this repo — must be committed, unlike every other dist/.
+!willhaben-mcp-patched/dist/
+!willhaben-mcp-patched/dist/index.js

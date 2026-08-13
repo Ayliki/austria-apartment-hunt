@@ -5,6 +5,7 @@
   "workspaces": [
     "apt-hunter",
     "immoscout-mcp",
-    "swipe-bot"
+    "swipe-bot",
+    "willhaben-mcp-patched"
   ]
 }

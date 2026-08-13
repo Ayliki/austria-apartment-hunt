@@ -26,21 +26,3 @@ This license covers the willhaben-mcp software only. It does NOT grant any
 rights to willhaben.at, its content, data, trademarks, or services. See the
 "Legal & Responsible Use" section of README.md. This software is not affiliated
 with, endorsed by, or sponsored by willhaben internet service GmbH & Co KG.
-
----
-
-Reproduced here under the terms above because this repository redistributes
-`.claude/skills/apartment-hunt/SKILL.md`, sourced unmodified from
-https://github.com/aliildan/willhaben-mcp.
-
----
-
-As of 2026-08-13, `willhaben-mcp-patched/` also redistributes a **modified**
-copy of willhaben-mcp v1.0.2's `dist/index.js`, permitted under the MIT terms
-above. The only change is documented inline at the `IMAGE_DISPLAY_CAP`
-constant in that file: the published package hardcodes `willhaben_get_listing`
-to return at most 5 image URLs regardless of how many the listing actually
-has; this copy raises that to 10 (Telegram's own `sendMediaGroup` hard limit),
-so cards with many photos aren't needlessly capped below what Telegram would
-show anyway. No functional behavior is otherwise changed. This copy of the
-license file is retained alongside it per the terms above.

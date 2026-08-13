@@ -1,0 +1,19 @@
+{
+  "name": "willhaben-mcp-patched",
+  "version": "1.0.2-patched.1",
+  "private": true,
+  "description": "Vendored, patched copy of willhaben-mcp (MIT, by Ali Ildan) — raises the get_listing image cap from 5 to Telegram's own sendMediaGroup limit of 10. See dist/index.js's PATCHED comment for the exact change. Not published; used only as a local MCP server spec.",
+  "type": "module",
+  "bin": {
+    "willhaben-mcp-patched": "dist/index.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "cheerio": "^1.0.0",
+    "zod": "^3.25.0 || ^4.0.0"
+  }
+}
