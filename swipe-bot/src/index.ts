@@ -29,7 +29,7 @@ async function main(): Promise<void> {
       const { inserted, warnings } = await runPoll(db);
       for (const w of warnings) console.error('WARNING:', w);
       console.log(`poll: ${inserted.length} new listings`);
-      await notifyNewMatches(bot.telegram, db, inserted, deps.computeCommute);
+      await notifyNewMatches(bot.telegram, db, inserted, deps.computeCommute, deps.geocode);
     } catch (err) {
       console.error('poll failed:', err);
     }

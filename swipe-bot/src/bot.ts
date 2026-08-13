@@ -2,7 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import {
   type DB, type UserPrefs, type ListingRow, type CommuteTimes,
   getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist,
-  getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes,
+  getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes, setListingCoords,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
@@ -241,18 +241,31 @@ export async function sendShortlistCard(telegram: Telegraf['telegram'], chatId: 
 
 /**
  * Cached-or-computed commute line for one (chat, listing) pair — null if the user has no commute
- * destination set, the listing has no coordinates, or the Routes API call failed. Cached in the DB
- * since Routes API calls cost quota and the same listing gets re-shown across /next, pushes, and swipes.
+ * destination set, or the listing has no coordinates and no address to geocode as a fallback (or
+ * that geocode fails), or the Routes API call failed. Cached in the DB since Routes API calls cost
+ * quota and the same listing gets re-shown across /next, pushes, and swipes.
+ *
+ * Not every advertiser publishes coordinates (verified: willhaben listings from Rustler
+ * Immobilientreuhand never do), but most still have a plain address — geocoding it once and
+ * persisting the result onto the listing row means the geocode call happens once per listing,
+ * ever, not once per view.
  */
 export async function getCommuteLineFor(
-  db: DB, chatId: number, listing: ListingRow, prefs: UserPrefs, computeCommute: ComputeCommuteFn,
+  db: DB, chatId: number, listing: ListingRow, prefs: UserPrefs, computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
 ): Promise<string | null> {
   if (prefs.commuteDestination == null || prefs.commuteLat == null || prefs.commuteLon == null) return null;
-  if (listing.lat == null || listing.lon == null) return null;
+
+  let origin = listing.lat != null && listing.lon != null ? { lat: listing.lat, lon: listing.lon } : null;
+  if (!origin) {
+    if (listing.addressLine == null) return null;
+    origin = await geocode(listing.addressLine);
+    if (!origin) return null;
+    setListingCoords(db, listing.id, origin.lat, origin.lon);
+  }
 
   let times = getCommuteTimes(db, chatId, listing.id);
   if (!times) {
-    times = await computeCommute({ lat: listing.lat, lon: listing.lon }, { lat: prefs.commuteLat, lon: prefs.commuteLon });
+    times = await computeCommute(origin, { lat: prefs.commuteLat, lon: prefs.commuteLon });
     setCommuteTimes(db, chatId, listing.id, times);
   }
   return formatCommuteLine(times, prefs.commuteDestination);
@@ -269,7 +282,7 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
     await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
     return;
   }
-  const commuteLine = await getCommuteLineFor(db, chatId, card, prefs, deps.computeCommute);
+  const commuteLine = await getCommuteLineFor(db, chatId, card, prefs, deps.computeCommute, deps.geocode);
   await sendCard(telegram, chatId, card, commuteLine);
 }
 
@@ -324,7 +337,15 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   const bot = new Telegraf(token);
 
   bot.start(async (ctx) => {
-    setOnboardingState(db, ctx.chat.id, []);
+    const chatId = ctx.chat.id;
+    if (getUserPrefs(db, chatId)) {
+      await ctx.reply(
+        'You\'re already set up. /next for a listing, /shortlist to browse what you\'ve liked, ' +
+        'or /settings to redo your preferences from scratch.'
+      );
+      return;
+    }
+    setOnboardingState(db, chatId, []);
     await ctx.reply(SAFETY_NOTICE);
     await ctx.reply(ONBOARDING_INTRO);
     await ctx.reply(QUESTIONS[0]);

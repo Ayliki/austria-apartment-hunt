@@ -2,10 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
-  appendSwipeStatus, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, type BotDeps,
+  appendSwipeStatus, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, type BotDeps, type GeocodeFn,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
-import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, type ListingRow, type DB } from '../src/db.js';
+import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -223,6 +223,20 @@ test('/start begins onboarding and asks the first question', async () => {
   assert.deepEqual(getOnboardingState(db, 1), []);
 });
 
+test('/start on an already-configured chat points at /next, /shortlist, /settings instead of silently re-onboarding', async () => {
+  const db = openDb(':memory:');
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /\/next/);
+  assert.match(texts[0], /\/shortlist/);
+  assert.match(texts[0], /\/settings/);
+  assert.equal(getOnboardingState(db, 1), null); // not put into onboarding
+});
+
 test('onboarding intro explains what happens after setup, not just how to answer', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
@@ -375,13 +389,15 @@ test('"skip" on the commute question saves no destination and shows no commute l
   assert.doesNotMatch(texts.at(-1) as string, /📍/);
 });
 
-test('getCommuteLineFor returns null when the user has no commute destination, or the listing has no coordinates', async () => {
+const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };
+
+test('getCommuteLineFor returns null when the user has no commute destination, or the listing has neither coordinates nor an address to fall back on', async () => {
   const db = openDb(':memory:');
   const noDestPrefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
-  assert.equal(await getCommuteLineFor(db, 1, row({ lat: 48.19, lon: 16.37 }), noDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null })), null);
+  assert.equal(await getCommuteLineFor(db, 1, row({ lat: 48.19, lon: 16.37 }), noDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null }), NEVER_GEOCODE), null);
 
   const withDestPrefs = { ...noDestPrefs, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
-  assert.equal(await getCommuteLineFor(db, 1, row({ lat: null, lon: null }), withDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null })), null);
+  assert.equal(await getCommuteLineFor(db, 1, row({ lat: null, lon: null, addressLine: null }), withDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null }), NEVER_GEOCODE), null);
 });
 
 test('getCommuteLineFor caches the computed result and does not recompute on a second call', async () => {
@@ -391,11 +407,42 @@ test('getCommuteLineFor caches the computed result and does not recompute on a s
   const computeCommute = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 12, transitMinutes: null, transitSummary: null }; };
 
   const listingRow = row({ id: 'willhaben:cached', lat: 48.19, lon: 16.37 });
-  const first = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute);
-  const second = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute);
+  const first = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute, NEVER_GEOCODE);
+  const second = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute, NEVER_GEOCODE);
 
   assert.equal(first, second);
   assert.equal(calls, 1);
+});
+
+test('getCommuteLineFor falls back to geocoding the listing\'s address when it has no coordinates, and persists the resolved coordinates onto the listing', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, lat: null, lon: null, addressLine: '1110 Wien, Simmering' }));
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  const geocode: GeocodeFn = async () => ({ lat: 48.11, lon: 16.4 });
+  const computeCommute = async (): Promise<CommuteTimes> => ({ walkMinutes: 20, transitMinutes: 10, transitSummary: 'U3' });
+
+  const [listingRow] = getCandidateListings(db, 1, prefs);
+  const line = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute, geocode);
+
+  assert.match(line as string, /20 min walk/);
+  const [persisted] = getCandidateListings(db, 1, prefs);
+  assert.equal(persisted.lat, 48.11);
+  assert.equal(persisted.lon, 16.4);
+});
+
+test('getCommuteLineFor returns null, and persists nothing, when the address fails to geocode', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, lat: null, lon: null, addressLine: 'nonsense address' }));
+  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  const geocode: GeocodeFn = async () => null;
+  const computeCommute = async (): Promise<CommuteTimes> => ({ walkMinutes: 20, transitMinutes: null, transitSummary: null });
+
+  const [listingRow] = getCandidateListings(db, 1, prefs);
+  const line = await getCommuteLineFor(db, 1, listingRow, prefs, computeCommute, geocode);
+
+  assert.equal(line, null);
+  const [persisted] = getCandidateListings(db, 1, prefs);
+  assert.equal(persisted.lat, null);
 });
 
 test('a restart mid-onboarding does not drop progress — this is the bug that shipped', async () => {

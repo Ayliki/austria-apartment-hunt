@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
   recordSwipe, getShortlist, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
-  getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, type ListingRow,
+  getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, setListingCoords, type ListingRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
@@ -281,7 +281,7 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, isWg: false, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null,
     ...overrides,
   };
 }
@@ -365,6 +365,37 @@ test('upsertListing persists lat/lon, getCandidateListings round-trips them', ()
   const [candidate] = getCandidateListings(db, 1, defaultPrefs(1));
   assert.equal(candidate.lat, 48.19);
   assert.equal(candidate.lon, 16.37);
+});
+
+test('upsertListing persists addressLine, getCandidateListings round-trips it, null stored as null', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, addressLine: '1060 Wien, Mariahilfer Straße 1' }));
+  upsertListing(db, listing({ id: 'b', district: 6, addressLine: null }));
+  const candidates = getCandidateListings(db, 1, defaultPrefs(1));
+  assert.equal(candidates.find((c) => c.id === 'willhaben:a')!.addressLine, '1060 Wien, Mariahilfer Straße 1');
+  assert.equal(candidates.find((c) => c.id === 'willhaben:b')!.addressLine, null);
+});
+
+test('setListingCoords updates a listing\'s lat/lon in place, getListingsByIds reflects it', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, lat: null, lon: null }));
+  setListingCoords(db, 'willhaben:a', 48.2, 16.4);
+  const [row] = getListingsByIds(db, ['willhaben:a']);
+  assert.equal(row.lat, 48.2);
+  assert.equal(row.lon, 16.4);
+});
+
+test('openDb migrates an older database predating listings.address_line', () => {
+  const path = `/tmp/swipe-bot-migration-test-address-${Date.now()}.sqlite`;
+  const preMigration = openDb(path);
+  upsertListing(preMigration, listing({ id: 'a', district: 6, addressLine: '1060 Wien' }));
+  preMigration.exec('ALTER TABLE listings DROP COLUMN address_line');
+  preMigration.close();
+
+  const migrated = openDb(path);
+  const [row] = getListingsByIds(migrated, ['willhaben:a']);
+  assert.equal(row.addressLine, null); // old value gone with the dropped column, but reopening must not throw
+  migrated.close();
 });
 
 test('getCommuteTimes returns null before anything is cached, then round-trips what was set', () => {

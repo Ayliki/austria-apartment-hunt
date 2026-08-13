@@ -4,7 +4,7 @@ import {
   getAllUserPrefs, getSwipedWithDirection, matchesPrefs, MCP_CHAT_ID,
 } from './db.js';
 import { rankListings } from './scoring.js';
-import { sendCard, getCommuteLineFor, type ComputeCommuteFn } from './bot.js';
+import { sendCard, getCommuteLineFor, type ComputeCommuteFn, type GeocodeFn } from './bot.js';
 
 /** Caps a single push burst per user — protects against a preference change (or a big poll) flooding a chat. */
 export const MAX_PUSH_PER_USER = 5;
@@ -15,7 +15,7 @@ export const MAX_PUSH_PER_USER = 5;
  * the MCP sentinel chat is skipped since it has no real Telegram chat to push to.
  */
 export async function notifyNewMatches(
-  telegram: Telegraf['telegram'], db: DB, newListings: ListingRow[], computeCommute: ComputeCommuteFn,
+  telegram: Telegraf['telegram'], db: DB, newListings: ListingRow[], computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
 ): Promise<void> {
   if (newListings.length === 0) return;
 
@@ -33,7 +33,7 @@ export async function notifyNewMatches(
       `${matches.length} new listing${matches.length === 1 ? '' : 's'} just matched your search:`
     );
     for (const listing of toSend) {
-      const commuteLine = await getCommuteLineFor(db, prefs.chatId, listing, prefs, computeCommute);
+      const commuteLine = await getCommuteLineFor(db, prefs.chatId, listing, prefs, computeCommute, geocode);
       await sendCard(telegram, prefs.chatId, listing, commuteLine);
     }
     if (matches.length > toSend.length) {

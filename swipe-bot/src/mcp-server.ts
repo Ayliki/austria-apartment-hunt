@@ -73,7 +73,7 @@ function errorResult(err: unknown) {
 
 async function cardWithCommute(db: DB, deps: McpDeps, card: ListingRow) {
   const prefs = getUserPrefs(db, MCP_CHAT_ID);
-  const commuteLine = prefs ? await getCommuteLineFor(db, MCP_CHAT_ID, card, prefs, deps.computeCommute) : null;
+  const commuteLine = prefs ? await getCommuteLineFor(db, MCP_CHAT_ID, card, prefs, deps.computeCommute, deps.geocode) : null;
   return formatCardPayload(card, commuteLine);
 }
 

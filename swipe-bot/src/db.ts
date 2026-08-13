@@ -45,6 +45,7 @@ export interface ListingRow {
   requiresWaitlistTicket: boolean;
   /** A room in a shared flat, co-living, or student housing (apt-hunter's detectWG) — not a whole apartment. */
   isWg: boolean;
+  addressLine: string | null;
   lat: number | null;
   lon: number | null;
 }
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS listings (
   first_seen TEXT NOT NULL,
   requires_waitlist_ticket INTEGER NOT NULL DEFAULT 0,
   is_wg INTEGER NOT NULL DEFAULT 0,
+  address_line TEXT,
   lat REAL, lon REAL
 );
 
@@ -142,6 +144,9 @@ function migrate(db: DB): void {
     });
     backfill(rows);
   }
+  if (!listingColumns.includes('address_line')) {
+    db.exec('ALTER TABLE listings ADD COLUMN address_line TEXT');
+  }
 
   const prefsColumns = (db.prepare('PRAGMA table_info(user_prefs)').all() as { name: string }[]).map((c) => c.name);
   if (!prefsColumns.includes('include_waitlist_housing')) {
@@ -203,6 +208,7 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
     firstSeen: row.first_seen as string,
     requiresWaitlistTicket: Boolean(row.requires_waitlist_ticket),
     isWg: Boolean(row.is_wg),
+    addressLine: row.address_line as string | null,
     lat: row.lat as number | null,
     lon: row.lon as number | null,
   };
@@ -216,8 +222,8 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
 export function upsertListing(db: DB, l: NormalizedListing): boolean {
   if (l.isShortTerm) return false;
   const result = db.prepare(`
-    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, is_wg, lat, lon)
-    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @isWg, @lat, @lon)
+    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, is_wg, address_line, lat, lon)
+    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @isWg, @addressLine, @lat, @lon)
   `).run({
     id: listingKey(l),
     source: l.source,
@@ -235,10 +241,16 @@ export function upsertListing(db: DB, l: NormalizedListing): boolean {
     firstSeen: new Date().toISOString(),
     requiresWaitlistTicket: l.requiresWaitlistTicket ? 1 : 0,
     isWg: l.isWg ? 1 : 0,
+    addressLine: l.addressLine,
     lat: l.lat,
     lon: l.lon,
   });
   return result.changes > 0;
+}
+
+/** Persists coordinates resolved for a listing after the fact (e.g. by geocoding its address, since not every advertiser publishes lat/lon) — so the geocode call happens once per listing, ever, not once per view. */
+export function setListingCoords(db: DB, listingId: string, lat: number, lon: number): void {
+  db.prepare('UPDATE listings SET lat = ?, lon = ? WHERE id = ?').run(lat, lon, listingId);
 }
 
 export function getAllUserPrefs(db: DB): UserPrefs[] {

@@ -3,16 +3,17 @@ import assert from 'node:assert/strict';
 import { Telegram } from 'telegraf';
 import { notifyNewMatches, MAX_PUSH_PER_USER } from '../src/notify.js';
 import { openDb, setUserPrefs, MCP_CHAT_ID, type ListingRow, type CommuteTimes } from '../src/db.js';
-import type { ComputeCommuteFn } from '../src/bot.js';
+import type { ComputeCommuteFn, GeocodeFn } from '../src/bot.js';
 
 const FAKE_COMPUTE_COMMUTE: ComputeCommuteFn = async () => ({ walkMinutes: null, transitMinutes: null, transitSummary: null });
+const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };
 
 function row(overrides: Partial<ListingRow>): ListingRow {
   return {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null,
     ...overrides,
   };
 }
@@ -38,18 +39,18 @@ function testTelegram(): { telegram: Telegram; calls: Call[] } {
 
 test('notifyNewMatches does nothing when there are no new listings', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
-  await notifyNewMatches(telegram, db, [], FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, [], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
   assert.equal(calls.length, 0);
 });
 
 test('notifyNewMatches pushes a matching listing to a user whose prefs it satisfies', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
   assert.match(texts[0] as string, /1 new listing just matched/);
@@ -57,31 +58,31 @@ test('notifyNewMatches pushes a matching listing to a user whose prefs it satisf
 
 test('notifyNewMatches skips a user whose prefs the listing does not satisfy', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 900 })], FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 900 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   assert.equal(calls.length, 0);
 });
 
 test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: MCP_CHAT_ID, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: MCP_CHAT_ID, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   assert.equal(calls.length, 0);
 });
 
 test('notifyNewMatches caps the burst per user and mentions the remainder', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
-  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.match(texts[0], new RegExp(`${matches.length} new listings just matched`));
@@ -93,21 +94,21 @@ test('notifyNewMatches caps the burst per user and mentions the remainder', asyn
 
 test('notifyNewMatches never pushes municipal/waitlist housing to a user who opted out', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, requiresWaitlistTicket: true })], FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, requiresWaitlistTicket: true })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   assert.equal(calls.length, 0);
 });
 
 test('notifyNewMatches includes the commute line on a pushed card when the user has a commute destination set', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
   const { telegram, calls } = testTelegram();
   const computeCommute: ComputeCommuteFn = async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' });
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, lat: 48.19, lon: 16.37 })], computeCommute);
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, lat: 48.19, lon: 16.37 })], computeCommute, NEVER_GEOCODE);
 
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.ok(texts.some((t) => t.includes('18 min walk · 7 min by tram D to TU Wien')));
@@ -115,25 +116,25 @@ test('notifyNewMatches includes the commute line on a pushed card when the user 
 
 test('notifyNewMatches caches the commute computation across the same (chat, listing) pair', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
   const { telegram } = testTelegram();
   let calls = 0;
   const computeCommute: ComputeCommuteFn = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 10, transitMinutes: null, transitSummary: null }; };
   const listing = row({ id: 'willhaben:a', price: 700, lat: 48.19, lon: 16.37 });
 
-  await notifyNewMatches(telegram, db, [listing], computeCommute);
-  await notifyNewMatches(telegram, db, [listing], computeCommute); // same listing "found new" again — shouldn't recompute
+  await notifyNewMatches(telegram, db, [listing], computeCommute, NEVER_GEOCODE);
+  await notifyNewMatches(telegram, db, [listing], computeCommute, NEVER_GEOCODE); // same listing "found new" again — shouldn't recompute
 
   assert.equal(calls, 1);
 });
 
 test('notifyNewMatches sends separate, independent pushes to different matching users', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
-  setUserPrefs(db, { chatId: 2, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  setUserPrefs(db, { chatId: 2, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE);
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   const chatIds = new Set(calls.map((c) => c.payload.chat_id));
   assert.deepEqual(chatIds, new Set([1])); // only chat 1's budget covers 700
