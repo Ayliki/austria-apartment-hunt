@@ -26,12 +26,27 @@ export interface SourceRefreshSummary {
 export interface RefreshSummary {
   willhaben: SourceRefreshSummary;
   immoscout: SourceRefreshSummary;
-  /** Rows deleted after the sweep: is_delisted and not in anyone's shortlist. */
+  /** Rows deleted after the sweep: is_delisted and not in anyone's shortlist. Always 0 when deletionSkippedFor is non-empty. */
   deleted: number;
+  /**
+   * Sources whose delisted count this sweep tripped the blast-radius guard (more than a quarter of
+   * that source's rows, or more than 10, flagged "not found" in one sweep) — a signal of a block
+   * page or upstream markup change, not real mass delisting. When non-empty, the end-of-sweep delete
+   * pass is skipped entirely this cycle; a self-heal via the next successful sweep is expected.
+   */
+  deletionSkippedFor: ListingSource[];
 }
 
 /** Gentle default pace between get_listing calls in a full sweep — 361 rows at this rate finishes in well under two minutes. */
 const DEFAULT_DELAY_MS = 300;
+
+const BLAST_RADIUS_MIN_DELISTED = 10;
+const BLAST_RADIUS_FRACTION = 0.25;
+
+/** True if a source's delisted count this sweep is implausibly high for real listings being taken down — almost certainly a block page or a markup change misfiring as "not found" instead. */
+export function exceedsBlastRadius(summary: SourceRefreshSummary): boolean {
+  return summary.delisted > Math.max(BLAST_RADIUS_MIN_DELISTED, summary.checked * BLAST_RADIUS_FRACTION);
+}
 
 interface ImmoscoutDetail {
   address?: string | null;
@@ -104,7 +119,11 @@ export async function refreshAllListings(
 
   const willhaben = await refreshSource(db, 'willhaben', deps.willhaben, delayMs, sleep);
   const immoscout = await refreshSource(db, 'immoscout', deps.immoscout, delayMs, sleep);
-  const deleted = deleteDelistedUnshortlisted(db);
 
-  return { willhaben, immoscout, deleted };
+  const deletionSkippedFor: ListingSource[] = [];
+  if (exceedsBlastRadius(willhaben)) deletionSkippedFor.push('willhaben');
+  if (exceedsBlastRadius(immoscout)) deletionSkippedFor.push('immoscout');
+  const deleted = deletionSkippedFor.length > 0 ? 0 : deleteDelistedUnshortlisted(db);
+
+  return { willhaben, immoscout, deleted, deletionSkippedFor };
 }

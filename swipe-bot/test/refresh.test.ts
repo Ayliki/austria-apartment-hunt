@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  classifyGetListingError, refreshAllListings, type ListingFetcher,
+  classifyGetListingError, refreshAllListings, exceedsBlastRadius, type ListingFetcher, type SourceRefreshSummary,
 } from '../src/refresh.js';
 import {
   openDb, upsertListing, setListingDelisted, getListingsByIds, recordSwipe, getShortlist,
@@ -183,4 +183,74 @@ test('refreshAllListings sweeps both sources independently and sums checked coun
 
   assert.equal(summary.willhaben.checked, 2);
   assert.equal(summary.immoscout.checked, 1);
+});
+
+test('exceedsBlastRadius: false for a normal small delisted count, true once it crosses max(10, checked*0.25)', () => {
+  const small: SourceRefreshSummary = { checked: 100, updated: 90, delisted: 5, errored: 5 };
+  assert.equal(exceedsBlastRadius(small), false);
+
+  // checked*0.25 = 25, so 25 is still within bounds (not > threshold) but 26 trips it.
+  const atThreshold: SourceRefreshSummary = { checked: 100, updated: 75, delisted: 25, errored: 0 };
+  assert.equal(exceedsBlastRadius(atThreshold), false);
+  const overThreshold: SourceRefreshSummary = { checked: 100, updated: 74, delisted: 26, errored: 0 };
+  assert.equal(exceedsBlastRadius(overThreshold), true);
+
+  // Below the floor of 10, even 100% delisted doesn't trip it.
+  const tinySource: SourceRefreshSummary = { checked: 5, updated: 0, delisted: 5, errored: 0 };
+  assert.equal(exceedsBlastRadius(tinySource), false);
+  // Once checked is small, the floor of 10 (not the fraction) governs.
+  const overFloor: SourceRefreshSummary = { checked: 5, updated: 0, delisted: 11, errored: 0 };
+  assert.equal(exceedsBlastRadius(overFloor), true);
+});
+
+test('refreshAllListings skips the delete pass entirely (both sources) when one source trips the blast-radius guard', async () => {
+  const db = openDb(':memory:');
+  // 16 willhaben rows, all of which will come back "not found" — clears the max(10, checked*0.25) floor (16*0.25=4, so floor=10 governs; 16 > 10 trips it).
+  for (let i = 0; i < 16; i++) {
+    upsertListing(db, listing({ id: `wh-${i}` }));
+  }
+  // One genuinely-gone immoscout row too, to confirm its deletion is also skipped by the global guard.
+  upsertListing(db, listing({ id: 'im-gone', source: 'immoscout' }));
+
+  const notFoundWillhaben = 'willhaben_get_listing failed: Listing x not found. Make sure the ID is correct.';
+  const notFoundImmoscout = 'immoscout_get_listing failed: Error: GET https://www.immobilienscout24.at/expose/123 failed with HTTP 404';
+  const summary = await refreshAllListings(db, {
+    willhaben: fetcherThrowing(notFoundWillhaben),
+    immoscout: fetcherThrowing(notFoundImmoscout),
+  }, noDelay);
+
+  assert.equal(summary.deleted, 0);
+  assert.deepEqual(summary.deletionSkippedFor, ['willhaben']);
+  // Rows are still flagged delisted, not deleted.
+  const rows = getListingsByIds(db, Array.from({ length: 16 }, (_, i) => `willhaben:wh-${i}`));
+  assert.equal(rows.length, 16);
+  assert.ok(rows.every((r) => r.isDelisted === true));
+  const [immoscoutRow] = getListingsByIds(db, ['immoscout:im-gone']);
+  assert.ok(immoscoutRow, 'immoscout row should still exist — the global guard skips deletion for both sources');
+  assert.equal(immoscoutRow.isDelisted, true);
+});
+
+test('refreshAllListings still deletes normally when only a small, plausible number of rows are genuinely not-found', async () => {
+  const db = openDb(':memory:');
+  for (let i = 0; i < 20; i++) {
+    upsertListing(db, listing({ id: `wh-${i}` }));
+  }
+
+  let calls = 0;
+  const mostlyOk: ListingFetcher = {
+    callToolText: async () => {
+      calls++;
+      if (calls <= 2) throw new Error('willhaben_get_listing failed: Listing x not found. Make sure the ID is correct.');
+      return WH_DETAIL_TEXT;
+    },
+  };
+
+  const summary = await refreshAllListings(db, {
+    willhaben: mostlyOk,
+    immoscout: fetcherReturning('{"images":[],"address":null}'),
+  }, noDelay);
+
+  assert.equal(summary.willhaben.delisted, 2); // 2 out of 20 = 10% < max(10, 5) threshold — not tripped
+  assert.deepEqual(summary.deletionSkippedFor, []);
+  assert.equal(summary.deleted, 2);
 });
