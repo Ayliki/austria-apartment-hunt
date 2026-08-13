@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
-  recordSwipe, getShortlist, getCandidateListings, getSwipedWithDirection,
+  recordSwipe, getShortlist, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
   getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, type ListingRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
@@ -152,6 +152,32 @@ test('recordSwipe(like) adds to shortlist, recordSwipe(pass) does not', () => {
   const shortlist = getShortlist(db, 1);
   assert.equal(shortlist.length, 1);
   assert.equal(shortlist[0].id, 'willhaben:a');
+});
+
+test('removeFromShortlist deletes the shortlist entry but leaves the swipe (like) intact, so the listing never resurfaces in /next', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  assert.equal(getShortlist(db, 1).length, 1);
+
+  removeFromShortlist(db, 1, 'willhaben:a');
+
+  assert.equal(getShortlist(db, 1).length, 0);
+  const [swiped] = getSwipedWithDirection(db, 1);
+  assert.equal(swiped.direction, 'like'); // still recorded as liked, not un-swiped
+  assert.deepEqual(getCandidateListings(db, 1, defaultPrefs(1)), []); // stays excluded from the deck
+});
+
+test('removeFromShortlist is per-user — removing for one chat does not affect another chat\'s shortlist entry for the same listing', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 2, 'willhaben:a', 'like');
+
+  removeFromShortlist(db, 1, 'willhaben:a');
+
+  assert.equal(getShortlist(db, 1).length, 0);
+  assert.equal(getShortlist(db, 2).length, 1);
 });
 
 test('getCandidateListings excludes already-swiped and filters by prefs', () => {

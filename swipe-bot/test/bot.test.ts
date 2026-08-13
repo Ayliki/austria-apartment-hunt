@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor, MAX_MEDIA_GROUP_ITEMS, type BotDeps } from '../src/bot.js';
+import {
+  createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
+  appendSwipeStatus, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, type BotDeps,
+} from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
-import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, type ListingRow, type DB } from '../src/db.js';
+import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, type ListingRow, type DB } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -111,6 +114,18 @@ test('formatCaption appends the commute line when given one, omits it entirely o
   assert.doesNotMatch(formatCaption(row({})), /📍/);
 });
 
+test('appendSwipeStatus replaces a group-companion placeholder wholesale, rather than appending to it', () => {
+  assert.equal(appendSwipeStatus('👍 or 👎?', '✅ Added to shortlist'), '✅ Added to shortlist');
+  assert.equal(appendSwipeStatus('🗑️ to remove', '🗑️ Removed'), '🗑️ Removed');
+});
+
+test('appendSwipeStatus appends to a real caption/text, rather than replacing it', () => {
+  assert.equal(
+    appendSwipeStatus('Sunny flat\n€650 · 43m² · 2 rooms\nhttps://x/1', '✅ Added to shortlist'),
+    'Sunny flat\n€650 · 43m² · 2 rooms\nhttps://x/1\n\n✅ Added to shortlist',
+  );
+});
+
 test('buildMediaGroup attaches the caption to only the first item', () => {
   const group = buildMediaGroup(['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg'], 'my caption');
   assert.equal(group.length, 3);
@@ -181,13 +196,13 @@ function commandUpdate(chatId: number, command: string) {
   };
 }
 
-function callbackUpdate(chatId: number, data: string) {
+function callbackUpdate(chatId: number, data: string, message: Record<string, unknown> = {}) {
   const id = nextUpdateId++;
   return {
     update_id: id,
     callback_query: {
       id: String(id), from: { id: chatId, is_bot: false, first_name: 'U' }, chat_instance: 'x', data,
-      message: { message_id: id, date: 0, chat: { id: chatId, type: 'private' as const } },
+      message: { message_id: id, date: 0, chat: { id: chatId, type: 'private' as const }, ...message },
     },
   };
 }
@@ -395,4 +410,105 @@ test('a 👍 swipe records the shortlist entry and sends the next card', async (
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));
   assert.ok(calls.some((c) => c.method === 'answerCallbackQuery'));
   assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('No new listings')));
+});
+
+test('a swipe on a no-photo text card clears its buttons and appends a status line, instead of leaving it swipeable forever', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an editMessageText call clearing the swiped card');
+  assert.match(edit!.payload.text as string, /✅ Added to shortlist/);
+  assert.deepEqual((edit!.payload.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard, []);
+});
+
+test('a pass on a no-photo text card shows "Passed", not "Added to shortlist"', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'pass:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.match(edit!.payload.text as string, /👎 Passed/);
+});
+
+test('a swipe on the media-group companion placeholder replaces it wholesale with the status', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: '👍 or 👎?' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.equal(edit!.payload.text, '✅ Added to shortlist');
+});
+
+test('a swipe on a photo card edits the caption (not the text), leaving the photo itself alone', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { photo: [{ file_id: 'x', file_unique_id: 'x', width: 1, height: 1 }], caption: 'Sunny flat\n€650 · 43m²\nhttps://x/1' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageCaption');
+  assert.ok(edit, 'expected an editMessageCaption call for a photo card');
+  assert.match(edit!.payload.caption as string, /✅ Added to shortlist/);
+  assert.equal(calls.some((c) => c.method === 'editMessageText'), false);
+});
+
+test('/shortlist sends nothing but the empty-state message when there are no liked listings', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/shortlist'));
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].payload.text as string, /shortlist is empty/);
+});
+
+test('/shortlist sends one card per liked listing, each with a Remove button, newest-liked first', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'old', price: 500 }));
+  upsertListing(db, listing({ id: 'new', price: 600 }));
+  recordSwipe(db, 1, 'willhaben:old', 'like');
+  recordSwipe(db, 1, 'willhaben:new', 'like');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/shortlist'));
+
+  const cards = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€'));
+  assert.equal(cards.length, 2);
+  const buttons = cards.map((c) => (c.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard[0][0]);
+  assert.ok(buttons.every((b) => b.text === '🗑️ Remove'));
+  assert.deepEqual(buttons.map((b) => b.callback_data), ['unlike:willhaben:new', 'unlike:willhaben:old']);
+});
+
+test('/shortlist caps at MAX_SHORTLIST_CARDS and tells the user how many were left out', async () => {
+  const db = openDb(':memory:');
+  for (let i = 0; i < MAX_SHORTLIST_CARDS + 3; i++) {
+    upsertListing(db, listing({ id: `x${i}`, price: 500 }));
+    recordSwipe(db, 1, `willhaben:x${i}`, 'like');
+  }
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/shortlist'));
+
+  const cards = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€'));
+  assert.equal(cards.length, MAX_SHORTLIST_CARDS);
+  const trailing = calls.at(-1)!;
+  assert.match(trailing.payload.text as string, /3 more/);
+});
+
+test('tapping Remove on a shortlist card deletes the shortlist entry and edits the card to show it was removed', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'unlike:willhaben:a', { text: 'Sunny flat\n€500\nhttps://x/1' }));
+
+  assert.equal(getShortlist(db, 1).length, 0);
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected the shortlist card to be edited');
+  assert.match(edit!.payload.text as string, /🗑️ Removed/);
+  assert.deepEqual((edit!.payload.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard, []);
+});
+
+test('a swipe on a message that already has no reply markup is a no-op edit, not an error that blocks the next card', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  // No text/photo at all on the callback message — should not throw, still sends the next-card message.
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));
+  assert.ok(calls.some((c) => c.method === 'sendMessage'));
 });

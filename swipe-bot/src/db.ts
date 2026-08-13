@@ -312,6 +312,11 @@ export function getShortlist(db: DB, chatId: number): ListingRow[] {
   return rows.map(rowToListing);
 }
 
+/** Un-saves a listing from the shortlist only — the underlying swipe (direction 'like') is left intact, so the listing stays excluded from future /next candidates, matching how a pass already behaves. */
+export function removeFromShortlist(db: DB, chatId: number, listingId: string): void {
+  db.prepare('DELETE FROM shortlist WHERE chat_id = ? AND listing_id = ?').run(chatId, listingId);
+}
+
 export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): ListingRow[] {
   const clauses: string[] = ['l.id NOT IN (SELECT listing_id FROM swipes WHERE chat_id = @chatId)'];
   const params: Record<string, unknown> = { chatId };

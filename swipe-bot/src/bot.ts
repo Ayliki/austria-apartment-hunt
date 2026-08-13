@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import {
   type DB, type UserPrefs, type ListingRow, type CommuteTimes,
-  getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist,
+  getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist,
   getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes,
 } from './db.js';
 import { rankListings } from './scoring.js';
@@ -165,6 +165,32 @@ export function buildMediaGroup(images: string[], caption: string): MediaGroupIt
   }));
 }
 
+/** Placeholder text used for the standalone buttons message that accompanies a multi-photo album — swapped wholesale (not appended to) once swiped, since it carries no listing info of its own. */
+export const SWIPE_PROMPT_TEXT = '👍 or 👎?';
+export const REMOVE_PROMPT_TEXT = '🗑️ to remove';
+const GROUP_PLACEHOLDER_TEXTS: string[] = [SWIPE_PROMPT_TEXT, REMOVE_PROMPT_TEXT];
+
+/** Pure — decides whether a swiped/removed card's status replaces its message text wholesale (the album-companion placeholder) or gets appended to real listing text (caption, or the no-photo full-text card). */
+export function appendSwipeStatus(originalText: string, status: string): string {
+  return GROUP_PLACEHOLDER_TEXTS.includes(originalText) ? status : `${originalText}\n\n${status}`;
+}
+
+/** Low-level: sends a listing as photo album / single photo / text, with the given inline buttons. Shared by sendCard (swipe deck: 👍👎) and sendShortlistCard (🗑️ Remove). */
+async function sendListingCard(
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, caption: string,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string,
+): Promise<void> {
+  if (card.images.length >= 2) {
+    // sendMediaGroup can't carry an inline keyboard on any item — send the album, then the buttons separately.
+    await telegram.sendMediaGroup(chatId, buildMediaGroup(card.images, caption));
+    await telegram.sendMessage(chatId, groupPromptText, buttons);
+  } else if (card.images.length === 1) {
+    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
+  } else {
+    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+  }
+}
+
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
 export async function sendCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine?: string | null,
@@ -174,16 +200,17 @@ export async function sendCard(
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
+  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT);
+}
 
-  if (card.images.length >= 2) {
-    // sendMediaGroup can't carry an inline keyboard on any item — send the album, then the buttons separately.
-    await telegram.sendMediaGroup(chatId, buildMediaGroup(card.images, caption));
-    await telegram.sendMessage(chatId, '👍 or 👎?', buttons);
-  } else if (card.images.length === 1) {
-    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
-  } else {
-    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
-  }
+/** Telegram send calls per /shortlist invocation, above which the rest are summarized instead of sent — keeps a long shortlist from spamming dozens of messages at once. */
+export const MAX_SHORTLIST_CARDS = 20;
+
+/** Sends one shortlist entry as a browsable card with a single 🗑️ Remove button — no commute line, to avoid a Routes API call per item on every /shortlist call. */
+export async function sendShortlistCard(telegram: Telegraf['telegram'], chatId: number, card: ListingRow): Promise<void> {
+  const caption = formatCaption(card);
+  const buttons = Markup.inlineKeyboard([Markup.button.callback('🗑️ Remove', `unlike:${card.id}`)]);
+  await sendListingCard(telegram, chatId, card, caption, buttons, REMOVE_PROMPT_TEXT);
 }
 
 /**
@@ -218,6 +245,34 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
   }
   const commuteLine = await getCommuteLineFor(db, chatId, card, prefs, deps.computeCommute);
   await sendCard(telegram, chatId, card, commuteLine);
+}
+
+/**
+ * Clears the buttons on the message a swipe/remove callback came from, replacing its text/caption with
+ * a short status line — otherwise Telegram leaves the 👍👎/🗑️ buttons live forever, and an old card in
+ * chat history stays tappable. Best-effort: editing can fail (message too old, deleted, already edited),
+ * which must never block sending the next card.
+ */
+async function clearSwipedCardButtons(
+  ctx: {
+    callbackQuery?: { message?: unknown };
+    editMessageCaption: (caption?: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+    editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+  },
+  status: string,
+): Promise<void> {
+  const message = ctx.callbackQuery?.message as { text?: string; caption?: string; photo?: unknown } | undefined;
+  if (!message) return;
+  try {
+    const emptyMarkup = Markup.inlineKeyboard([]);
+    if (message.photo) {
+      await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), emptyMarkup);
+    } else if (message.text) {
+      await ctx.editMessageText(appendSwipeStatus(message.text, status), emptyMarkup);
+    }
+  } catch {
+    // best-effort — see doc comment above
+  }
 }
 
 /** Finishes onboarding: saves prefs (base fields + resolved commute destination), confirms, and shows what's already queued up. */
@@ -256,13 +311,19 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   });
 
   bot.command('shortlist', async (ctx) => {
-    const items = getShortlist(db, ctx.chat.id);
+    const chatId = ctx.chat.id;
+    const items = getShortlist(db, chatId);
     if (items.length === 0) {
       await ctx.reply('Your shortlist is empty — 👍 a card to save it here.');
       return;
     }
-    const lines = items.map((l) => `${l.title} — €${l.price ?? '?'} — ${l.url}`);
-    await ctx.reply(lines.join('\n\n'));
+    const shown = items.slice(0, MAX_SHORTLIST_CARDS);
+    for (const item of shown) {
+      await sendShortlistCard(ctx.telegram, chatId, item);
+    }
+    if (items.length > MAX_SHORTLIST_CARDS) {
+      await ctx.reply(`...and ${items.length - MAX_SHORTLIST_CARDS} more — narrow your prefs with /settings to see fewer at a time.`);
+    }
   });
 
   bot.command('next', async (ctx) => {
@@ -307,7 +368,16 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const chatId = ctx.chat!.id;
     recordSwipe(db, chatId, listingId, direction as 'like' | 'pass');
     await ctx.answerCbQuery(direction === 'like' ? 'Saved to shortlist 👍' : 'Passed 👎');
+    await clearSwipedCardButtons(ctx, direction === 'like' ? '✅ Added to shortlist' : '👎 Passed');
     await sendNextCard(ctx.telegram, chatId, db, deps);
+  });
+
+  bot.action(/^unlike:(.+)$/, async (ctx) => {
+    const [, listingId] = ctx.match;
+    const chatId = ctx.chat!.id;
+    removeFromShortlist(db, chatId, listingId);
+    await ctx.answerCbQuery('Removed from shortlist 🗑️');
+    await clearSwipedCardButtons(ctx, '🗑️ Removed');
   });
 
   return bot;
