@@ -58,8 +58,8 @@ gentle on the source.
 
 1. Call `willhaben_get_listing` / `immoscout_get_listing` for the row's id.
 2. **Not found** (willhaben: `isError: true` with body containing
-   "not found"; immoscout: thrown message containing "404" or "no Expose"
-   — see Classifying failures below) → set `is_delisted = 1`. Leave
+   "not found"; immoscout: thrown message containing "HTTP 404" or
+   "no Expose" — see Classifying failures below) → set `is_delisted = 1`. Leave
    `images`/`address_line` untouched (nothing to update from a dead page).
 3. **Success** → update `images` from the fresh detail payload; update
    `address_line` (willhaben: parsed `address` field; immoscout: `address`
@@ -88,7 +88,7 @@ A small pure helper, `classifyGetListingError(source, error): 'not-found' |
 `isError`, or the raw thrown error otherwise):
 
 - `willhaben`: `'not-found'` iff the message contains `"not found"`.
-- `immoscout`: `'not-found'` iff the message contains `"404"` or
+- `immoscout`: `'not-found'` iff the message contains `"HTTP 404"` or
   `"no Expose"`.
 - Anything else → `'transient'`.
 
@@ -107,10 +107,10 @@ Migrated the same way `address_line`/`lat`/`lon` were (`migrate()` in
 
 ### Visibility changes
 
-- `getAllListingIds` / whatever powers `/next`'s deck and `notify.ts`'s push
-  path: add `WHERE is_delisted = 0`. A delisted listing never surfaces for
-  swiping or as a push, whether or not it's still parked in the DB for
-  someone's shortlist.
+- `getCandidateListings` (what powers `/next`'s deck): add `AND l.is_delisted
+  = 0`. `notify.ts`'s push path needs no change — it only ever pushes
+  listings freshly inserted by *this* poll cycle, which can never already be
+  flagged delisted.
 - `/shortlist` (`sendShortlistCard` in `bot.ts`): when rendering a row with
   `is_delisted = 1`, append `⚠️ No longer listed` to the caption/text (same
   place the WG/waitlist badges already get composed). The 🗑️ Remove button
@@ -162,5 +162,5 @@ const refreshTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
   deleted and the retained-because-shortlisted cases.
 - `sendShortlistCard` rendering: existing test pattern extended to assert the
   "no longer listed" badge appears iff `is_delisted = 1`.
-- `/next` deck and `notify.ts` push path: existing tests extended to assert a
+- `getCandidateListings` (`/next`'s deck): existing tests extended to assert a
   delisted row is excluded.
