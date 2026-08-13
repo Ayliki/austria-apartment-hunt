@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {
   openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
   recordSwipe, getShortlist, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
-  getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, setListingCoords, type ListingRow,
+  getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, setListingCoords,
+  getListingsBySource, applyListingRefresh, setListingDelisted, deleteDelistedUnshortlisted, type ListingRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
@@ -281,7 +282,7 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null, isDelisted: false,
     ...overrides,
   };
 }
@@ -419,4 +420,119 @@ test('commute cache is per (chat, listing) — independent across both users and
   setCommuteTimes(db, 2, 'willhaben:a', { walkMinutes: 30, transitMinutes: null, transitSummary: null });
   assert.equal(getCommuteTimes(db, 1, 'willhaben:a')!.walkMinutes, 10);
   assert.equal(getCommuteTimes(db, 2, 'willhaben:a')!.walkMinutes, 30);
+});
+
+test('upsertListing defaults is_delisted to false', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  const [candidate] = getCandidateListings(db, 1, defaultPrefs(1));
+  assert.equal(candidate.isDelisted, false);
+});
+
+test('getCandidateListings excludes delisted listings', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'live', district: 6 }));
+  upsertListing(db, listing({ id: 'gone', district: 6 }));
+  setListingDelisted(db, 'willhaben:gone', true);
+  const candidates = getCandidateListings(db, 1, defaultPrefs(1));
+  assert.deepEqual(candidates.map((c) => c.id), ['willhaben:live']);
+});
+
+test('setListingDelisted flips is_delisted both ways', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6 }));
+  setListingDelisted(db, 'willhaben:a', true);
+  assert.equal(getListingsByIds(db, ['willhaben:a'])[0].isDelisted, true);
+  setListingDelisted(db, 'willhaben:a', false);
+  assert.equal(getListingsByIds(db, ['willhaben:a'])[0].isDelisted, false);
+});
+
+test('getListingsBySource returns only that source\'s rows, oldest first_seen first', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: '1', source: 'willhaben', district: 6 }));
+  upsertListing(db, listing({ id: '2', source: 'immoscout', district: 6 }));
+  upsertListing(db, listing({ id: '3', source: 'willhaben', district: 6 }));
+  const wh = getListingsBySource(db, 'willhaben');
+  assert.deepEqual(wh.map((r) => r.id), ['willhaben:1', 'willhaben:3']);
+  const is24 = getListingsBySource(db, 'immoscout');
+  assert.deepEqual(is24.map((r) => r.id), ['immoscout:2']);
+});
+
+test('applyListingRefresh overwrites images/addressLine/lat/lon and clears is_delisted', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', district: 6, images: ['https://img/old.jpg'], addressLine: null, lat: null, lon: null }));
+  setListingDelisted(db, 'willhaben:a', true); // simulate a past transient misflag
+  applyListingRefresh(db, 'willhaben:a', {
+    images: ['https://img/1.jpg', 'https://img/2.jpg'],
+    addressLine: '1060 Wien, Mariahilfer Straße 1',
+    lat: 48.2, lon: 16.35,
+  });
+  const [row] = getListingsByIds(db, ['willhaben:a']);
+  assert.deepEqual(row.images, ['https://img/1.jpg', 'https://img/2.jpg']);
+  assert.equal(row.addressLine, '1060 Wien, Mariahilfer Straße 1');
+  assert.equal(row.lat, 48.2);
+  assert.equal(row.lon, 16.35);
+  assert.equal(row.isDelisted, false); // a fresh successful fetch un-flags it
+});
+
+test('applyListingRefresh never regresses existing data when the fresh fetch has nothing', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({
+    id: 'a', district: 6,
+    images: ['https://img/keep.jpg'], addressLine: '1060 Wien', lat: 48.2, lon: 16.35,
+  }));
+  applyListingRefresh(db, 'willhaben:a', { images: [], addressLine: null, lat: null, lon: null });
+  const [row] = getListingsByIds(db, ['willhaben:a']);
+  assert.deepEqual(row.images, ['https://img/keep.jpg']); // empty fetch result never wipes known photos
+  assert.equal(row.addressLine, '1060 Wien');
+  assert.equal(row.lat, 48.2);
+  assert.equal(row.lon, 16.35);
+});
+
+test('deleteDelistedUnshortlisted removes a delisted listing nobody shortlisted, along with its swipes/commute_cache', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'gone', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:gone', 'pass');
+  setCommuteTimes(db, 1, 'willhaben:gone', { walkMinutes: 10, transitMinutes: null, transitSummary: null });
+  setListingDelisted(db, 'willhaben:gone', true);
+
+  const deleted = deleteDelistedUnshortlisted(db);
+
+  assert.equal(deleted, 1);
+  assert.deepEqual(getListingsByIds(db, ['willhaben:gone']), []);
+  assert.deepEqual(getSwipedWithDirection(db, 1), []);
+  assert.equal(getCommuteTimes(db, 1, 'willhaben:gone'), null);
+});
+
+test('deleteDelistedUnshortlisted keeps a delisted listing someone has shortlisted, flagged but present', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'gone', district: 6 }));
+  recordSwipe(db, 1, 'willhaben:gone', 'like'); // shortlists it
+  setListingDelisted(db, 'willhaben:gone', true);
+
+  const deleted = deleteDelistedUnshortlisted(db);
+
+  assert.equal(deleted, 0);
+  assert.equal(getShortlist(db, 1).length, 1);
+  assert.equal(getShortlist(db, 1)[0].isDelisted, true);
+});
+
+test('deleteDelistedUnshortlisted is a no-op when nothing is delisted', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'live', district: 6 }));
+  assert.equal(deleteDelistedUnshortlisted(db), 0);
+  assert.equal(getListingsByIds(db, ['willhaben:live']).length, 1);
+});
+
+test('openDb migrates an older database predating is_delisted, defaulting existing rows to false (not delisted)', () => {
+  const path = `/tmp/swipe-bot-migration-test-delisted-${Date.now()}.sqlite`;
+  const preMigration = openDb(path);
+  upsertListing(preMigration, listing({ id: 'a', district: 6 }));
+  preMigration.exec('ALTER TABLE listings DROP COLUMN is_delisted');
+  preMigration.close();
+
+  const migrated = openDb(path);
+  const [row] = getListingsByIds(migrated, ['willhaben:a']);
+  assert.equal(row.isDelisted, false);
+  migrated.close();
 });

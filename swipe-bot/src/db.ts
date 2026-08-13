@@ -48,6 +48,8 @@ export interface ListingRow {
   addressLine: string | null;
   lat: number | null;
   lon: number | null;
+  /** True once a refresh sweep gets a "not found" response for this listing — see refresh.ts. Rows shortlisted by someone are kept flagged rather than deleted. */
+  isDelisted: boolean;
 }
 
 const SCHEMA = `
@@ -65,7 +67,8 @@ CREATE TABLE IF NOT EXISTS listings (
   requires_waitlist_ticket INTEGER NOT NULL DEFAULT 0,
   is_wg INTEGER NOT NULL DEFAULT 0,
   address_line TEXT,
-  lat REAL, lon REAL
+  lat REAL, lon REAL,
+  is_delisted INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS user_prefs (
@@ -147,6 +150,9 @@ function migrate(db: DB): void {
   if (!listingColumns.includes('address_line')) {
     db.exec('ALTER TABLE listings ADD COLUMN address_line TEXT');
   }
+  if (!listingColumns.includes('is_delisted')) {
+    db.exec('ALTER TABLE listings ADD COLUMN is_delisted INTEGER NOT NULL DEFAULT 0');
+  }
 
   const prefsColumns = (db.prepare('PRAGMA table_info(user_prefs)').all() as { name: string }[]).map((c) => c.name);
   if (!prefsColumns.includes('include_waitlist_housing')) {
@@ -211,6 +217,7 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
     addressLine: row.address_line as string | null,
     lat: row.lat as number | null,
     lon: row.lon as number | null,
+    isDelisted: Boolean(row.is_delisted),
   };
 }
 
@@ -251,6 +258,60 @@ export function upsertListing(db: DB, l: NormalizedListing): boolean {
 /** Persists coordinates resolved for a listing after the fact (e.g. by geocoding its address, since not every advertiser publishes lat/lon) — so the geocode call happens once per listing, ever, not once per view. */
 export function setListingCoords(db: DB, listingId: string, lat: number, lon: number): void {
   db.prepare('UPDATE listings SET lat = ?, lon = ? WHERE id = ?').run(lat, lon, listingId);
+}
+
+/** All stored rows for one source, oldest first_seen first — the order refreshAllListings sweeps them in. */
+export function getListingsBySource(db: DB, source: 'willhaben' | 'immoscout'): ListingRow[] {
+  const rows = db.prepare('SELECT * FROM listings WHERE source = ? ORDER BY first_seen ASC').all(source) as Record<string, unknown>[];
+  return rows.map(rowToListing);
+}
+
+/**
+ * Applies a successful refresh fetch's result onto a stored row. Never regresses already-known-good
+ * data: an empty images array or a null addressLine/lat/lon from the fresh fetch keeps whatever was
+ * already stored, since a partial or empty response is more likely a parsing gap than the truth.
+ * Always clears is_delisted — a successful fetch means the listing is live again (or was never
+ * actually gone, e.g. a past transient error had been misclassified).
+ */
+export function applyListingRefresh(
+  db: DB, id: string, data: { images: string[]; addressLine: string | null; lat: number | null; lon: number | null },
+): void {
+  const current = db.prepare('SELECT images, address_line, lat, lon FROM listings WHERE id = ?').get(id) as
+    { images: string; address_line: string | null; lat: number | null; lon: number | null } | undefined;
+  if (!current) return;
+  const images = data.images.length > 0 ? data.images : (JSON.parse(current.images) as string[]);
+  const addressLine = data.addressLine ?? current.address_line;
+  const lat = data.lat ?? current.lat;
+  const lon = data.lon ?? current.lon;
+  db.prepare('UPDATE listings SET images = ?, address_line = ?, lat = ?, lon = ?, is_delisted = 0 WHERE id = ?')
+    .run(JSON.stringify(images), addressLine, lat, lon, id);
+}
+
+/** Flags (or un-flags) a listing as taken off its source site. See deleteDelistedUnshortlisted for what happens next. */
+export function setListingDelisted(db: DB, id: string, delisted: boolean): void {
+  db.prepare('UPDATE listings SET is_delisted = ? WHERE id = ?').run(delisted ? 1 : 0, id);
+}
+
+/**
+ * Hard-deletes every listing flagged is_delisted that nobody has shortlisted, plus its swipes and
+ * commute_cache rows (no FKs on this schema, so these are explicit). A delisted listing that IS in
+ * someone's shortlist is left alone — deleting it would make the card vanish from /shortlist without
+ * a trace, and the person may already be in contact with the landlord. Returns how many were deleted.
+ */
+export function deleteDelistedUnshortlisted(db: DB): number {
+  const rows = db.prepare(`
+    SELECT id FROM listings WHERE is_delisted = 1 AND id NOT IN (SELECT listing_id FROM shortlist)
+  `).all() as { id: string }[];
+  if (rows.length === 0) return 0;
+  const del = db.transaction((ids: string[]) => {
+    for (const id of ids) {
+      db.prepare('DELETE FROM swipes WHERE listing_id = ?').run(id);
+      db.prepare('DELETE FROM commute_cache WHERE listing_id = ?').run(id);
+      db.prepare('DELETE FROM listings WHERE id = ?').run(id);
+    }
+  });
+  del(rows.map((r) => r.id));
+  return rows.length;
 }
 
 export function getAllUserPrefs(db: DB): UserPrefs[] {
@@ -352,7 +413,10 @@ export function removeFromShortlist(db: DB, chatId: number, listingId: string): 
 }
 
 export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): ListingRow[] {
-  const clauses: string[] = ['l.id NOT IN (SELECT listing_id FROM swipes WHERE chat_id = @chatId)'];
+  const clauses: string[] = [
+    'l.id NOT IN (SELECT listing_id FROM swipes WHERE chat_id = @chatId)',
+    'l.is_delisted = 0',
+  ];
   const params: Record<string, unknown> = { chatId };
 
   if (prefs.priceFrom != null) { clauses.push('(l.price IS NULL OR l.price >= @priceFrom)'); params.priceFrom = prefs.priceFrom; }
