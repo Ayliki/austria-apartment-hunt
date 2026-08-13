@@ -142,6 +142,14 @@ test('detectWaitlistTicket catches municipal-housing keywords', () => {
   assert.equal(detectWaitlistTicket('Sanierte Garconniere im 2. Liftstock'), false);
 });
 
+// The onboarding question already promises this category ("Gemeindewohnung, Genossenschaft,
+// Direktvergabe") — these titles were verified leaking into a real user's candidate queue in prod.
+test('detectWaitlistTicket also catches Genossenschaftswohnung (cooperative housing), matching what onboarding already promises', () => {
+  assert.equal(detectWaitlistTicket('Genossenschaftswohnung zu vergeben'), true);
+  assert.equal(detectWaitlistTicket('2 Zimmer Genossenschaftswohnung'), true);
+  assert.equal(detectWaitlistTicket('3 Zimmer - Genossenschaftswohnung, nur Sozialbau-Mieter'), true);
+});
+
 test('detectShortTerm catches nightly/vacation-style title phrasing', () => {
   assert.equal(detectShortTerm('NOTFALLWOHNUNG zur kurzfristigen Nutzung! - PROVISIONSFREI', 600, 45), true);
   assert.equal(detectShortTerm('Gemütliche Ferienwohnung am Stadtrand', 900, 40), true);

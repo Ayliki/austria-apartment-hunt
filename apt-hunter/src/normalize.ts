@@ -60,7 +60,7 @@ export function parseAustrianNumber(s: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-const WAITLIST_RE = /vormerkschein|wohnticket|gemeindewohnung/i;
+const WAITLIST_RE = /vormerkschein|wohnticket|gemeindewohnung|genossenschaft/i;
 
 export function detectWaitlistTicket(title: string): boolean {
   return WAITLIST_RE.test(title);
