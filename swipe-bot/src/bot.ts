@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import {
   type DB, type UserPrefs, type ListingRow, type CommuteTimes,
-  getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist,
+  getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
   getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes, setListingCoords,
 } from './db.js';
 import { rankListings } from './scoring.js';
@@ -303,15 +303,16 @@ async function clearSwipedCardButtons(
     editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
   },
   status: string,
+  undoButton?: ReturnType<typeof Markup.button.callback>,
 ): Promise<void> {
   const message = ctx.callbackQuery?.message as { text?: string; caption?: string; photo?: unknown } | undefined;
   if (!message) return;
   try {
-    const emptyMarkup = Markup.inlineKeyboard([]);
+    const markup = Markup.inlineKeyboard(undoButton ? [undoButton] : []);
     if (message.photo) {
-      await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), emptyMarkup);
+      await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), markup);
     } else if (message.text) {
-      await ctx.editMessageText(appendSwipeStatus(message.text, status), emptyMarkup);
+      await ctx.editMessageText(appendSwipeStatus(message.text, status), markup);
     }
   } catch {
     // best-effort — see doc comment above
@@ -441,14 +442,27 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const [, direction, listingId] = ctx.match;
     const chatId = ctx.chat!.id;
     const saved = recordSwipe(db, chatId, listingId, direction as 'like' | 'pass');
+    const undoButton = Markup.button.callback('↩️ Undo', `undo:${listingId}`);
     if (direction === 'like' && !saved) {
       await ctx.answerCbQuery('This listing is no longer available.');
-      await clearSwipedCardButtons(ctx, '⚠️ No longer available');
+      await clearSwipedCardButtons(ctx, '⚠️ No longer available', undoButton);
     } else {
       await ctx.answerCbQuery(direction === 'like' ? 'Saved to shortlist 👍' : 'Passed 👎');
-      await clearSwipedCardButtons(ctx, direction === 'like' ? '✅ Added to shortlist' : '👎 Passed');
+      await clearSwipedCardButtons(ctx, direction === 'like' ? '✅ Added to shortlist' : '👎 Passed', undoButton);
     }
     await sendNextCard(ctx.telegram, chatId, db, deps);
+  });
+
+  bot.action(/^undo:(.+)$/, async (ctx) => {
+    const [, listingId] = ctx.match;
+    const chatId = ctx.chat!.id;
+    const undone = undoSwipe(db, chatId, listingId);
+    if (!undone) {
+      await ctx.answerCbQuery('You can only undo your most recent swipe.');
+      return;
+    }
+    await ctx.answerCbQuery('Swipe undone ↩️');
+    await clearSwipedCardButtons(ctx, '↩️ Undone');
   });
 
   bot.action(/^unlike:(.+)$/, async (ctx) => {

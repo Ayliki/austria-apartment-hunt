@@ -577,7 +577,7 @@ test('a 👍 swipe on a listing deleted mid-flight (e.g. by the refresh sweep) t
   assert.equal(getShortlist(db, 1).length, 0);
 });
 
-test('a swipe on a no-photo text card clears its buttons and appends a status line, instead of leaving it swipeable forever', async () => {
+test('a swipe on a no-photo text card clears its swipe buttons down to a single Undo button', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a' }));
   const { bot, calls } = createTestBot(db);
@@ -586,7 +586,38 @@ test('a swipe on a no-photo text card clears its buttons and appends a status li
   const edit = calls.find((c) => c.method === 'editMessageText');
   assert.ok(edit, 'expected an editMessageText call clearing the swiped card');
   assert.match(edit!.payload.text as string, /✅ Added to shortlist/);
-  assert.deepEqual((edit!.payload.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard, []);
+  const markup = edit!.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] };
+  assert.deepEqual(markup.inline_keyboard, [[{ text: '↩️ Undo', callback_data: 'undo:willhaben:a', hide: false }]]);
+});
+
+test('tapping Undo right after a like reverses it: swipe and shortlist entry both gone', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: 'Sunny flat\n€500\nhttps://x/1\n(no photo)' }));
+  await bot.handleUpdate(callbackUpdate(1, 'undo:willhaben:a', { text: 'Sunny flat\n€500\nhttps://x/1\n(no photo)\n\n✅ Added to shortlist' }));
+
+  assert.equal(getShortlist(db, 1).length, 0);
+  const undoAnswer = calls.filter((c) => c.method === 'answerCallbackQuery').at(-1);
+  assert.equal(undoAnswer!.payload.text, 'Swipe undone ↩️');
+  const undoEdit = calls.filter((c) => c.method === 'editMessageText').at(-1);
+  assert.match(undoEdit!.payload.text as string, /↩️ Undone/);
+  assert.deepEqual((undoEdit!.payload.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard, []);
+});
+
+test('tapping Undo on a swipe that is no longer the most recent one is refused, nothing changes', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  upsertListing(db, listing({ id: 'b', price: 600 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: 'Flat A\n€500\nhttps://x/a\n(no photo)' }));
+  await bot.handleUpdate(callbackUpdate(1, 'pass:willhaben:b', { text: 'Flat B\n€600\nhttps://x/b\n(no photo)' }));
+
+  await bot.handleUpdate(callbackUpdate(1, 'undo:willhaben:a', { text: 'Flat A\n€500\nhttps://x/a\n(no photo)\n\n✅ Added to shortlist' }));
+
+  assert.equal(getShortlist(db, 1).length, 1); // 'a' is still shortlisted — the undo was refused
+  const undoAnswer = calls.filter((c) => c.method === 'answerCallbackQuery').at(-1);
+  assert.equal(undoAnswer!.payload.text, 'You can only undo your most recent swipe.');
 });
 
 test('a pass on a no-photo text card shows "Passed", not "Added to shortlist"', async () => {
