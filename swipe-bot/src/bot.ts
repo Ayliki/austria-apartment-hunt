@@ -163,7 +163,7 @@ function truncate(s: string, maxLen: number): string {
 }
 
 /** Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, commute line, description, link). Exported for direct testing. */
-export function formatCaption(l: ListingRow, commuteLine?: string | null): string {
+export function formatCaption(l: ListingRow, commuteLine?: string | null, prefix?: string): string {
   const price = l.price != null ? `€${l.price}` : 'price n/a';
   const area = l.area != null ? `${l.area}m²` : '';
   const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
@@ -177,7 +177,8 @@ export function formatCaption(l: ListingRow, commuteLine?: string | null): strin
   const commute = commuteLine ? `\n${commuteLine}` : '';
   const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${delistedFlag}${commute}\n${l.url}`;
   const full = l.description ? `${base}\n\n${l.description}` : base;
-  return truncate(full, MAX_CAPTION_LENGTH);
+  const withPrefix = prefix ? `${prefix}${full}` : full;
+  return truncate(withPrefix, MAX_CAPTION_LENGTH);
 }
 
 /** Telegram's hard cap on items in a single sendMediaGroup call. */
@@ -196,6 +197,15 @@ export function buildMediaGroup(images: string[], caption: string): MediaGroupIt
     media: url,
     ...(i === 0 ? { caption } : {}),
   }));
+}
+
+/** Pure — builds the Prev/Remove/Next row for browsing the shortlist one card at a time, omitting Prev at the first position and Next at the last (Telegram has no disabled-button state, so an unreachable direction is simply not offered). */
+export function shortlistNavButtons(listingId: string, position: number, total: number): ReturnType<typeof Markup.inlineKeyboard> {
+  const row: ReturnType<typeof Markup.button.callback>[] = [];
+  if (position > 1) row.push(Markup.button.callback('◀️ Prev', `slnav:prev:${listingId}`));
+  row.push(Markup.button.callback('🗑️ Remove', `unlike:${listingId}`));
+  if (position < total) row.push(Markup.button.callback('▶️ Next', `slnav:next:${listingId}`));
+  return Markup.inlineKeyboard([row]);
 }
 
 /** Placeholder text used for the standalone buttons message that accompanies a multi-photo album — swapped wholesale (not appended to) once swiped, since it carries no listing info of its own. */

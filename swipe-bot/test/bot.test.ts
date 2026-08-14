@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
-  appendSwipeStatus, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
+  appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
@@ -120,6 +120,45 @@ test('formatCaption appends the commute line when given one, omits it entirely o
 
   assert.doesNotMatch(formatCaption(row({}), null), /📍/);
   assert.doesNotMatch(formatCaption(row({})), /📍/);
+});
+
+test('formatCaption includes an optional prefix ahead of the title, within the truncation budget', () => {
+  const withPrefix = formatCaption(row({}), null, '❤️ 3 of 12\n\n');
+  assert.match(withPrefix, /^❤️ 3 of 12\n\nSunny two-room flat/);
+});
+
+test('formatCaption without a prefix behaves exactly as before (no leading position line)', () => {
+  assert.doesNotMatch(formatCaption(row({})), /❤️/);
+});
+
+test('formatCaption truncates to 1024 chars even with a prefix present', () => {
+  const longDescription = 'x'.repeat(2000);
+  const caption = formatCaption(row({ description: longDescription }), null, '❤️ 3 of 12\n\n');
+  assert.ok(caption.length <= 1024, `caption was ${caption.length} chars`);
+  assert.ok(caption.startsWith('❤️ 3 of 12\n\n'));
+  assert.ok(caption.endsWith('…'));
+});
+
+test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order', () => {
+  const markup = shortlistNavButtons('willhaben:a', 2, 3) as unknown as { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } };
+  const row = markup.reply_markup.inline_keyboard[0];
+  assert.deepEqual(row.map((b) => b.text), ['◀️ Prev', '🗑️ Remove', '▶️ Next']);
+  assert.deepEqual(row.map((b) => b.callback_data), ['slnav:prev:willhaben:a', 'unlike:willhaben:a', 'slnav:next:willhaben:a']);
+});
+
+test('shortlistNavButtons: the first position omits Prev', () => {
+  const markup = shortlistNavButtons('willhaben:a', 1, 3) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove', '▶️ Next']);
+});
+
+test('shortlistNavButtons: the last position omits Next', () => {
+  const markup = shortlistNavButtons('willhaben:a', 3, 3) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['◀️ Prev', '🗑️ Remove']);
+});
+
+test('shortlistNavButtons: a single-item shortlist omits both Prev and Next', () => {
+  const markup = shortlistNavButtons('willhaben:a', 1, 1) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove']);
 });
 
 test('BOT_COMMANDS lists start, next, shortlist, settings, help, each with a non-empty description', () => {
