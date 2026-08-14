@@ -210,15 +210,14 @@ export function shortlistNavButtons(listingId: string, position: number, total: 
 
 /** Placeholder text used for the standalone buttons message that accompanies a multi-photo album — swapped wholesale (not appended to) once swiped, since it carries no listing info of its own. */
 export const SWIPE_PROMPT_TEXT = '👍 or 👎?';
-export const REMOVE_PROMPT_TEXT = '🗑️ to remove';
-const GROUP_PLACEHOLDER_TEXTS: string[] = [SWIPE_PROMPT_TEXT, REMOVE_PROMPT_TEXT];
+const GROUP_PLACEHOLDER_TEXTS: string[] = [SWIPE_PROMPT_TEXT];
 
 /** Pure — decides whether a swiped/removed card's status replaces its message text wholesale (the album-companion placeholder) or gets appended to real listing text (caption, or the no-photo full-text card). */
 export function appendSwipeStatus(originalText: string, status: string): string {
   return GROUP_PLACEHOLDER_TEXTS.includes(originalText) ? status : `${originalText}\n\n${status}`;
 }
 
-/** Low-level: sends a listing as photo album / single photo / text, with the given inline buttons. Shared by sendCard (swipe deck: 👍👎) and sendShortlistCard (🗑️ Remove). */
+/** Low-level: sends a listing as photo album / single photo / text, with the given inline buttons. Used by sendCard (swipe deck: 👍👎) — shortlist browsing (bot.ts) has its own single-photo-only sender, since a message it will later edit in place can never be a multi-photo album. */
 async function sendListingCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, caption: string,
   buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string,
@@ -246,14 +245,17 @@ export async function sendCard(
   await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT);
 }
 
-/** Telegram send calls per /shortlist invocation, above which the rest are summarized instead of sent — keeps a long shortlist from spamming dozens of messages at once. */
-export const MAX_SHORTLIST_CARDS = 20;
-
-/** Sends one shortlist entry as a browsable card with a single 🗑️ Remove button — no commute line, to avoid a Routes API call per item on every /shortlist call. */
-export async function sendShortlistCard(telegram: Telegraf['telegram'], chatId: number, card: ListingRow): Promise<void> {
-  const caption = formatCaption(card);
-  const buttons = Markup.inlineKeyboard([Markup.button.callback('🗑️ Remove', `unlike:${card.id}`)]);
-  await sendListingCard(telegram, chatId, card, caption, buttons, REMOVE_PROMPT_TEXT);
+/** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */
+async function sendShortlistBrowseCard(
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, position: number, total: number,
+): Promise<void> {
+  const caption = formatCaption(card, null, `❤️ ${position} of ${total}\n\n`);
+  const buttons = shortlistNavButtons(card.id, position, total);
+  if (card.images.length > 0) {
+    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
+  } else {
+    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+  }
 }
 
 /**
@@ -352,20 +354,14 @@ async function finishOnboarding(
   await sendNextCard(telegram, chatId, db, deps);
 }
 
-/** Sends the shortlist (or its empty-state message). Shared by /shortlist and the "📋 Shortlist" keyboard button. */
+/** Sends the first shortlist card (or the empty-state message). Shared by /shortlist and the "📋 Shortlist" keyboard button — from there, browsing the rest happens via Prev/Next/Remove on that one message, not further /shortlist calls. */
 async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
   const items = getShortlist(db, chatId);
   if (items.length === 0) {
     await telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
     return;
   }
-  const shown = items.slice(0, MAX_SHORTLIST_CARDS);
-  for (const item of shown) {
-    await sendShortlistCard(telegram, chatId, item);
-  }
-  if (items.length > MAX_SHORTLIST_CARDS) {
-    await telegram.sendMessage(chatId, `...and ${items.length - MAX_SHORTLIST_CARDS} more — narrow your prefs with /settings to see fewer at a time.`);
-  }
+  await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length);
 }
 
 /** Restarts the onboarding wizard from question 0. Shared by /settings and the "⚙️ Settings" keyboard button. */

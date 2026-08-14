@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
-  appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, MAX_SHORTLIST_CARDS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
+  appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
@@ -168,7 +168,6 @@ test('BOT_COMMANDS lists start, next, shortlist, settings, help, each with a non
 
 test('appendSwipeStatus replaces a group-companion placeholder wholesale, rather than appending to it', () => {
   assert.equal(appendSwipeStatus('👍 or 👎?', '✅ Added to shortlist'), '✅ Added to shortlist');
-  assert.equal(appendSwipeStatus('🗑️ to remove', '🗑️ Removed'), '🗑️ Removed');
 });
 
 test('appendSwipeStatus appends to a real caption/text, rather than replacing it', () => {
@@ -707,7 +706,7 @@ test('/shortlist sends nothing but the empty-state message when there are no lik
   assert.match(calls[0].payload.text as string, /shortlist is empty/);
 });
 
-test('/shortlist sends one card per liked listing, each with a Remove button, newest-liked first', async () => {
+test('/shortlist sends only the newest-liked item, as a single card with a position count and nav buttons', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'old', price: 500 }));
   upsertListing(db, listing({ id: 'new', price: 600 }));
@@ -717,25 +716,13 @@ test('/shortlist sends one card per liked listing, each with a Remove button, ne
   await bot.handleUpdate(commandUpdate(1, '/shortlist'));
 
   const cards = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€'));
-  assert.equal(cards.length, 2);
-  const buttons = cards.map((c) => (c.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard[0][0]);
-  assert.ok(buttons.every((b) => b.text === '🗑️ Remove'));
-  assert.deepEqual(buttons.map((b) => b.callback_data), ['unlike:willhaben:new', 'unlike:willhaben:old']);
-});
+  assert.equal(cards.length, 1); // only the first card, not the whole shortlist
+  assert.match(cards[0].payload.text as string, /❤️ 1 of 2/);
+  assert.match(cards[0].payload.text as string, /€600/); // newest-liked ('new') shown first
 
-test('/shortlist caps at MAX_SHORTLIST_CARDS and tells the user how many were left out', async () => {
-  const db = openDb(':memory:');
-  for (let i = 0; i < MAX_SHORTLIST_CARDS + 3; i++) {
-    upsertListing(db, listing({ id: `x${i}`, price: 500 }));
-    recordSwipe(db, 1, `willhaben:x${i}`, 'like');
-  }
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/shortlist'));
-
-  const cards = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€'));
-  assert.equal(cards.length, MAX_SHORTLIST_CARDS);
-  const trailing = calls.at(-1)!;
-  assert.match(trailing.payload.text as string, /3 more/);
+  const row = (cards[0].payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard[0];
+  assert.deepEqual(row.map((b) => b.text), ['🗑️ Remove', '▶️ Next']); // position 1 of 2 — no Prev, has Next
+  assert.deepEqual(row.map((b) => b.callback_data), ['unlike:willhaben:new', 'slnav:next:willhaben:new']);
 });
 
 test('tapping Remove on a shortlist card deletes the shortlist entry and edits the card to show it was removed', async () => {
