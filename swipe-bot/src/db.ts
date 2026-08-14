@@ -437,9 +437,12 @@ export function undoSwipe(db: DB, chatId: number, listingId: string): boolean {
 }
 
 export function getShortlist(db: DB, chatId: number): ListingRow[] {
+  // Tiebreak on s.rowid DESC (insertion order) since saved_at is millisecond-resolution ISO text —
+  // two likes recorded within the same millisecond (routine when swiping fast, or under test) would
+  // otherwise sort arbitrarily instead of consistently newest-liked-first.
   const rows = db.prepare(`
     SELECT l.* FROM shortlist s JOIN listings l ON l.id = s.listing_id
-    WHERE s.chat_id = ? ORDER BY s.saved_at DESC
+    WHERE s.chat_id = ? ORDER BY s.saved_at DESC, s.rowid DESC
   `).all(chatId) as Record<string, unknown>[];
   return rows.map(rowToListing);
 }

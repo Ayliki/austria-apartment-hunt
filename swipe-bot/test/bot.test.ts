@@ -725,18 +725,100 @@ test('/shortlist sends only the newest-liked item, as a single card with a posit
   assert.deepEqual(row.map((b) => b.callback_data), ['unlike:willhaben:new', 'slnav:next:willhaben:new']);
 });
 
-test('tapping Remove on a shortlist card deletes the shortlist entry and edits the card to show it was removed', async () => {
+test('tapping Next from position 1 of 3 edits the same message in place to position 2 of 3', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  upsertListing(db, listing({ id: 'b', price: 600 }));
+  upsertListing(db, listing({ id: 'c', price: 700 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  recordSwipe(db, 1, 'willhaben:c', 'like');
+  // newest-liked first: c (pos 1), b (pos 2), a (pos 3)
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:next:willhaben:c', { text: '❤️ 1 of 3\n\nFlat\n€700\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an in-place edit, not a new message');
+  assert.match(edit!.payload.text as string, /❤️ 2 of 3/);
+  assert.match(edit!.payload.text as string, /€600/);
+  assert.equal(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€')), false); // no new card message
+});
+
+test('tapping Prev at position 1 is refused with a distinct reply, nothing changes', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', price: 500 }));
   recordSwipe(db, 1, 'willhaben:a', 'like');
   const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(callbackUpdate(1, 'unlike:willhaben:a', { text: 'Sunny flat\n€500\nhttps://x/1' }));
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:prev:willhaben:a', { text: '❤️ 1 of 1\n\nFlat\n€500\nhttps://x/1\n(no photo)' }));
+
+  const answer = calls.find((c) => c.method === 'answerCallbackQuery');
+  assert.equal(answer!.payload.text, 'This is the first one.');
+  assert.equal(calls.some((c) => c.method === 'editMessageText'), false);
+});
+
+test('navigating to a listing whose photo-presence differs from the current message deletes and sends fresh, instead of an unsupported cross-type edit', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500, images: [] })); // no photo — current message is text
+  upsertListing(db, listing({ id: 'b', price: 600, images: ['https://img/1.jpg'] })); // has a photo — target
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  // newest-first: b (pos 1, has photo), a (pos 2, no photo) — Prev from 'a' goes to 'b'
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:prev:willhaben:a', { text: '❤️ 2 of 2\n\nFlat\n€500\nhttps://x/1\n(no photo)' }));
+
+  assert.ok(calls.some((c) => c.method === 'deleteMessage'), 'expected the old text card to be deleted');
+  assert.ok(calls.some((c) => c.method === 'sendPhoto'), 'expected a fresh photo message for the target');
+  assert.equal(calls.some((c) => c.method === 'editMessageText'), false);
+  assert.equal(calls.some((c) => c.method === 'editMessageMedia'), false);
+});
+
+test('tapping Remove on a middle item advances in place to the item that slid into its slot', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  upsertListing(db, listing({ id: 'b', price: 600 }));
+  upsertListing(db, listing({ id: 'c', price: 700 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  recordSwipe(db, 1, 'willhaben:c', 'like');
+  // newest-first: c (pos 1), b (pos 2), a (pos 3) — remove 'b' at position 2
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'unlike:willhaben:b', { text: '❤️ 2 of 3\n\nFlat\n€600\nhttps://x/1\n(no photo)' }));
+
+  const remaining = getShortlist(db, 1);
+  assert.deepEqual(remaining.map((l) => l.id).sort(), ['willhaben:a', 'willhaben:c'].sort());
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an in-place edit to the item that slid into position 2');
+  assert.match(edit!.payload.text as string, /❤️ 2 of 2/);
+  assert.match(edit!.payload.text as string, /€500/); // 'a' is now at position 2
+});
+
+test('tapping Remove on the last item advances to the new last item, position count decreases', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  upsertListing(db, listing({ id: 'b', price: 600 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  // newest-first: b (pos 1), a (pos 2) — remove 'a', the last one
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'unlike:willhaben:a', { text: '❤️ 2 of 2\n\nFlat\n€500\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an in-place edit to the new last item');
+  assert.match(edit!.payload.text as string, /❤️ 1 of 1/);
+  assert.match(edit!.payload.text as string, /€600/);
+});
+
+test('tapping Remove on the only remaining item shows the empty-shortlist message via delete+send', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'unlike:willhaben:a', { text: '❤️ 1 of 1\n\nFlat\n€500\nhttps://x/1\n(no photo)' }));
 
   assert.equal(getShortlist(db, 1).length, 0);
-  const edit = calls.find((c) => c.method === 'editMessageText');
-  assert.ok(edit, 'expected the shortlist card to be edited');
-  assert.match(edit!.payload.text as string, /🗑️ Removed/);
-  assert.deepEqual((edit!.payload.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard, []);
+  assert.ok(calls.some((c) => c.method === 'deleteMessage'), 'expected a deleteMessage call');
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('shortlist is empty')), 'expected the empty-shortlist message');
 });
 
 test('a swipe on a message that already has no reply markup is a no-op edit, not an error that blocks the next card', async () => {

@@ -334,6 +334,61 @@ async function clearSwipedCardButtons(
   }
 }
 
+/** Minimal shape replaceShortlistCard/replaceShortlistWithEmptyState need from a callback context. */
+interface ShortlistCardCtx {
+  callbackQuery?: { message?: unknown };
+  chat?: { id: number };
+  telegram: Telegraf['telegram'];
+  editMessageMedia: (media: { type: 'photo'; media: string; caption?: string }, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+  editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+  deleteMessage: () => Promise<unknown>;
+}
+
+/**
+ * Replaces the current callback message in place with a different shortlist position — editing the
+ * photo/text if the target's type (photo vs no-photo) matches the current message's type, since
+ * Telegram has no API to convert a message from one type to the other via edit. When the types
+ * differ, deletes the old message and sends a fresh one instead, so shortlist browsing never
+ * accumulates more than one message in the chat even across that edge case. Best-effort: an
+ * edit/delete failure (message too old, already gone) must never throw and block the response.
+ */
+async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, position: number, total: number): Promise<void> {
+  const message = ctx.callbackQuery?.message as { photo?: unknown } | undefined;
+  if (!message) return;
+  const chatId = ctx.chat!.id;
+  const caption = formatCaption(listing, null, `❤️ ${position} of ${total}\n\n`);
+  const buttons = shortlistNavButtons(listing.id, position, total);
+  const targetHasPhoto = listing.images.length > 0;
+  const currentHasPhoto = Boolean(message.photo);
+  try {
+    if (targetHasPhoto && currentHasPhoto) {
+      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption }, buttons);
+    } else if (!targetHasPhoto && !currentHasPhoto) {
+      await ctx.editMessageText(`${caption}\n(no photo)`, buttons);
+    } else {
+      await ctx.deleteMessage();
+      if (targetHasPhoto) {
+        await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons });
+      } else {
+        await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+      }
+    }
+  } catch {
+    // best-effort — see doc comment above
+  }
+}
+
+/** Replaces the current callback message with the empty-shortlist message — always delete+send, since there's no in-place target type to match against once nothing is left to browse. */
+async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx): Promise<void> {
+  const chatId = ctx.chat!.id;
+  try {
+    await ctx.deleteMessage();
+    await ctx.telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
+  } catch {
+    // best-effort
+  }
+}
+
 /** Finishes onboarding: saves prefs (base fields + resolved commute destination), confirms, and shows what's already queued up. */
 async function finishOnboarding(
   telegram: Telegraf['telegram'], db: DB, chatId: number, answers: string[],
@@ -474,12 +529,38 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     await clearSwipedCardButtons(ctx, '↩️ Undone');
   });
 
+  bot.action(/^slnav:(prev|next):(.+)$/, async (ctx) => {
+    const [, direction, listingId] = ctx.match;
+    const chatId = ctx.chat!.id;
+    const items = getShortlist(db, chatId);
+    const idx = items.findIndex((i) => i.id === listingId);
+    if (idx === -1) {
+      await ctx.answerCbQuery('This listing is no longer in your shortlist.');
+      return;
+    }
+    const targetIdx = direction === 'prev' ? idx - 1 : idx + 1;
+    if (targetIdx < 0 || targetIdx >= items.length) {
+      await ctx.answerCbQuery(direction === 'prev' ? 'This is the first one.' : 'This is the last one.');
+      return;
+    }
+    await ctx.answerCbQuery();
+    await replaceShortlistCard(ctx, items[targetIdx], targetIdx + 1, items.length);
+  });
+
   bot.action(/^unlike:(.+)$/, async (ctx) => {
     const [, listingId] = ctx.match;
     const chatId = ctx.chat!.id;
+    const before = getShortlist(db, chatId);
+    const removedIndex = before.findIndex((i) => i.id === listingId);
     removeFromShortlist(db, chatId, listingId);
     await ctx.answerCbQuery('Removed from shortlist 🗑️');
-    await clearSwipedCardButtons(ctx, '🗑️ Removed');
+    const after = getShortlist(db, chatId);
+    if (after.length === 0) {
+      await replaceShortlistWithEmptyState(ctx);
+      return;
+    }
+    const nextIndex = Math.min(Math.max(removedIndex, 0), after.length - 1);
+    await replaceShortlistCard(ctx, after[nextIndex], nextIndex + 1, after.length);
   });
 
   return bot;
