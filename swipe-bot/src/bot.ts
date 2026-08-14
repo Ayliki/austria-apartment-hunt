@@ -345,12 +345,38 @@ interface ShortlistCardCtx {
 }
 
 /**
+ * Deletes the current callback message and sends a fresh photo/text message in its place — the
+ * fallback path for both the cross-type case (Telegram can't convert a message's type via edit)
+ * and for when an in-place edit itself fails. Delete and send are each best-effort on their own:
+ * a delete failure (message too old, already gone) must never suppress the send that was supposed
+ * to follow it, and a send failure must never throw and block the response.
+ */
+async function deleteAndSendShortlistCard(
+  ctx: ShortlistCardCtx, chatId: number, listing: ListingRow, caption: string, buttons: ReturnType<typeof Markup.inlineKeyboard>,
+): Promise<void> {
+  try {
+    await ctx.deleteMessage();
+  } catch {
+    // best-effort — an old/already-gone message can't always be deleted
+  }
+  try {
+    if (listing.images.length > 0) {
+      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons });
+    } else {
+      await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+    }
+  } catch {
+    // best-effort — see doc comment above
+  }
+}
+
+/**
  * Replaces the current callback message in place with a different shortlist position — editing the
  * photo/text if the target's type (photo vs no-photo) matches the current message's type, since
  * Telegram has no API to convert a message from one type to the other via edit. When the types
- * differ, deletes the old message and sends a fresh one instead, so shortlist browsing never
- * accumulates more than one message in the chat even across that edge case. Best-effort: an
- * edit/delete failure (message too old, already gone) must never throw and block the response.
+ * differ, or when the in-place edit itself fails (e.g. an expired CDN image URL), falls back to
+ * deleting the old message and sending a fresh one instead — so the user always ends up seeing the
+ * target card, just via a fresh message rather than a true in-place edit in that edge case.
  */
 async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, position: number, total: number): Promise<void> {
   const message = ctx.callbackQuery?.message as { photo?: unknown } | undefined;
@@ -360,22 +386,22 @@ async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, 
   const buttons = shortlistNavButtons(listing.id, position, total);
   const targetHasPhoto = listing.images.length > 0;
   const currentHasPhoto = Boolean(message.photo);
-  try {
-    if (targetHasPhoto && currentHasPhoto) {
+  if (targetHasPhoto && currentHasPhoto) {
+    try {
       await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption }, buttons);
-    } else if (!targetHasPhoto && !currentHasPhoto) {
-      await ctx.editMessageText(`${caption}\n(no photo)`, buttons);
-    } else {
-      await ctx.deleteMessage();
-      if (targetHasPhoto) {
-        await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons });
-      } else {
-        await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
-      }
+      return;
+    } catch {
+      // in-place edit failed (e.g. expired image URL) — fall through to delete+send below
     }
-  } catch {
-    // best-effort — see doc comment above
+  } else if (!targetHasPhoto && !currentHasPhoto) {
+    try {
+      await ctx.editMessageText(`${caption}\n(no photo)`, buttons);
+      return;
+    } catch {
+      // in-place edit failed — fall through to delete+send below
+    }
   }
+  await deleteAndSendShortlistCard(ctx, chatId, listing, caption, buttons);
 }
 
 /** Replaces the current callback message with the empty-shortlist message — always delete+send, since there's no in-place target type to match against once nothing is left to browse. */
@@ -383,6 +409,10 @@ async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx): Promise<vo
   const chatId = ctx.chat!.id;
   try {
     await ctx.deleteMessage();
+  } catch {
+    // best-effort — an old/already-gone message can't always be deleted
+  }
+  try {
     await ctx.telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
   } catch {
     // best-effort

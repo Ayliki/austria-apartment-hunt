@@ -204,9 +204,17 @@ interface Call { method: string; payload: Record<string, unknown> }
 // the prototype is the only stable interception point. `activeCalls` routes to whichever test
 // bot is currently mid-await; tests in this file run sequentially, so this is safe.
 let activeCalls: Call[] | null = null;
+// When set, callApi throws for this one method on its next invocation, then clears itself —
+// used to simulate a Telegram API failure (e.g. editMessageMedia rejecting an expired CDN URL)
+// without needing a full mock-framework dependency.
+let forceFailureOnce: string | null = null;
 (Telegram.prototype as unknown as { callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown> }).callApi =
   async function callApi(method, payload) {
     if (!activeCalls) throw new Error('callApi invoked outside a test bot context');
+    if (forceFailureOnce === method) {
+      forceFailureOnce = null;
+      throw new Error(`simulated ${method} failure`);
+    }
     activeCalls.push({ method, payload });
     if (method === 'sendMediaGroup') return [];
     if (method === 'answerCallbackQuery') return true;
@@ -725,6 +733,21 @@ test('/shortlist sends only the newest-liked item, as a single card with a posit
   assert.deepEqual(row.map((b) => b.callback_data), ['unlike:willhaben:new', 'slnav:next:willhaben:new']);
 });
 
+test('/shortlist on a listing with a photo sends a sendPhoto card, not a text message', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'new', price: 600, images: ['https://img/1.jpg'] }));
+  recordSwipe(db, 1, 'willhaben:new', 'like');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/shortlist'));
+
+  const photoCall = calls.find((c) => c.method === 'sendPhoto');
+  assert.ok(photoCall, 'expected a sendPhoto call for a listing with an image');
+  assert.equal(photoCall!.payload.photo, 'https://img/1.jpg');
+  assert.match(photoCall!.payload.caption as string, /❤️ 1 of 1/);
+  assert.match(photoCall!.payload.caption as string, /€600/);
+  assert.equal(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€')), false); // no text card
+});
+
 test('tapping Next from position 1 of 3 edits the same message in place to position 2 of 3', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', price: 500 }));
@@ -742,6 +765,49 @@ test('tapping Next from position 1 of 3 edits the same message in place to posit
   assert.match(edit!.payload.text as string, /❤️ 2 of 3/);
   assert.match(edit!.payload.text as string, /€600/);
   assert.equal(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€')), false); // no new card message
+});
+
+test('tapping Next from a photo card to another photo card edits the media in place, not delete+resend', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500, images: ['https://img/a.jpg'] }));
+  upsertListing(db, listing({ id: 'b', price: 600, images: ['https://img/b.jpg'] }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  // newest-first: b (pos 1, photo), a (pos 2, photo) — Next from 'b' goes to 'a'
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:next:willhaben:b', { photo: [{ file_id: 'x' }], caption: '❤️ 1 of 2\n\nFlat\n€600\nhttps://x/1' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageMedia');
+  assert.ok(edit, 'expected an in-place media edit, not delete+resend');
+  const media = edit!.payload.media as { type: string; media: string; caption?: string };
+  assert.equal(media.type, 'photo');
+  assert.equal(media.media, 'https://img/a.jpg');
+  assert.match(media.caption ?? '', /❤️ 2 of 2/);
+  assert.match(media.caption ?? '', /€500/);
+  assert.equal(calls.some((c) => c.method === 'deleteMessage'), false);
+  assert.equal(calls.some((c) => c.method === 'sendPhoto'), false);
+});
+
+test('when editMessageMedia fails (e.g. an expired image URL), falls back to delete+send so the target card still shows', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', price: 500, images: ['https://img/a.jpg'] }));
+  upsertListing(db, listing({ id: 'b', price: 600, images: ['https://img/b.jpg'] }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  // newest-first: b (pos 1, photo), a (pos 2, photo) — Next from 'b' goes to 'a'
+  const { bot, calls } = createTestBot(db);
+  forceFailureOnce = 'editMessageMedia';
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:next:willhaben:b', { photo: [{ file_id: 'x' }], caption: '❤️ 1 of 2\n\nFlat\n€600\nhttps://x/1' }));
+
+  assert.equal(calls.some((c) => c.method === 'editMessageMedia'), false); // the failed attempt itself isn't recorded
+  const deleteIdx = calls.findIndex((c) => c.method === 'deleteMessage');
+  const sendIdx = calls.findIndex((c) => c.method === 'sendPhoto');
+  assert.ok(deleteIdx !== -1, 'expected a deleteMessage fallback after the failed edit');
+  assert.ok(sendIdx !== -1, 'expected a sendPhoto fallback after the failed edit');
+  assert.ok(deleteIdx < sendIdx, 'expected delete to precede the fresh send');
+  const sendPayload = calls[sendIdx].payload;
+  assert.equal(sendPayload.photo, 'https://img/a.jpg');
+  assert.match(sendPayload.caption as string, /❤️ 2 of 2/);
 });
 
 test('tapping Prev at position 1 is refused with a distinct reply, nothing changes', async () => {
