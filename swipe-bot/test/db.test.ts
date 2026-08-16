@@ -697,6 +697,13 @@ test('updateSearchProfile overwrites prefs without changing name/active/id', () 
   assert.equal(updated.active, true);
 });
 
+test('a profile created with priceTo: Infinity round-trips as priceTo: null (JSON has no Infinity, and null already means "no upper bound")', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'No limit', prefs({ priceTo: Infinity }));
+  const [loaded] = getSearchProfiles(db, 1);
+  assert.equal(loaded.prefs.priceTo, null);
+});
+
 test('renameSearchProfile changes only the name', () => {
   const db = openDb(':memory:');
   const p = createSearchProfile(db, 1, 'Studio Center', prefs());

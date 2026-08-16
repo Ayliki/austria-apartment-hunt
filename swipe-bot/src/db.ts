@@ -487,6 +487,11 @@ export interface SearchProfile {
 export const MAX_SEARCH_PROFILES_PER_CHAT = 5;
 
 function rowToSearchProfile(row: Record<string, unknown>): SearchProfile {
+  // Note on prefs.priceTo: the wizard's top budget band (wizard.ts's BUDGET_BANDS) uses
+  // priceTo: Infinity for "no upper bound". JSON.stringify(Infinity) serializes to `null`, so
+  // JSON.parse here already hands back priceTo: null for that band with no extra handling needed
+  // — and matchesPrefs/getCandidateListings already treat a null/undefined priceTo as unbounded,
+  // so this round-trip is consistent with every other "no limit" prefs field, not a special case.
   return {
     id: row.id as number,
     chatId: row.chat_id as number,
