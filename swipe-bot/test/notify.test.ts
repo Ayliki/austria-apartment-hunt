@@ -81,23 +81,24 @@ test('notifyNewMatches does nothing when there are no new listings', async () =>
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches sends one header plus one message per shown listing, each with a View button', async () => {
+test('notifyNewMatches sends one header plus a full swipe card per shown listing', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  const matches = Array.from({ length: 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
+  const matches = Array.from({ length: 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700, images: ['https://img/1.jpg'] }));
   const { delay } = noSleepDelay();
   await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
 
   const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  assert.equal(sendMessageCalls.length, 4); // header + 3 listings
+  const sendPhotoCalls = calls.filter((c) => c.method === 'sendPhoto');
+  assert.equal(sendMessageCalls.length, 1); // header only
+  assert.equal(sendPhotoCalls.length, 3); // one full card per listing
   assert.match(sendMessageCalls[0].payload.text as string, /🏠 Test — 3 new matches:/);
-  for (let i = 1; i <= 3; i++) {
-    const text = sendMessageCalls[i].payload.text as string;
-    assert.match(text, /€700/);
-    const keyboard = (sendMessageCalls[i].payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] });
-    assert.ok(keyboard.inline_keyboard.some((r) => r.some((b) => b.callback_data.startsWith('view:'))), 'each listing message has a View button');
+  for (const c of sendPhotoCalls) {
+    assert.match(c.payload.caption as string, /€700/);
+    const keyboard = (c.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] });
+    assert.ok(keyboard.inline_keyboard.some((r) => r.some((b) => b.callback_data.startsWith('like:') || b.callback_data.startsWith('pass:'))), 'each card has 👍/👎 buttons');
   }
 });
 
@@ -106,12 +107,14 @@ test('notifyNewMatches caps each profile at MAX_PUSH_PER_USER matches shown, wit
   createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
+  const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700, images: ['https://img/1.jpg'] }));
   const { delay } = noSleepDelay();
   await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
 
   const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  assert.equal(sendMessageCalls.length, 1 + MAX_PUSH_PER_USER + 1); // header + capped listings + "+N more"
+  const sendPhotoCalls = calls.filter((c) => c.method === 'sendPhoto');
+  assert.equal(sendPhotoCalls.length, MAX_PUSH_PER_USER); // capped number of full cards
+  assert.equal(sendMessageCalls.length, 2); // header + "+N more"
   assert.match(sendMessageCalls[0].payload.text as string, new RegExp(`${matches.length} new matches`));
   assert.match(sendMessageCalls.at(-1)!.payload.text as string, /\+3 more — check \/next\./);
 });
@@ -211,12 +214,12 @@ test('notifyNewMatches includes each listing\'s commute line when the profile ha
   createSearchProfile(db, 1, 'Commuter', commuteProfilePrefs());
   const { telegram, calls } = testTelegram();
 
-  const matches = [row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37 })];
+  const matches = [row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37, images: ['https://img/1.jpg'] })];
   await notifyNewMatches(telegram, db, matches, WORKING_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
-  const listingMessages = calls.filter((c) => c.method === 'sendMessage' && !(c.payload.text as string).startsWith('🏠'));
+  const listingMessages = calls.filter((c) => c.method === 'sendPhoto');
   assert.equal(listingMessages.length, 1);
-  assert.match(listingMessages[0].payload.text as string, /📍 18 min walk · 7 min by tram D to TU Wien/);
+  assert.match(listingMessages[0].payload.caption as string, /📍 18 min walk · 7 min by tram D to TU Wien/);
 });
 
 test('notifyNewMatches degrades a single listing to no commute line on a Routes failure, without aborting the rest of the push', async () => {
@@ -226,17 +229,16 @@ test('notifyNewMatches degrades a single listing to no commute line on a Routes 
 
   const failingComputeCommute: ComputeCommuteFn = async () => { throw new Error('Routes API down'); };
   const matches = [
-    row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37 }),
-    row({ id: 'willhaben:b', price: 750, lat: 48.21, lon: 16.38 }),
+    row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37, images: ['https://img/1.jpg'] }),
+    row({ id: 'willhaben:b', price: 750, lat: 48.21, lon: 16.38, images: ['https://img/2.jpg'] }),
   ];
   await notifyNewMatches(telegram, db, matches, failingComputeCommute, NEVER_GEOCODE);
 
-  const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  assert.equal(sendMessageCalls.length, 3, 'the push loop must complete despite the Routes failure');
-  const listingMessages = sendMessageCalls.filter((c) => !(c.payload.text as string).startsWith('🏠'));
-  assert.match(listingMessages[0].payload.text as string, /€700/);
-  assert.match(listingMessages[1].payload.text as string, /€750/);
-  for (const m of listingMessages) {
-    assert.doesNotMatch(m.payload.text as string, /📍/, 'no commute line should appear when the Routes call fails');
+  const sendPhotoCalls = calls.filter((c) => c.method === 'sendPhoto');
+  assert.equal(sendPhotoCalls.length, 2, 'the push loop must complete despite the Routes failure');
+  for (const c of sendPhotoCalls) {
+    const caption = c.payload.caption as string;
+    assert.ok(/€700|€750/.test(caption));
+    assert.doesNotMatch(caption, /📍/, 'no commute line should appear when the Routes call fails');
   }
 });

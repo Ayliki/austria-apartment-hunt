@@ -1,10 +1,10 @@
-import { Markup, type Telegraf } from 'telegraf';
+import { type Telegraf } from 'telegraf';
 import {
   type DB, type ListingRow,
   getAllSearchProfiles, getSwipedWithDirection, matchesPrefs, MCP_CHAT_ID,
 } from './db.js';
 import { rankListings } from './scoring.js';
-import { getCommuteLineFor, type ComputeCommuteFn, type GeocodeFn } from './bot.js';
+import { sendCard, getCommuteLineFor, type ComputeCommuteFn, type GeocodeFn } from './bot.js';
 import { t } from './locales.js';
 
 /** Caps a single push burst per user — protects against a preference change (or a big poll) flooding a chat. */
@@ -44,11 +44,11 @@ export function formatPushEntry(l: ListingRow, commuteLine: string | null = null
  * as soon as it's found instead of only on their next /next. Best-ranked matches are sent first;
  * the MCP sentinel chat is skipped since it has no real Telegram chat to push to.
  *
- * Delivery is grouped and paced per profile rather than bursting one message per listing: each
- * matching profile gets a header (naming the profile, since Tasks 7-9 let one chat hold several
- * saved searches) followed by one compact message per shown listing, each with a [View ▸] button
- * that opens the full card on demand. A stagger between profiles avoids Telegram flood-control on
- * chats with multiple active searches.
+ * Delivery is grouped and paced per profile: each matching profile gets a header (naming the
+ * profile, since one chat can hold several saved searches) followed by a full swipe-style card for
+ * each shown listing — photo album / single photo / text-with-caption, with the same 👍/👎 buttons
+ * as /next. A stagger between profiles avoids Telegram flood-control on chats with multiple active
+ * searches.
  *
  * Product decision (flagged by Task 3's review, resolved here): getAllSearchProfiles returns every
  * saved profile for a chat regardless of its `active` flag, and this function deliberately does not
@@ -88,10 +88,8 @@ export async function notifyNewMatches(
       } catch {
         commuteLine = null;
       }
-      const viewButton = Markup.inlineKeyboard([
-        [Markup.button.callback(t(db, profile.chatId, 'push_view'), `view:${l.id}`)],
-      ]);
-      await telegram.sendMessage(profile.chatId, formatPushEntry(l, commuteLine), viewButton);
+      // Send the full swipe card so pushes include every photo, not just a one-image link preview.
+      await sendCard(telegram, profile.chatId, l, commuteLine, db);
     }
 
     if (matches.length > toShow.length) {
