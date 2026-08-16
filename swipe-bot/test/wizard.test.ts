@@ -62,9 +62,10 @@ test('a choice that does not belong to the current step throws', () => {
   assert.throws(() => applyWizardChoice(s, { kind: 'commute_skip' }));
 });
 
-test('BUDGET_BANDS has the four bands from the spec, in order', () => {
-  assert.deepEqual(BUDGET_BANDS.map((b) => b.label), ['€500-700', '€700-900', '€900-1100', '€1100+']);
-  assert.equal(BUDGET_BANDS[3].priceTo, Infinity); // "No limit" style top band
+test('BUDGET_BANDS has the four spec bands plus a "no minimum" escape hatch, in order', () => {
+  assert.deepEqual(BUDGET_BANDS.map((b) => b.label), ['Under €500', '€500-700', '€700-900', '€900-1100', '€1100+']);
+  assert.equal(BUDGET_BANDS[0].priceFrom, null); // "no minimum" style bottom band
+  assert.equal(BUDGET_BANDS.at(-1)!.priceTo, Infinity); // "No limit" style top band
 });
 
 test('DISTRICT_GROUPS covers 1-23 with no gaps or overlaps', () => {

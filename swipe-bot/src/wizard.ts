@@ -27,7 +27,11 @@ export type WizardChoice =
   | { kind: 'budget'; priceFrom: number | null; priceTo: number }
   | { kind: 'districts_toggle'; district: number }
   | { kind: 'districts_continue' }
-  | { kind: 'rooms_size'; roomsFrom: number | null; roomsTo: number | null; areaFrom: number | null; areaTo: number | null }
+  // areaFrom/areaTo are accepted for backward compatibility with older callers/tests but are never
+  // actually applied (see applyWizardChoice's 'rooms_size' case below) — this step only ever offers
+  // room-count chips, never an area range, so it must not silently clobber a profile's existing area
+  // filter (e.g. one carried over from a pre-search-profiles migration) when only rooms is edited.
+  | { kind: 'rooms_size'; roomsFrom: number | null; roomsTo: number | null; areaFrom?: number | null; areaTo?: number | null }
   | { kind: 'amenity_toggle'; field: 'requireElevator' | 'requireParking' | 'includeWaitlistHousing' | 'includeWg' }
   | { kind: 'amenities_continue' }
   | { kind: 'commute_skip' }
@@ -35,6 +39,9 @@ export type WizardChoice =
   | { kind: 'back' };
 
 export const BUDGET_BANDS: { label: string; priceFrom: number | null; priceTo: number }[] = [
+  // priceFrom: null here means "no minimum" — without this band the cheapest chip (€500-700) hard-
+  // excluded anything under €500, with no escape hatch for someone whose budget is genuinely lower.
+  { label: 'Under €500', priceFrom: null, priceTo: 500 },
   { label: '€500-700', priceFrom: 500, priceTo: 700 },
   { label: '€700-900', priceFrom: 700, priceTo: 900 },
   { label: '€900-1100', priceFrom: 900, priceTo: 1100 },
@@ -63,7 +70,9 @@ export function applyWizardChoice(state: WizardState, choice: WizardChoice): Wiz
       name: [],
       budget: ['priceFrom', 'priceTo'],
       districts: ['districts'],
-      rooms_size: ['roomsFrom', 'roomsTo', 'areaFrom', 'areaTo'],
+      // Not areaFrom/areaTo — this step never sets them (see WizardChoice's 'rooms_size' comment
+      // above), so going back from it must not clear an area filter it never touched.
+      rooms_size: ['roomsFrom', 'roomsTo'],
       amenities: ['requireElevator', 'requireParking', 'includeWaitlistHousing', 'includeWg'],
       commute: ['commuteDestination', 'commuteLat', 'commuteLon'],
     };
@@ -92,10 +101,13 @@ export function applyWizardChoice(state: WizardState, choice: WizardChoice): Wiz
       return { ...state, stepIndex: state.stepIndex + 1 };
     case 'rooms_size':
       if (step !== 'rooms_size') throw new Error(`wizard is on step "${step}", not "rooms_size"`);
+      // Deliberately does NOT touch areaFrom/areaTo — this step only ever offers room-count chips
+      // (1/2/3+/Any), never an area range, so a pre-existing area filter (e.g. carried over from a
+      // pre-search-profiles migration, or set by some future step) must survive an edit made here.
       return {
         ...state,
         stepIndex: state.stepIndex + 1,
-        partial: { ...state.partial, roomsFrom: choice.roomsFrom, roomsTo: choice.roomsTo, areaFrom: choice.areaFrom, areaTo: choice.areaTo },
+        partial: { ...state.partial, roomsFrom: choice.roomsFrom, roomsTo: choice.roomsTo },
       };
     case 'amenity_toggle': {
       if (step !== 'amenities') throw new Error(`wizard is on step "${step}", not "amenities"`);
