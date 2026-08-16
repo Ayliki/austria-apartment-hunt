@@ -16,15 +16,18 @@ export interface WizardState {
   partial: Partial<SearchProfilePrefs>;
   /** Non-null means `/settings` jumped straight to editing one step of an existing profile (see Task 6) rather than running the full onboarding flow. */
   editingProfileId: number | null;
+  /** True when the user tapped "Custom range" on the budget step and the next free-text message should be parsed as a custom price range. */
+  awaitingCustomBudget: boolean;
 }
 
 export function initialWizardState(): WizardState {
-  return { stepIndex: 0, profileName: null, partial: {}, editingProfileId: null };
+  return { stepIndex: 0, profileName: null, partial: {}, editingProfileId: null, awaitingCustomBudget: false };
 }
 
 export type WizardChoice =
   | { kind: 'name'; name: string }
   | { kind: 'budget'; priceFrom: number | null; priceTo: number }
+  | { kind: 'budget_custom' }
   | { kind: 'districts_toggle'; district: number }
   | { kind: 'districts_continue' }
   // areaFrom/areaTo are accepted for backward compatibility with older callers/tests but are never
@@ -87,7 +90,10 @@ export function applyWizardChoice(state: WizardState, choice: WizardChoice): Wiz
       return { ...state, stepIndex: state.stepIndex + 1, profileName: choice.name };
     case 'budget':
       if (step !== 'budget') throw new Error(`wizard is on step "${step}", not "budget"`);
-      return { ...state, stepIndex: state.stepIndex + 1, partial: { ...state.partial, priceFrom: choice.priceFrom, priceTo: choice.priceTo } };
+      return { ...state, stepIndex: state.stepIndex + 1, awaitingCustomBudget: false, partial: { ...state.partial, priceFrom: choice.priceFrom, priceTo: choice.priceTo } };
+    case 'budget_custom':
+      if (step !== 'budget') throw new Error(`wizard is on step "${step}", not "budget"`);
+      return { ...state, awaitingCustomBudget: true };
     case 'districts_toggle': {
       if (step !== 'districts') throw new Error(`wizard is on step "${step}", not "districts"`);
       const current = state.partial.districts ?? [];
@@ -142,6 +148,49 @@ export function applyWizardChoice(state: WizardState, choice: WizardChoice): Wiz
 
 export function isWizardComplete(state: WizardState): boolean {
   return state.stepIndex >= WIZARD_STEPS.length;
+}
+
+/**
+ * Parses free-text budget input into a price range. Supported shapes (case-insensitive, € and spaces
+ * ignored): "500-1200", "<1200", "under 1200", "500+", "from 500", "max 800", or a bare number
+ * (treated as the upper limit). Returns null for anything that can't be confidently interpreted.
+ */
+export function parseCustomBudget(input: string): { priceFrom: number | null; priceTo: number | null } | null {
+  const s = input.replace(/[€\s]/g, '').toLowerCase();
+  if (!s) return null;
+
+  const rangeMatch = s.match(/^(\d+)[\-–](\d+)$/);
+  if (rangeMatch) {
+    const from = Number(rangeMatch[1]);
+    const to = Number(rangeMatch[2]);
+    if (from >= to || from < 0 || to < 0) return null;
+    return { priceFrom: from, priceTo: to };
+  }
+
+  const maxMatch = s.match(/^(?:<|under|max|upto)(\d+)$/);
+  if (maxMatch) {
+    const to = Number(maxMatch[1]);
+    return to >= 0 ? { priceFrom: null, priceTo: to } : null;
+  }
+
+  const minMatch = s.match(/^(\d+)\+$/);
+  if (minMatch) {
+    const from = Number(minMatch[1]);
+    return from >= 0 ? { priceFrom: from, priceTo: null } : null;
+  }
+  const minKeywordMatch = s.match(/^(?:>|from|min)(\d+)$/);
+  if (minKeywordMatch) {
+    const from = Number(minKeywordMatch[1]);
+    return from >= 0 ? { priceFrom: from, priceTo: null } : null;
+  }
+
+  const singleMatch = s.match(/^(\d+)$/);
+  if (singleMatch) {
+    const to = Number(singleMatch[1]);
+    return to >= 0 ? { priceFrom: null, priceTo: to } : null;
+  }
+
+  return null;
 }
 
 /** Throws if the wizard hasn't reached the end — callers must check isWizardComplete first. Fills in the neutral default for any optional step that was somehow never visited (e.g. jumping straight from districts to commute via editingProfileId). */

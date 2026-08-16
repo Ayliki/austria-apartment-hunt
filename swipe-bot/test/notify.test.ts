@@ -81,21 +81,24 @@ test('notifyNewMatches does nothing when there are no new listings', async () =>
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches sends one header + one compact-entries message per matching profile, not one message per listing', async () => {
+test('notifyNewMatches sends one header plus one message per shown listing, each with a View button', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  const matches = Array.from({ length: 7 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
+  const matches = Array.from({ length: 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
   const { delay } = noSleepDelay();
   await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
 
   const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  assert.equal(sendMessageCalls.length, 2);
-  assert.match(sendMessageCalls[0].payload.text as string, /🏠 Test — 7 new matches:/);
-  const entriesText = sendMessageCalls[1].payload.text as string;
-  const entryCount = (entriesText.match(/€700/g) ?? []).length;
-  assert.equal(entryCount, MAX_PUSH_PER_USER); // compact entries block, one line per shown listing, capped
+  assert.equal(sendMessageCalls.length, 4); // header + 3 listings
+  assert.match(sendMessageCalls[0].payload.text as string, /🏠 Test — 3 new matches:/);
+  for (let i = 1; i <= 3; i++) {
+    const text = sendMessageCalls[i].payload.text as string;
+    assert.match(text, /€700/);
+    const keyboard = (sendMessageCalls[i].payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] });
+    assert.ok(keyboard.inline_keyboard.some((r) => r.some((b) => b.callback_data.startsWith('view:'))), 'each listing message has a View button');
+  }
 });
 
 test('notifyNewMatches caps each profile at MAX_PUSH_PER_USER matches shown, with a "+N more" note', async () => {
@@ -107,12 +110,10 @@ test('notifyNewMatches caps each profile at MAX_PUSH_PER_USER matches shown, wit
   const { delay } = noSleepDelay();
   await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
 
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.equal(texts.length, 2);
-  assert.match(texts[0], new RegExp(`${matches.length} new matches`));
-  assert.match(texts[1], /\+3 more — check \/next\./);
-  const entryCount = (texts[1].match(/€700/g) ?? []).length;
-  assert.equal(entryCount, MAX_PUSH_PER_USER);
+  const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(sendMessageCalls.length, 1 + MAX_PUSH_PER_USER + 1); // header + capped listings + "+N more"
+  assert.match(sendMessageCalls[0].payload.text as string, new RegExp(`${matches.length} new matches`));
+  assert.match(sendMessageCalls.at(-1)!.payload.text as string, /\+3 more — check \/next\./);
 });
 
 test('notifyNewMatches header includes the profile name so multi-profile users know which search matched', async () => {
@@ -213,8 +214,9 @@ test('notifyNewMatches includes each listing\'s commute line when the profile ha
   const matches = [row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37 })];
   await notifyNewMatches(telegram, db, matches, WORKING_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
-  const entriesText = calls.find((c) => c.method === 'sendMessage' && !(c.payload.text as string).startsWith('🏠'))!.payload.text as string;
-  assert.match(entriesText, /📍 18 min walk · 7 min by tram D to TU Wien/);
+  const listingMessages = calls.filter((c) => c.method === 'sendMessage' && !(c.payload.text as string).startsWith('🏠'));
+  assert.equal(listingMessages.length, 1);
+  assert.match(listingMessages[0].payload.text as string, /📍 18 min walk · 7 min by tram D to TU Wien/);
 });
 
 test('notifyNewMatches degrades a single listing to no commute line on a Routes failure, without aborting the rest of the push', async () => {
@@ -230,9 +232,11 @@ test('notifyNewMatches degrades a single listing to no commute line on a Routes 
   await notifyNewMatches(telegram, db, matches, failingComputeCommute, NEVER_GEOCODE);
 
   const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  assert.equal(sendMessageCalls.length, 2, 'the push loop must complete despite the Routes failure');
-  const entriesText = sendMessageCalls[1].payload.text as string;
-  assert.match(entriesText, /€700/);
-  assert.match(entriesText, /€750/);
-  assert.doesNotMatch(entriesText, /📍/, 'no commute line should appear when the Routes call fails');
+  assert.equal(sendMessageCalls.length, 3, 'the push loop must complete despite the Routes failure');
+  const listingMessages = sendMessageCalls.filter((c) => !(c.payload.text as string).startsWith('🏠'));
+  assert.match(listingMessages[0].payload.text as string, /€700/);
+  assert.match(listingMessages[1].payload.text as string, /€750/);
+  for (const m of listingMessages) {
+    assert.doesNotMatch(m.payload.text as string, /📍/, 'no commute line should appear when the Routes call fails');
+  }
 });

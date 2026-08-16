@@ -407,7 +407,7 @@ test('completing the wizard end-to-end creates an active SearchProfile with the 
   await bot.handleUpdate(callbackUpdate(1, 'wizard:district:6')); // toggle district 6
   await bot.handleUpdate(callbackUpdate(1, 'wizard:district:7')); // toggle district 7
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue')); // -> rooms/size step
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1')); // rooms chip -> amenities step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:')); // rooms chip -> amenities step
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenity:requireElevator')); // toggle elevator on
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue')); // -> commute step
   await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip')); // completes the wizard
@@ -420,7 +420,7 @@ test('completing the wizard end-to-end creates an active SearchProfile with the 
   assert.equal(profile.active, true);
   assert.equal(profile.name, 'Studio Center');
   assert.deepEqual(profile.prefs, {
-    priceFrom: 700, priceTo: 900, districts: [6, 7], roomsFrom: 1, roomsTo: 1, areaFrom: null, areaTo: null,
+    priceFrom: 700, priceTo: 900, districts: [6, 7], roomsFrom: 1, roomsTo: null, areaFrom: null, areaTo: null,
     includeWaitlistHousing: false, includeWg: false, requireElevator: true, requireParking: false,
     commuteDestination: null, commuteLat: null, commuteLon: null,
   });
@@ -570,7 +570,7 @@ test('opting out of waitlist housing and WG rooms via the amenity chips excludes
   await bot.handleUpdate(textUpdate(1, 'My Search'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue')); // neither amenity chip tapped -> both default false
   await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip'));
 
@@ -588,7 +588,7 @@ test('opting in to waitlist housing and WG rooms via the amenity chips includes 
   await bot.handleUpdate(textUpdate(1, 'My Search'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenity:includeWaitlistHousing'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenity:includeWg'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
@@ -609,7 +609,7 @@ test('a successfully geocoded commute destination is saved on wizard completion'
   await bot.handleUpdate(textUpdate(1, 'My Search'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
   await bot.handleUpdate(textUpdate(1, 'TU Wien')); // commute step is free-text
 
@@ -626,7 +626,7 @@ test('an unresolvable commute destination re-asks instead of saving garbage or a
   await bot.handleUpdate(textUpdate(1, 'My Search'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
   await bot.handleUpdate(textUpdate(1, 'nowhere'));
 
@@ -634,7 +634,7 @@ test('an unresolvable commute destination re-asks instead of saving garbage or a
   assert.ok(state, 'still mid-wizard, waiting on the commute step');
   assert.equal(WIZARD_STEPS[state!.stepIndex], 'commute');
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts.at(-1) as string, /couldn't find that location/);
+  assert.match(texts.at(-1) as string, /Couldn't find that location/);
 });
 
 test('tapping Skip on the commute step saves no destination and completes the wizard', async () => {
@@ -644,7 +644,7 @@ test('tapping Skip on the commute step saves no destination and completes the wi
   await bot.handleUpdate(textUpdate(1, 'My Search'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
   await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip'));
 
@@ -846,16 +846,16 @@ test('editing only the rooms/size field via /settings does not wipe an existing 
   const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ areaFrom: 30, areaTo: 60, roomsFrom: null, roomsTo: null }));
   const { bot } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:rooms_size`));
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:2:2')); // pick "2 rooms" — must not touch area
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:2:')); // pick "2+ rooms" — must not touch area
 
   const updated = getActiveSearchProfile(db, 1)!;
   assert.equal(updated.prefs.roomsFrom, 2);
-  assert.equal(updated.prefs.roomsTo, 2);
+  assert.equal(updated.prefs.roomsTo, null);
   assert.equal(updated.prefs.areaFrom, 30); // unchanged
   assert.equal(updated.prefs.areaTo, 60); // unchanged
 });
 
-test('the rooms/size step offers an "Any" chip with no room-count restriction, and no longer offers a dead-end "Custom range" chip', async () => {
+test('the rooms/size step offers 1+/2+/3+ open-ended chips and an "Any" chip', async () => {
   const db = openDb(':memory:');
   const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ roomsFrom: 2, roomsTo: 2 }));
   const { bot, calls } = createTestBot(db);
@@ -864,7 +864,9 @@ test('the rooms/size step offers an "Any" chip with no room-count restriction, a
   const edit = calls.find((c) => c.method === 'editMessageText')!;
   const keyboard = (edit.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
   const flat = keyboard.flat();
-  assert.ok(!flat.some((b) => /custom range/i.test(b.text)), 'no dead-end "Custom range" chip should be offered');
+  assert.ok(flat.some((b) => b.text === '1+' && b.callback_data === 'wizard:rooms:1:'));
+  assert.ok(flat.some((b) => b.text === '2+' && b.callback_data === 'wizard:rooms:2:'));
+  assert.ok(flat.some((b) => b.text === '3+' && b.callback_data === 'wizard:rooms:3:'));
   assert.ok(flat.some((b) => b.text === 'Any' && b.callback_data === 'wizard:rooms_any'));
 
   await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms_any'));
@@ -889,6 +891,62 @@ test('the budget step offers a "no minimum" chip below the lowest fixed band', a
   const updated = getActiveSearchProfile(db, 1)!;
   assert.equal(updated.prefs.priceFrom, null);
   assert.equal(updated.prefs.priceTo, 500);
+});
+
+test('the budget step offers a working "Custom range" fallback to free text', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:budget`));
+
+  const edit = calls.find((c) => c.method === 'editMessageText')!;
+  const keyboard = (edit.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const flat = keyboard.flat();
+  const customButton = flat.find((b) => /custom range/i.test(b.text));
+  assert.ok(customButton, 'expected a "Custom range" button on the budget step');
+
+  await bot.handleUpdate(callbackUpdate(1, customButton.callback_data));
+  await bot.handleUpdate(textUpdate(1, '500-1200'));
+
+  const updated = getActiveSearchProfile(db, 1)!;
+  assert.equal(updated.prefs.priceFrom, 500);
+  assert.equal(updated.prefs.priceTo, 1200);
+  assert.equal(getWizardState(db, 1), null);
+});
+
+test('an invalid custom budget reply re-asks instead of saving garbage', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:budget`));
+
+  const edit = calls.find((c) => c.method === 'editMessageText')!;
+  const keyboard = (edit.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const customButton = keyboard.flat().find((b) => /custom range/i.test(b.text))!;
+  await bot.handleUpdate(callbackUpdate(1, customButton.callback_data));
+  const before = getActiveSearchProfile(db, 1)!;
+  await bot.handleUpdate(textUpdate(1, 'cheap'));
+
+  const after = getActiveSearchProfile(db, 1)!;
+  assert.equal(after.prefs.priceFrom, before.prefs.priceFrom);
+  assert.equal(after.prefs.priceTo, before.prefs.priceTo);
+  assert.ok(getWizardState(db, 1), 'wizard stays open for retry');
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && /Try a range/i.test(c.payload.text as string)));
+});
+
+test('the districts step chunks the 10-23 group into rows small enough for Telegram', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:districts`));
+
+  const edit = calls.find((c) => c.method === 'editMessageText')!;
+  const keyboard = (edit.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const maxRowLength = Math.max(...keyboard.map((r) => r.length));
+  assert.ok(maxRowLength <= 8, `no inline-keyboard row should exceed Telegram's effective limit, got ${maxRowLength}`);
+  const flat = keyboard.flat();
+  assert.ok(flat.some((b) => b.text === '18' || b.text === '✅ 18'), 'district 18 must be reachable');
+  assert.ok(flat.some((b) => b.text === '19' || b.text === '✅ 19'), 'district 19 must be reachable');
 });
 
 test('editing the name field via free text updates only the name, not the rest of the profile', async () => {
@@ -1470,6 +1528,17 @@ test('tapping browse:<profileId> calls sendNextCard for that profile\'s chat', a
   assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€500')));
 });
 
+test('tapping view:<listingId> sends the full card for that listing', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: 'a', price: 500, images: ['https://img/a.jpg'] }));
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(callbackUpdate(1, 'view:willhaben:a'));
+
+  assert.ok(calls.some((c) => c.method === 'sendPhoto' && (c.payload.caption as string).includes('€500')));
+});
+
 test('completing the wizard via buttons still attaches MAIN_KEYBOARD, even though editMessageText cannot carry it', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
@@ -1477,7 +1546,7 @@ test('completing the wizard via buttons still attaches MAIN_KEYBOARD, even thoug
   await bot.handleUpdate(textUpdate(1, 'Studio Center')); // free-text name -> budget step
   await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900')); // -> districts step
   await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue')); // -> rooms/size step
-  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1')); // -> amenities step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:')); // -> amenities step
   await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue')); // -> commute step
   await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip')); // completes the wizard via a button
 

@@ -5,12 +5,13 @@ import {
   getWizardState, setWizardState, deleteWizardState, getCommuteTimes, setCommuteTimes, setListingCoords,
   setChatLanguage, createSearchProfile, countSearchProfiles, MAX_SEARCH_PROFILES_PER_CHAT,
   getSearchProfiles, getSearchProfile, setActiveSearchProfile, deleteSearchProfile, updateSearchProfile, renameSearchProfile,
+  getListingById,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
 import { t, LOCALE_NAMES } from './locales.js';
 import {
-  WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs,
+  WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs, parseCustomBudget,
   type WizardState, type WizardChoice, type WizardStepId,
 } from './wizard.js';
 
@@ -48,8 +49,9 @@ export const MAIN_KEYBOARD = Markup.keyboard([['⏭ Next', '📋 Shortlist', '�
 
 /** Every locale key `renderWizardStep`/`wizardStrings` needs resolved for the chat's language, fetched once per render. */
 const WIZARD_STRING_KEYS = [
-  'wizard_progress', 'wizard_name_prompt', 'wizard_budget_prompt', 'wizard_districts_prompt', 'wizard_rooms_prompt',
-  'wizard_amenities_prompt', 'wizard_commute_prompt', 'btn_skip', 'btn_back', 'btn_continue',
+  'wizard_progress', 'wizard_name_prompt', 'wizard_name_prompt_edit', 'wizard_budget_prompt', 'wizard_districts_prompt', 'wizard_rooms_prompt',
+  'wizard_amenities_prompt', 'wizard_commute_prompt', 'wizard_budget_custom_prompt', 'wizard_budget_custom_error',
+  'btn_skip', 'btn_back', 'btn_continue', 'btn_custom_range',
   'amenity_elevator', 'amenity_parking', 'amenity_include_waitlist', 'amenity_include_wg',
 ] as const;
 
@@ -69,6 +71,13 @@ function wizardParams(db: DB, chatId: number, state: WizardState): Record<string
   return { step: state.stepIndex + 1, total: WIZARD_STEPS.length, n: countSearchProfiles(db, chatId) + 1 };
 }
 
+/** Splits an array into chunks of at most `size` — used for inline-keyboard rows so Telegram never truncates a wide row of buttons. */
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 /**
  * Builds the text + inline keyboard for whatever step `state` is currently on. Pure given `state`
  * and the chat's language-resolved `strings` (built once per render by `wizardStrings`), so this
@@ -80,21 +89,36 @@ export function renderWizardStep(state: WizardState, strings: Record<string, str
   const backRow = state.stepIndex > 0 ? [Markup.button.callback(strings.btn_back, 'wizard:back')] : [];
 
   switch (step) {
-    case 'name':
-      return { text: `${progress}\n\n${strings.wizard_name_prompt}`, keyboard: Markup.inlineKeyboard([[Markup.button.callback(strings.btn_skip, 'wizard:name_skip')]]) };
-    case 'budget':
+    case 'name': {
+      const namePrompt = state.editingProfileId != null ? strings.wizard_name_prompt_edit : strings.wizard_name_prompt;
+      return { text: `${progress}\n\n${namePrompt}`, keyboard: Markup.inlineKeyboard([[Markup.button.callback(strings.btn_skip, 'wizard:name_skip')]]) };
+    }
+    case 'budget': {
+      if (state.awaitingCustomBudget) {
+        return {
+          text: `${progress}\n\n${strings.wizard_budget_custom_prompt}`,
+          keyboard: Markup.inlineKeyboard([backRow].filter((r) => r.length > 0)),
+        };
+      }
       return {
         text: `${progress}\n\n${strings.wizard_budget_prompt}`,
         keyboard: Markup.inlineKeyboard([
           ...BUDGET_BANDS.map((b) => [Markup.button.callback(b.label, `wizard:budget:${b.priceFrom ?? ''}:${b.priceTo}`)]),
+          [Markup.button.callback(strings.btn_custom_range, 'wizard:budget_custom')],
           backRow,
         ].filter((row) => row.length > 0)),
       };
+    }
     case 'districts': {
       const selected = new Set(state.partial.districts ?? []);
-      const rows = DISTRICT_GROUPS.map((g) => g.districts.map((d) =>
-        Markup.button.callback(selected.has(d) ? `✅ ${d}` : `${d}`, `wizard:district:${d}`)
-      ));
+      // Telegram inline keyboards truncate past ~8 buttons per row; chunk each district group so
+      // districts 10-23 (14 buttons) don't get cut off on narrow screens.
+      const rows = DISTRICT_GROUPS.flatMap((g) =>
+        chunk(
+          g.districts.map((d) => Markup.button.callback(selected.has(d) ? `✅ ${d}` : `${d}`, `wizard:district:${d}`)),
+          7,
+        )
+      );
       const continueRow = selected.size > 0 ? [Markup.button.callback(strings.btn_continue, 'wizard:districts_continue')] : [];
       return { text: `${progress}\n\n${strings.wizard_districts_prompt}`, keyboard: Markup.inlineKeyboard([...rows, continueRow, backRow].filter((r) => r.length > 0)) };
     }
@@ -102,7 +126,8 @@ export function renderWizardStep(state: WizardState, strings: Record<string, str
       return {
         text: `${progress}\n\n${strings.wizard_rooms_prompt}`,
         keyboard: Markup.inlineKeyboard([
-          [Markup.button.callback('1', 'wizard:rooms:1:1'), Markup.button.callback('2', 'wizard:rooms:2:2'), Markup.button.callback('3+', 'wizard:rooms:3:')],
+          // All room-count choices are open-ended minimums (1+, 2+, 3+), not exact matches.
+          [Markup.button.callback('1+', 'wizard:rooms:1:'), Markup.button.callback('2+', 'wizard:rooms:2:'), Markup.button.callback('3+', 'wizard:rooms:3:')],
           [Markup.button.callback('Any', 'wizard:rooms_any')],
           backRow,
         ].filter((r) => r.length > 0)),
@@ -302,12 +327,12 @@ export async function getCommuteLineFor(
 async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB, deps: BotDeps): Promise<void> {
   const profile = getActiveSearchProfile(db, chatId);
   if (!profile) {
-    await telegram.sendMessage(chatId, 'You haven\'t set your preferences yet — send /start to get set up.');
+    await telegram.sendMessage(chatId, t(db, chatId, 'next_no_profile'));
     return;
   }
   const card = nextCardFor(db, chatId);
   if (!card) {
-    await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
+    await telegram.sendMessage(chatId, t(db, chatId, 'next_no_listings'));
     return;
   }
   const commuteLine = await getCommuteLineFor(db, profile.id, card, profile.prefs, deps.computeCommute, deps.geocode);
@@ -414,7 +439,7 @@ async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, 
 }
 
 /** Replaces the current callback message with the empty-shortlist message — always delete+send, since there's no in-place target type to match against once nothing is left to browse. */
-async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx): Promise<void> {
+async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx, db: DB): Promise<void> {
   const chatId = ctx.chat!.id;
   try {
     await ctx.deleteMessage();
@@ -422,7 +447,7 @@ async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx): Promise<vo
     // best-effort — an old/already-gone message can't always be deleted
   }
   try {
-    await ctx.telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
+    await ctx.telegram.sendMessage(chatId, t(db, chatId, 'shortlist_empty'));
   } catch {
     // best-effort
   }
@@ -432,7 +457,7 @@ async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx): Promise<vo
 async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
   const items = getShortlist(db, chatId);
   if (items.length === 0) {
-    await telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
+    await telegram.sendMessage(chatId, t(db, chatId, 'shortlist_empty'));
     return;
   }
   await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length, db);
@@ -491,20 +516,18 @@ export async function sendProfileActivationSummary(telegram: Telegraf['telegram'
     // lift/parkingSpaces are only ever populated from immoscout's detail fetch (never willhaben,
     // and only for a capped batch of newly-enriched listings per poll — see db.ts's ListingRow doc
     // comment), so requiring either can silently starve the deck to near-empty with no explanation.
-    // Hardcoded English (not threaded through t()) is a deliberate, deferred i18n gap for this one
-    // message — see the review ledger.
     const elevatorParkingNote = (profile.prefs.requireElevator || profile.prefs.requireParking)
-      ? ' Note: elevator/parking data is only available for some listings, so this filter may be more restrictive than it looks.'
+      ? t(db, profile.chatId, 'elevator_parking_note')
       : '';
     await telegram.sendMessage(
       profile.chatId,
-      `🏠 ${profile.name}: no matches yet — I'll message you here as soon as something matches.${elevatorParkingNote}`,
+      t(db, profile.chatId, 'no_matches_yet', { name: profile.name }) + elevatorParkingNote,
       MAIN_KEYBOARD,
     );
     return;
   }
   const summary = summarizeMatches(candidates);
-  await telegram.sendMessage(profile.chatId, "Here's what's already out there for it:", MAIN_KEYBOARD);
+  await telegram.sendMessage(profile.chatId, t(db, profile.chatId, 'aggregate_summary_lead'), MAIN_KEYBOARD);
   await telegram.sendMessage(
     profile.chatId,
     formatAggregateSummary(profile, summary),
@@ -515,7 +538,7 @@ export async function sendProfileActivationSummary(telegram: Telegraf['telegram'
 /** Starts a brand-new wizard run for `chatId`: refuses once the chat is at MAX_SEARCH_PROFILES_PER_CHAT, otherwise resets wizard state to step 0 and sends its prompt. Shared by /start (first-time setup) and the "+ Add another search" button from /searches. */
 async function startWizard(telegram: Telegraf['telegram'], db: DB, chatId: number): Promise<void> {
   if (countSearchProfiles(db, chatId) >= MAX_SEARCH_PROFILES_PER_CHAT) {
-    await telegram.sendMessage(chatId, `You already have ${MAX_SEARCH_PROFILES_PER_CHAT} searches — delete one with /searches first.`);
+    await telegram.sendMessage(chatId, t(db, chatId, 'max_searches_reached', { maxProfiles: MAX_SEARCH_PROFILES_PER_CHAT }));
     return;
   }
   const state = initialWizardState();
@@ -551,12 +574,12 @@ function finalizeFieldEdit(db: DB, chatId: number, editingProfileId: number, nex
   // the chat is left permanently stuck believing it's mid-edit for a profile that no longer exists.
   if (!profile) {
     deleteWizardState(db, chatId);
-    return 'That search no longer exists.';
+    return t(db, chatId, 'search_no_longer_exists');
   }
   updateSearchProfile(db, profile.id, { ...profile.prefs, ...next.partial });
   if (next.profileName && next.profileName !== profile.name) renameSearchProfile(db, profile.id, next.profileName);
   deleteWizardState(db, chatId);
-  return `Updated "${next.profileName ?? profile.name}".`;
+  return t(db, chatId, 'updated_search', { name: next.profileName ?? profile.name });
 }
 
 export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
@@ -598,7 +621,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       if (choice.kind === 'back') {
         deleteWizardState(db, chatId);
         await ctx.answerCbQuery();
-        await ctx.editMessageText('Edit cancelled.');
+        await ctx.editMessageText(t(db, chatId, 'edit_cancelled'));
         return;
       }
       if (next.stepIndex === current.stepIndex) {
@@ -618,7 +641,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       deleteWizardState(db, chatId);
       const profile = createSearchProfile(db, chatId, next.profileName ?? `Search ${countSearchProfiles(db, chatId) + 1}`, finalizePrefs(next));
       await ctx.answerCbQuery();
-      await ctx.editMessageText(`Saved "${profile.name}". New listings get checked every ~3h — I'll message you here as soon as something matches.`);
+      await ctx.editMessageText(t(db, chatId, 'saved_search_ready', { name: profile.name }));
       await sendProfileActivationSummary(ctx.telegram, db, profile);
       return;
     }
@@ -632,8 +655,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const chatId = ctx.chat.id;
     if (getActiveSearchProfile(db, chatId)) {
       await ctx.reply(
-        'You already have a search set up — /next for a listing, /searches to manage your searches, ' +
-        'or /settings to edit one.',
+        t(db, chatId, 'already_has_search'),
         MAIN_KEYBOARD,
       );
       return;
@@ -646,12 +668,12 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   async function sendSettingsMenu(chatId: number): Promise<void> {
     const profile = getActiveSearchProfile(db, chatId);
     if (!profile) {
-      await bot.telegram.sendMessage(chatId, 'No active search — /start to set one up.');
+      await bot.telegram.sendMessage(chatId, t(db, chatId, 'no_active_search'));
       return;
     }
     await bot.telegram.sendMessage(
       chatId,
-      `Editing "${profile.name}" — pick a field:`,
+      t(db, chatId, 'settings_menu_title', { name: profile.name }),
       Markup.inlineKeyboard(SETTINGS_FIELD_BUTTONS.map(([label, field]) => [Markup.button.callback(label, `editfield:${profile.id}:${field}`)])),
     );
   }
@@ -664,7 +686,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const chatId = ctx.chat.id;
     const profiles = getSearchProfiles(db, chatId);
     if (profiles.length === 0) {
-      await ctx.reply('No searches yet — /start to set one up.');
+      await ctx.reply(t(db, chatId, 'no_searches_yet'));
       return;
     }
     const lines = profiles.map((p) => `${p.active ? '▶ ' : '  '}${p.name}`).join('\n');
@@ -674,7 +696,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     ]);
     const addButton = profiles.length < MAX_SEARCH_PROFILES_PER_CHAT ? [Markup.button.callback(t(db, chatId, 'btn_add_another_search'), 'wizard:new')] : [];
     await ctx.reply(
-      `Your searches:\n${lines}`,
+      `${t(db, chatId, 'searches_header')}\n${lines}`,
       Markup.inlineKeyboard([...buttons.map((b) => [b]), addButton].filter((row) => row.length > 0)),
     );
   });
@@ -683,9 +705,9 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const chatId = ctx.chat!.id;
     const profileId = Number(ctx.match[1]);
     const profile = getSearchProfile(db, profileId);
-    if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery('That search no longer exists.'); return; }
+    if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
     setActiveSearchProfile(db, chatId, profileId);
-    await ctx.answerCbQuery('Switched.');
+    await ctx.answerCbQuery(t(db, chatId, 'switched'));
     // /help promises switching to a search with matches waiting sends the activation summary — this
     // is that promise's only call site for the switch path (wizard completion is the other one).
     await sendProfileActivationSummary(ctx.telegram, db, profile);
@@ -695,20 +717,20 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const chatId = ctx.chat!.id;
     const profileId = Number(ctx.match[1]);
     const target = getSearchProfile(db, profileId);
-    if (!target || target.chatId !== chatId) { await ctx.answerCbQuery('This search no longer exists.'); return; }
+    if (!target || target.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
     const wasActive = getActiveSearchProfile(db, chatId)?.id === profileId;
     deleteSearchProfile(db, profileId);
-    await ctx.answerCbQuery('Deleted.');
+    await ctx.answerCbQuery(t(db, chatId, 'deleted'));
     if (!wasActive) return;
     // The deleted profile was active — db.ts's deleteSearchProfile leaves no profile active
     // afterward (see its doc comment), so prompt the user to pick a new one if any remain.
     const remaining = getSearchProfiles(db, chatId);
     if (remaining.length === 0) {
-      await ctx.reply('Deleted your last search — /start to set up a new one.');
+      await ctx.reply(t(db, chatId, 'last_search_deleted'));
       return;
     }
     await ctx.reply(
-      'Deleted. No search is active now — pick one to switch to:',
+      t(db, chatId, 'no_active_search_after_delete'),
       Markup.inlineKeyboard(remaining.map((p) => [Markup.button.callback(`Switch to "${p.name}"`, `switchprofile:${p.id}`)])),
     );
   });
@@ -722,9 +744,9 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const [, profileIdRaw, field] = ctx.match;
     const profileId = Number(profileIdRaw);
     const profile = getSearchProfile(db, profileId);
-    if (!profile || profile.chatId !== ctx.chat!.id) { await ctx.answerCbQuery('This search no longer exists.'); return; }
+    if (!profile || profile.chatId !== ctx.chat!.id) { await ctx.answerCbQuery(t(db, ctx.chat!.id, 'search_no_longer_exists')); return; }
     const stepIndex = WIZARD_STEPS.indexOf(field as WizardStepId);
-    const state: WizardState = { stepIndex, profileName: profile.name, partial: profile.prefs, editingProfileId: profileId };
+    const state: WizardState = { stepIndex, profileName: profile.name, partial: profile.prefs, editingProfileId: profileId, awaitingCustomBudget: false };
     setWizardState(db, ctx.chat!.id, state);
     await ctx.answerCbQuery();
     const { text, keyboard } = renderWizardStep(state, wizardStrings(db, ctx.chat!.id, wizardParams(db, ctx.chat!.id, state)));
@@ -767,7 +789,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       // rename-on-mismatch logic. Treat it exactly like Back: cancel the edit, don't touch the name.
       deleteWizardState(db, chatId);
       await ctx.answerCbQuery();
-      await ctx.editMessageText('Edit cancelled.');
+      await ctx.editMessageText(t(db, chatId, 'edit_cancelled'));
       return;
     }
     await advanceWizard(ctx, { kind: 'name', name: `Search ${countSearchProfiles(db, chatId) + 1}` });
@@ -776,6 +798,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const [, fromRaw, toRaw] = ctx.match;
     return advanceWizard(ctx, { kind: 'budget', priceFrom: fromRaw === '' ? null : Number(fromRaw), priceTo: toRaw === 'Infinity' ? Infinity : Number(toRaw) });
   });
+  bot.action('wizard:budget_custom', (ctx) => advanceWizard(ctx, { kind: 'budget_custom' }));
   bot.action(/^wizard:district:(\d+)$/, (ctx) => advanceWizard(ctx, { kind: 'districts_toggle', district: Number(ctx.match[1]) }));
   bot.action('wizard:districts_continue', (ctx) => advanceWizard(ctx, { kind: 'districts_continue' }));
   bot.action(/^wizard:rooms:(\d+):(\d*)$/, (ctx) => {
@@ -794,6 +817,23 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   bot.action(/^browse:(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     await sendNextCard(ctx.telegram, ctx.chat!.id, db, deps);
+  });
+
+  /** Per-listing "View ▸" button from push notifications — sends the full card on demand. */
+  bot.action(/^view:(.+)$/, async (ctx) => {
+    const [, listingId] = ctx.match;
+    const chatId = ctx.chat!.id;
+    const listing = getListingById(db, listingId);
+    if (!listing) {
+      await ctx.answerCbQuery(t(db, chatId, 'listing_no_longer_available'));
+      return;
+    }
+    await ctx.answerCbQuery();
+    const profile = getActiveSearchProfile(db, chatId);
+    const commuteLine = profile
+      ? await getCommuteLineFor(db, profile.id, listing, profile.prefs, deps.computeCommute, deps.geocode)
+      : null;
+    await sendCard(ctx.telegram, chatId, listing, commuteLine, db);
   });
 
   bot.on('text', async (ctx) => {
@@ -825,11 +865,32 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       await ctx.reply(text, keyboard);
       return;
     }
+    if (step === 'budget' && state.awaitingCustomBudget) {
+      const parsed = parseCustomBudget(raw);
+      if (!parsed) {
+        await ctx.reply(t(db, chatId, 'wizard_budget_custom_error'));
+        return;
+      }
+      const next = applyWizardChoice(state, { kind: 'budget', priceFrom: parsed.priceFrom, priceTo: parsed.priceTo ?? Infinity });
+      if (state.editingProfileId != null) {
+        const message = finalizeFieldEdit(db, chatId, state.editingProfileId, next);
+        await ctx.reply(message);
+        return;
+      }
+      setWizardState(db, chatId, next);
+      const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId, wizardParams(db, chatId, next)));
+      try {
+        await ctx.editMessageText(text, keyboard);
+      } catch {
+        await ctx.reply(text, keyboard);
+      }
+      return;
+    }
     if (step === 'commute') {
       const trimmed = raw;
       const point = await deps.geocode(trimmed);
       if (!point) {
-        await ctx.reply('couldn\'t find that location — try being more specific, or tap Skip');
+        await ctx.reply(t(db, chatId, 'commute_not_found'));
         return; // keep the same step, don't advance or lose prior answers
       }
       const next = applyWizardChoice(state, { kind: 'commute_set', destination: trimmed, lat: point.lat, lon: point.lon });
@@ -840,14 +901,14 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       }
       deleteWizardState(db, chatId);
       const profile = createSearchProfile(db, chatId, next.profileName ?? `Search ${countSearchProfiles(db, chatId) + 1}`, finalizePrefs(next));
-      await ctx.reply(`Saved "${profile.name}". New listings get checked every ~3h — I'll message you here as soon as something matches.`, MAIN_KEYBOARD);
+      await ctx.reply(t(db, chatId, 'saved_search_ready', { name: profile.name }), MAIN_KEYBOARD);
       await sendProfileActivationSummary(ctx.telegram, db, profile);
       return;
     }
-    // Free text on any other step (name/commute are the only free-text-capable steps) doesn't
-    // advance the wizard — but staying totally silent is a bad failure mode if the inline buttons
-    // scrolled off-screen, so nudge the user back to them instead of dropping the message.
-    await ctx.reply('Please tap one of the buttons above to continue.');
+    // Free text on any other step (name/commute/budget custom are the free-text-capable steps)
+    // doesn't advance the wizard — but staying totally silent is a bad failure mode if the inline
+    // buttons scrolled off-screen, so nudge the user back to them instead of dropping the message.
+    await ctx.reply(t(db, chatId, 'tap_buttons_to_continue'));
   });
 
   bot.action(/^(like|pass):(.+)$/, async (ctx) => {
@@ -856,11 +917,11 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const saved = recordSwipe(db, chatId, listingId, direction as 'like' | 'pass');
     const undoButton = Markup.button.callback('↩️ Undo', `undo:${listingId}`);
     if (direction === 'like' && !saved) {
-      await ctx.answerCbQuery('This listing is no longer available.');
-      await clearSwipedCardButtons(ctx, '⚠️ No longer available', undoButton);
+      await ctx.answerCbQuery(t(db, chatId, 'listing_no_longer_available'));
+      await clearSwipedCardButtons(ctx, t(db, chatId, 'status_no_longer_available'), undoButton);
     } else {
-      await ctx.answerCbQuery(direction === 'like' ? 'Saved to shortlist 👍' : 'Passed 👎');
-      await clearSwipedCardButtons(ctx, direction === 'like' ? '✅ Added to shortlist' : '👎 Passed', undoButton);
+      await ctx.answerCbQuery(direction === 'like' ? t(db, chatId, 'saved_to_shortlist') : t(db, chatId, 'passed'));
+      await clearSwipedCardButtons(ctx, direction === 'like' ? t(db, chatId, 'status_added_to_shortlist') : t(db, chatId, 'status_passed'), undoButton);
     }
     await sendNextCard(ctx.telegram, chatId, db, deps);
   });
@@ -870,11 +931,11 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const chatId = ctx.chat!.id;
     const undone = undoSwipe(db, chatId, listingId);
     if (!undone) {
-      await ctx.answerCbQuery('You can only undo your most recent swipe.');
+      await ctx.answerCbQuery(t(db, chatId, 'undo_only_last'));
       return;
     }
-    await ctx.answerCbQuery('Swipe undone ↩️');
-    await clearSwipedCardButtons(ctx, '↩️ Undone');
+    await ctx.answerCbQuery(t(db, chatId, 'swipe_undone'));
+    await clearSwipedCardButtons(ctx, t(db, chatId, 'status_undone'));
   });
 
   bot.action(/^slnav:(prev|next):(.+)$/, async (ctx) => {
@@ -883,12 +944,12 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const items = getShortlist(db, chatId);
     const idx = items.findIndex((i) => i.id === listingId);
     if (idx === -1) {
-      await ctx.answerCbQuery('This listing is no longer in your shortlist.');
+      await ctx.answerCbQuery(t(db, chatId, 'not_in_shortlist'));
       return;
     }
     const targetIdx = direction === 'prev' ? idx - 1 : idx + 1;
     if (targetIdx < 0 || targetIdx >= items.length) {
-      await ctx.answerCbQuery(direction === 'prev' ? 'This is the first one.' : 'This is the last one.');
+      await ctx.answerCbQuery(direction === 'prev' ? t(db, chatId, 'first_shortlist_item') : t(db, chatId, 'last_shortlist_item'));
       return;
     }
     await ctx.answerCbQuery();
@@ -901,10 +962,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const before = getShortlist(db, chatId);
     const removedIndex = before.findIndex((i) => i.id === listingId);
     removeFromShortlist(db, chatId, listingId);
-    await ctx.answerCbQuery('Removed from shortlist 🗑️');
+    await ctx.answerCbQuery(t(db, chatId, 'removed_from_shortlist'));
     const after = getShortlist(db, chatId);
     if (after.length === 0) {
-      await replaceShortlistWithEmptyState(ctx);
+      await replaceShortlistWithEmptyState(ctx, db);
       return;
     }
     const nextIndex = Math.min(Math.max(removedIndex, 0), after.length - 1);

@@ -1,10 +1,11 @@
-import type { Telegraf } from 'telegraf';
+import { Markup, type Telegraf } from 'telegraf';
 import {
   type DB, type ListingRow,
   getAllSearchProfiles, getSwipedWithDirection, matchesPrefs, MCP_CHAT_ID,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { getCommuteLineFor, type ComputeCommuteFn, type GeocodeFn } from './bot.js';
+import { t } from './locales.js';
 
 /** Caps a single push burst per user — protects against a preference change (or a big poll) flooding a chat. */
 export const MAX_PUSH_PER_USER = 5;
@@ -24,10 +25,8 @@ const realDelay: DelayFn = (ms) => new Promise((resolve) => setTimeout(resolve, 
 /**
  * Pure — one compact line per listing for a push notification's body: title, price, size/rooms/district,
  * an optional appended commute line, and the link. Local to this file: pushes are the only remaining
- * surface needing a compact multi-listing format now that /shortlist keeps its existing card-based
- * Prev/Next/Remove browsing (see Task 9's revision note), so nothing is shared with or imported from
- * bot.ts here — `commuteLine` is a plain string computed by the caller via bot.ts's getCommuteLineFor
- * helper, not a shared formatter.
+ * surface needing a compact multi-listing format, so nothing is shared with or imported from bot.ts
+ * here — `commuteLine` is a plain string computed by the caller via bot.ts's getCommuteLineFor helper.
  */
 export function formatPushEntry(l: ListingRow, commuteLine: string | null = null): string {
   const parts = [
@@ -47,23 +46,15 @@ export function formatPushEntry(l: ListingRow, commuteLine: string | null = null
  *
  * Delivery is grouped and paced per profile rather than bursting one message per listing: each
  * matching profile gets a header (naming the profile, since Tasks 7-9 let one chat hold several
- * saved searches) followed by one compact-entries message capped at MAX_PUSH_PER_USER, with a
- * stagger between profiles to avoid Telegram flood-control on chats with multiple active searches.
- * The grouping/stagger/cap is what controls Telegram message *count* — it says nothing about how
- * much work backs each message, so each shown listing still gets its commute line computed via
- * bot.ts's getCommuteLineFor (same as /next), and this remains the only poll-time caller that warms
- * the commute cache and backfills listing coordinates ahead of the user's next /next.
+ * saved searches) followed by one compact message per shown listing, each with a [View ▸] button
+ * that opens the full card on demand. A stagger between profiles avoids Telegram flood-control on
+ * chats with multiple active searches.
  *
  * Product decision (flagged by Task 3's review, resolved here): getAllSearchProfiles returns every
  * saved profile for a chat regardless of its `active` flag, and this function deliberately does not
  * filter by `active` — every saved search stays "live" for polling/pushing, not just the one the
  * user currently has selected in /searches. `active` only controls which profile /next, /shortlist,
- * and other single-profile UI act on; it is not a pause switch for a saved search. This matches how
- * saved-search/alert products generally work (e.g. a job-alert or property-alert product still
- * emails you for every saved search, not just the one you last viewed) and preserves the pre-Task-9
- * behavior (every profile always polled) for chats that still only have one profile. If a future
- * task wants a way to mute a saved search's pushes without deleting it, that should be a separate,
- * explicit flag (e.g. `muted`) rather than overloading `active`.
+ * and other single-profile UI act on; it is not a pause switch for a saved search.
  */
 export async function notifyNewMatches(
   telegram: Telegraf['telegram'], db: DB, newListings: ListingRow[], computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
@@ -83,7 +74,11 @@ export async function notifyNewMatches(
 
     const ranked = rankListings(matches, getSwipedWithDirection(db, profile.chatId));
     const toShow = ranked.slice(0, MAX_PUSH_PER_USER);
-    const entries = (await Promise.all(toShow.map(async (l) => {
+
+    const headerKey = matches.length === 1 ? 'push_header_one' : 'push_header_many';
+    await telegram.sendMessage(profile.chatId, t(db, profile.chatId, headerKey, { name: profile.name, count: matches.length }));
+
+    for (const l of toShow) {
       // A single Routes API failure must degrade this one listing to no commute line, not abort the
       // whole profile's push (the old pre-Task-10 caller effectively could, since it awaited commute
       // inline with no isolation between listings) — genuinely more resilient than prior behavior.
@@ -93,11 +88,17 @@ export async function notifyNewMatches(
       } catch {
         commuteLine = null;
       }
-      return formatPushEntry(l, commuteLine);
-    }))).join('\n\n');
-    const remainder = matches.length > toShow.length ? `\n\n+${matches.length - toShow.length} more — check /next.` : '';
+      const viewButton = Markup.inlineKeyboard([
+        [Markup.button.callback(t(db, profile.chatId, 'push_view'), `view:${l.id}`)],
+      ]);
+      await telegram.sendMessage(profile.chatId, formatPushEntry(l, commuteLine), viewButton);
+    }
 
-    await telegram.sendMessage(profile.chatId, `🏠 ${profile.name} — ${matches.length} new match${matches.length === 1 ? '' : 'es'}:`);
-    await telegram.sendMessage(profile.chatId, `${entries}${remainder}`);
+    if (matches.length > toShow.length) {
+      await telegram.sendMessage(
+        profile.chatId,
+        t(db, profile.chatId, 'push_more', { count: matches.length - toShow.length }),
+      );
+    }
   }
 }

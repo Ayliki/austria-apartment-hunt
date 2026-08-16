@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs, WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS,
+  initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs, parseCustomBudget, WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS,
 } from '../src/wizard.js';
 
 test('a fresh wizard starts at step 0 (name) and is not complete', () => {
@@ -159,4 +159,29 @@ test('finalizePrefs normalizes the top BUDGET_BANDS choice (priceTo: Infinity) t
   s = applyWizardChoice(s, { kind: 'commute_skip' });
   const prefs = finalizePrefs(s);
   assert.equal(prefs.priceTo, null);
+});
+
+
+test('parseCustomBudget parses a range, max-only, min-only, and bare number', () => {
+  assert.deepEqual(parseCustomBudget('500-1200'), { priceFrom: 500, priceTo: 1200 });
+  assert.deepEqual(parseCustomBudget('€500 - 1200'), { priceFrom: 500, priceTo: 1200 });
+  assert.deepEqual(parseCustomBudget('<1200'), { priceFrom: null, priceTo: 1200 });
+  assert.deepEqual(parseCustomBudget('under 900'), { priceFrom: null, priceTo: 900 });
+  assert.deepEqual(parseCustomBudget('500+'), { priceFrom: 500, priceTo: null });
+  assert.deepEqual(parseCustomBudget('from 600'), { priceFrom: 600, priceTo: null });
+  assert.deepEqual(parseCustomBudget('800'), { priceFrom: null, priceTo: 800 });
+});
+
+test('parseCustomBudget rejects malformed or nonsensical input', () => {
+  assert.equal(parseCustomBudget(''), null);
+  assert.equal(parseCustomBudget('cheap'), null);
+  assert.equal(parseCustomBudget('1200-500'), null); // backwards range
+});
+
+test('budget_custom toggles awaitingCustomBudget without advancing', () => {
+  let s = initialWizardState();
+  s = applyWizardChoice(s, { kind: 'name', name: 'X' });
+  s = applyWizardChoice(s, { kind: 'budget_custom' });
+  assert.equal(s.stepIndex, WIZARD_STEPS.indexOf('budget'));
+  assert.equal(s.awaitingCustomBudget, true);
 });

@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { detectWG, detectWaitlistTicket } from 'apt-hunter/dist/normalize.js';
-import type { WizardState } from './wizard.js';
+import { WIZARD_STEPS, type WizardState } from './wizard.js';
 
 export type DB = Database.Database;
 
@@ -226,9 +226,11 @@ function isValidWizardState(x: unknown): x is WizardState {
   const s = x as Record<string, unknown>;
   return (
     typeof s.stepIndex === 'number' &&
+    s.stepIndex >= 0 && s.stepIndex <= WIZARD_STEPS.length &&
     (s.profileName === null || typeof s.profileName === 'string') &&
     typeof s.partial === 'object' && s.partial !== null && !Array.isArray(s.partial) &&
-    (s.editingProfileId === null || typeof s.editingProfileId === 'number')
+    (s.editingProfileId === null || typeof s.editingProfileId === 'number') &&
+    (s.awaitingCustomBudget === undefined || typeof s.awaitingCustomBudget === 'boolean')
   );
 }
 
@@ -767,6 +769,12 @@ export function getListingsByIds(db: DB, ids: string[]): ListingRow[] {
   ids.forEach((id, i) => { params[`id${i}`] = id; });
   const rows = db.prepare(`SELECT * FROM listings WHERE id IN (${placeholders})`).all(params) as Record<string, unknown>[];
   return rows.map(rowToListing);
+}
+
+/** Single listing by id, or null if it doesn't exist. */
+export function getListingById(db: DB, id: string): ListingRow | null {
+  const row = db.prepare('SELECT * FROM listings WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  return row ? rowToListing(row) : null;
 }
 
 /** Pure equivalent of getCandidateListings's WHERE clause, for filtering an in-memory batch (e.g. a poll's fresh inserts) without a query per listing. Mirrors its null-handling exactly: a null listing field always passes price/area/rooms bounds, but a null district fails a district restriction. */

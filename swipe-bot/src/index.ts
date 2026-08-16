@@ -10,7 +10,7 @@ import { notifyNewMatches } from './notify.js';
 import { geocode, computeCommute } from './commute.js';
 
 const POLL_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3h, matches apt-hunter's LaunchAgent cadence
-const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day is plenty at this DB's size (hundreds of rows, not thousands)
+const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6h so listings taken down between polls get flagged faster than the previous daily sweep
 
 async function main(): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
