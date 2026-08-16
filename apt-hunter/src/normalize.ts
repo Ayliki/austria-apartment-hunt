@@ -19,6 +19,14 @@ export interface NormalizedListing {
   images: string[];
   description: string | null;
   dateCreated: string | null;
+  /** Structured amenity data — only ever populated from immoscout's detail fetch; willhaben has no equivalent fields. */
+  lift: boolean | null;
+  parkingSpaces: number | null;
+  floor: string | null;
+  energyClass: string | null;
+  availableFrom: string | null;
+  /** Best-effort keyword match on title+description — never a reliable filter, only a badge. */
+  mentionsPets: boolean;
   /** Set by score.ts. */
   valueFlag?: 'good' | 'fair' | 'premium' | null;
   /** Set by dedupe.ts on merged primaries. */
@@ -99,6 +107,15 @@ const WG_RE = /\bwg\b|wg-zimmer|\d+er-wg|wohngemeinschaft|co-living|studenten(zi
  */
 export function detectWG(title: string): boolean {
   return WG_RE.test(title.replace(WG_SUITABLE_RE, ''));
+}
+
+const PETS_ALLOWED_RE = /haustiere erlaubt|tierhaltung erlaubt|haustierfreundlich|pet[- ]friendly|pets? (?:allowed|ok|welcome)/i;
+const PETS_DISALLOWED_RE = /haustiere (?:nicht|verboten)|no pets/i;
+
+/** Best-effort: matches common "pets allowed" phrasing in German or English, but backs off on an explicit "not allowed" nearby — never a reliable signal, callers must treat this as an unverified badge only. */
+export function detectPetFriendly(text: string): boolean {
+  if (PETS_DISALLOWED_RE.test(text)) return false;
+  return PETS_ALLOWED_RE.test(text);
 }
 
 /** "📍 Wien, 02. Bezirk, Leopoldstadt" -> 2 */
@@ -197,6 +214,12 @@ export function normalizeWillhaben(hit: WillhabenSearchHit, detail?: WillhabenDe
     images: detail?.images ?? [],
     description: detail?.description ?? null,
     dateCreated: hit.dateCreated,
+    lift: null,
+    parkingSpaces: null,
+    floor: null,
+    energyClass: null,
+    availableFrom: null,
+    mentionsPets: detectPetFriendly(`${hit.title} ${detail?.description ?? ''}`),
   };
 }
 
@@ -230,5 +253,11 @@ export function normalizeImmoscout(raw: any, detail?: any): NormalizedListing {
       : raw.imageUrl ? [raw.imageUrl] : [],
     description: detail?.description ?? null,
     dateCreated: raw.dateCreated ?? null,
+    lift: detail?.lift ?? null,
+    parkingSpaces: detail?.parkingSpaces ?? null,
+    floor: detail?.floor ?? null,
+    energyClass: detail?.energyClass ?? null,
+    availableFrom: detail?.availableFrom ?? null,
+    mentionsPets: detectPetFriendly(`${raw.title ?? ''} ${detail?.description ?? ''}`),
   };
 }

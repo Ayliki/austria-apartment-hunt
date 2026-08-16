@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import type { WillhabenSearchHit } from '../src/normalize.js';
 import {
   parseAustrianNumber,
   parseWillhabenSearchText,
@@ -9,6 +10,7 @@ import {
   detectWaitlistTicket,
   detectShortTerm,
   detectWG,
+  detectPetFriendly,
 } from '../src/normalize.js';
 
 test('parseAustrianNumber handles Austrian formats', () => {
@@ -243,4 +245,55 @@ test('normalizeImmoscout flags short-term listings by title and by implausible p
   assert.equal(normalizeImmoscout({ ...IS24_HIT, title: 'Charmante Ferienwohnung im Zentrum' }).isShortTerm, true);
   assert.equal(normalizeImmoscout({ ...IS24_HIT, price: 59.99, area: 45 }).isShortTerm, true);
   assert.equal(normalizeImmoscout(IS24_HIT).isShortTerm, false); // €15.28/m², a normal long-term rent
+});
+
+test('detectPetFriendly catches German and English pet-allowed phrasing', () => {
+  assert.equal(detectPetFriendly('Haustiere erlaubt nach Absprache'), true);
+  assert.equal(detectPetFriendly('Tierhaltung erlaubt'), true);
+  assert.equal(detectPetFriendly('Pets allowed, small dogs welcome'), true);
+  assert.equal(detectPetFriendly('pet-friendly building'), true);
+  assert.equal(detectPetFriendly('Ruhige 2-Zimmer Wohnung im 3. Stock'), false);
+});
+
+test('detectPetFriendly does not false-positive on "Haustiere nicht erlaubt"', () => {
+  assert.equal(detectPetFriendly('Haustiere nicht erlaubt'), false);
+  assert.equal(detectPetFriendly('No pets allowed'), false);
+});
+
+test('normalizeImmoscout maps lift/parkingSpaces/floor/energyClass/availableFrom from detail, and mentionsPets from title+description', () => {
+  const raw = { exposeId: '1', title: 'Nice flat, pet-friendly', price: 700 };
+  const detail = {
+    lift: true, parkingSpaces: 2, floor: '3. Stock', energyClass: 'B',
+    availableFrom: '2026-09-01', description: 'Sunny flat near the park.',
+    images: [],
+  };
+  const n = normalizeImmoscout(raw, detail);
+  assert.equal(n.lift, true);
+  assert.equal(n.parkingSpaces, 2);
+  assert.equal(n.floor, '3. Stock');
+  assert.equal(n.energyClass, 'B');
+  assert.equal(n.availableFrom, '2026-09-01');
+  assert.equal(n.mentionsPets, true);
+});
+
+test('normalizeImmoscout amenity fields are null (not false/0) when no detail is supplied', () => {
+  const n = normalizeImmoscout({ exposeId: '2', title: 'Flat', price: 600 });
+  assert.equal(n.lift, null);
+  assert.equal(n.parkingSpaces, null);
+  assert.equal(n.floor, null);
+  assert.equal(n.energyClass, null);
+  assert.equal(n.availableFrom, null);
+  assert.equal(n.mentionsPets, false);
+});
+
+test('normalizeWillhaben amenity structured fields are always null (willhaben has no such data), mentionsPets still detected from description', () => {
+  const hit: WillhabenSearchHit = {
+    id: '3', title: 'Flat', price: 600, location: null, dateCreated: null,
+    sellerType: null, sellerName: null, area: null, rooms: null, pricePerSqm: null,
+    url: 'https://www.willhaben.at/iad/object?adId=3', zip: null, district: null,
+  };
+  const n = normalizeWillhaben(hit, { lat: null, lon: null, address: null, images: [], description: 'Haustiere erlaubt!' });
+  assert.equal(n.lift, null);
+  assert.equal(n.parkingSpaces, null);
+  assert.equal(n.mentionsPets, true);
 });
