@@ -31,8 +31,8 @@
 | `swipe-bot/src/locales.ts` *(new)* | string catalog + `t()` helper |
 | `swipe-bot/src/locales/en.ts`, `ru.ts`, `de.ts` *(new)* | per-language string tables |
 | `swipe-bot/src/wizard.ts` *(new)* | pure wizard state machine (steps, transitions, keyboards) — kept separate from `bot.ts` because it's the largest new surface and needs its own focused test file |
-| `swipe-bot/src/bot.ts` | wizard wiring, `/settings`, `/searches`, `/language`, card amenity badges, list-mode rendering |
-| `swipe-bot/src/notify.ts` | pacing/cap + list-mode grouped push |
+| `swipe-bot/src/bot.ts` | wizard wiring, `/settings`, `/searches`, `/language`, card amenity badges, aggregate activation summary (existing `/shortlist` card browsing untouched) |
+| `swipe-bot/src/notify.ts` | pacing/cap + grouped push, own compact-entry formatter |
 | `swipe-bot/src/mcp-server.ts` | swap `UserPrefs`/`getUserPrefs`/`setUserPrefs` calls for the new profile helpers |
 | `swipe-bot/src/poller.ts` | swap `getAllUserPrefs` for `getAllSearchProfiles` |
 
@@ -1621,21 +1621,36 @@ git commit -m "surface elevator/parking/floor/energy/availability and a pet-ment
 
 ---
 
-## Task 9: Aggregate summary + list-mode pagination (results delivery, part 1)
+## Task 9: Aggregate match summary on profile activation (results delivery, part 1)
+
+**Plan revision note (2026-08-16):** the original version of this task
+replaced `/shortlist`'s delivery with a new "list-mode" pagination system,
+on the assumption (accurate against the stale `main` the spec was written
+against, inaccurate against `origin/main`) that `/shortlist` still dumped
+up to 20 full photo cards. It doesn't anymore — `origin/main` already
+shipped one-card-at-a-time shortlist browsing with live Prev/Next/🗑️Remove
+buttons (`swipe-card-ux-design.md` + `persistent-keyboard-undo-design.md`,
+functions `sendShortlistBrowseCard`/`shortlistNavButtons`/
+`replaceShortlistCard`/`sendShortlistTo` in `bot.ts`). Replacing that with
+a compact concatenated list would have been a regression (it drops the
+per-item Remove button), so **this task no longer touches `/shortlist` at
+all** — leave `sendShortlistTo`, `sendShortlistBrowseCard`,
+`shortlistNavButtons`, `replaceShortlistCard`, and the `unlike:` callback
+untouched. No list-mode/pagination surface is added by this task; the one
+place still needing a compact-entry format is push notifications, handled
+in Task 10, which defines its own formatter local to `notify.ts`.
 
 **Files:**
 - Modify: `swipe-bot/src/bot.ts`
 - Test: `swipe-bot/test/bot.test.ts`
 
 **Interfaces:**
-- Consumes: `getCandidateListings`, `matchesPrefs`, `SearchProfile` from Tasks 2-3; `rankListings` from `scoring.ts` (unchanged).
+- Consumes: `getCandidateListings`, `matchesPrefs`, `SearchProfile` from Tasks 2-3; `rankListings` from `scoring.ts` (unchanged); `sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB, deps: BotDeps): Promise<void>` (existing, `bot.ts:293`, already what onboarding-completion calls today at `bot.ts:439` to start the swipe deck — this task's "Browse ▸" button calls the same function, it does not reimplement card delivery).
 - Produces:
   - `summarizeMatches(listings: ListingRow[]): { count: number; priceMin: number | null; priceMax: number | null; priceAvg: number | null; topDistricts: number[] }` (pure, exported for direct testing)
   - `formatAggregateSummary(profile: SearchProfile, summary: ReturnType<typeof summarizeMatches>): string` (pure)
-  - `buildListModeEntries(listings: ListingRow[]): string[]` (pure — one compact line per listing: title, price, size/rooms/district, link)
-  - `LIST_MODE_PAGE_SIZE = 5`
-  - `bot.action(/^listmore:(\d+)$/, ...)` — pagination continuation, offset encoded in the callback data
-  - `sendProfileActivationSummary(telegram, db, profile): Promise<void>` (used by Task 6's wizard-completion handlers, referenced there as a forward dependency this task fulfills)
+  - `bot.action(/^browse:(\d+)$/, ...)` — the summary's only button, calls `sendNextCard` for that profile's chat
+  - `sendProfileActivationSummary(telegram, db, profile): Promise<void>` (used by Task 6's wizard-completion handler in place of today's direct `sendNextCard` call — the wizard now shows the summary first, and the summary's button is what actually starts browsing)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1665,22 +1680,21 @@ test('formatAggregateSummary renders the profile name, count, price range/avg, a
   assert.match(text, /district(s)? 6/i);
 });
 
-test('buildListModeEntries renders one compact line per listing with no photos, price, and link', () => {
-  const entries = buildListModeEntries([row({ title: 'Cozy flat', price: 700, url: 'https://x/1' })]);
-  assert.equal(entries.length, 1);
-  assert.match(entries[0], /Cozy flat/);
-  assert.match(entries[0], /€700/);
-  assert.match(entries[0], /https:\/\/x\/1/);
+test('sendProfileActivationSummary sends the aggregate summary with a single Browse button when matches exist', async () => {
+  // Seed 3 candidate listings matching the profile's prefs, call sendProfileActivationSummary,
+  // assert telegram.sendMessage was called once with formatAggregateSummary's text and an
+  // inline keyboard containing exactly one button whose callback_data is `browse:<profileId>`.
 });
 
-test('/shortlist with more than LIST_MODE_PAGE_SIZE items sends the first page plus a "Show N more" button, not every card at once', async () => {
-  // Seed LIST_MODE_PAGE_SIZE + 3 shortlist entries, invoke /shortlist, assert only one message
-  // was sent (not one sendPhoto/sendMessage per item) and it contains a listmore: callback button.
+test('sendProfileActivationSummary sends a "no matches yet" message with no button when candidates is empty', async () => {
+  // Seed zero matching listings, call sendProfileActivationSummary, assert the sent message text
+  // mentions no matches and no inline keyboard is attached.
 });
 
-test('tapping listmore:<offset> appends the next page to the same message', async () => {
-  // Seed enough shortlist entries for 2 pages, fire /shortlist then the listmore: callback,
-  // assert ctx.editMessageText was called with all items from both pages present.
+test('tapping browse:<profileId> calls sendNextCard for that profile\'s chat', async () => {
+  // Fire the browse: callback action for a known profile/chat, assert sendNextCard's observable
+  // effect (a card message sent via telegram.sendPhoto/sendMessage) happens exactly as it does
+  // today when /next is invoked directly — this task adds a new entry point, not new card logic.
 });
 ```
 
@@ -1712,16 +1726,6 @@ export function formatAggregateSummary(profile: SearchProfile, s: ReturnType<typ
   return `🏠 ${profile.name}: ${s.count} match${s.count === 1 ? '' : 'es'} · ${priceRange}${districts}`;
 }
 
-export const LIST_MODE_PAGE_SIZE = 5;
-
-export function buildListModeEntries(listings: ListingRow[]): string[] {
-  return listings.map((l) => {
-    const price = l.price != null ? `€${l.price}` : 'price n/a';
-    const details = [l.area != null ? `${l.area}m²` : null, l.rooms != null ? `${l.rooms} rooms` : null, l.district != null ? `district ${l.district}` : null].filter(Boolean).join(' · ');
-    return `${l.title}\n${price} · ${details}\n${l.url}`;
-  });
-}
-
 async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
   const candidates = getCandidateListings(db, profile.chatId, profile.prefs);
   if (candidates.length === 0) {
@@ -1731,64 +1735,16 @@ async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: 
   const summary = summarizeMatches(candidates);
   await telegram.sendMessage(
     profile.chatId, formatAggregateSummary(profile, summary),
-    Markup.inlineKeyboard([[Markup.button.callback('Browse top matches ▸', `browse:${profile.id}`), Markup.button.callback('See all as list', `list:${profile.id}:0`)]]),
+    Markup.inlineKeyboard([[Markup.button.callback('Browse top matches ▸', `browse:${profile.id}`)]]),
   );
 }
 
 bot.action(/^browse:(\d+)$/, async (ctx) => {
   await sendNextCard(ctx.telegram, ctx.chat!.id, db, deps);
 });
-
-bot.action(/^list:(\d+):(\d+)$/, async (ctx) => {
-  const [, profileIdRaw, offsetRaw] = ctx.match;
-  const profile = getSearchProfile(db, Number(profileIdRaw));
-  if (!profile) return;
-  const offset = Number(offsetRaw);
-  const candidates = rankListings(getCandidateListings(db, profile.chatId, profile.prefs), getSwipedWithDirection(db, profile.chatId));
-  const page = candidates.slice(offset, offset + LIST_MODE_PAGE_SIZE);
-  const entries = buildListModeEntries(page).join('\n\n');
-  const hasMore = offset + LIST_MODE_PAGE_SIZE < candidates.length;
-  const keyboard = hasMore ? Markup.inlineKeyboard([[Markup.button.callback(`Show ${Math.min(LIST_MODE_PAGE_SIZE, candidates.length - offset - LIST_MODE_PAGE_SIZE)} more ▸`, `list:${profile.id}:${offset + LIST_MODE_PAGE_SIZE}`)]]) : Markup.inlineKeyboard([]);
-  if (offset === 0) {
-    await ctx.editMessageText(entries || 'No matches.', keyboard);
-  } else {
-    // Appending: edit the same message, concatenating the previously-shown text with the new page —
-    // ctx.callbackQuery.message.text carries what's already rendered.
-    const existing = (ctx.callbackQuery!.message as { text?: string }).text ?? '';
-    await ctx.editMessageText(`${existing}\n\n${entries}`, keyboard);
-  }
-});
 ```
 
-Rewrite `bot.command('shortlist', ...)` to use list-mode instead of looping `sendShortlistCard` per item:
-
-```typescript
-bot.command('shortlist', async (ctx) => {
-  const chatId = ctx.chat.id;
-  const items = getShortlist(db, chatId);
-  if (items.length === 0) { await ctx.reply('Your shortlist is empty — 👍 a card to save it here.'); return; }
-  const page = items.slice(0, LIST_MODE_PAGE_SIZE);
-  const entries = buildListModeEntries(page).join('\n\n');
-  const hasMore = items.length > LIST_MODE_PAGE_SIZE;
-  const keyboard = hasMore
-    ? Markup.inlineKeyboard([[Markup.button.callback(`Show ${Math.min(LIST_MODE_PAGE_SIZE, items.length - LIST_MODE_PAGE_SIZE)} more ▸`, `shortlistmore:${LIST_MODE_PAGE_SIZE}`)]])
-    : Markup.inlineKeyboard([]);
-  await ctx.reply(entries, keyboard);
-});
-
-bot.action(/^shortlistmore:(\d+)$/, async (ctx) => {
-  const offset = Number(ctx.match[1]);
-  const items = getShortlist(db, ctx.chat!.id);
-  const page = items.slice(offset, offset + LIST_MODE_PAGE_SIZE);
-  const entries = buildListModeEntries(page).join('\n\n');
-  const hasMore = offset + LIST_MODE_PAGE_SIZE < items.length;
-  const keyboard = hasMore ? Markup.inlineKeyboard([[Markup.button.callback(`Show ${Math.min(LIST_MODE_PAGE_SIZE, items.length - offset - LIST_MODE_PAGE_SIZE)} more ▸`, `shortlistmore:${offset + LIST_MODE_PAGE_SIZE}`)]]) : Markup.inlineKeyboard([]);
-  const existing = (ctx.callbackQuery!.message as { text?: string }).text ?? '';
-  await ctx.editMessageText(`${existing}\n\n${entries}`, keyboard);
-});
-```
-
-`MAX_SHORTLIST_CARDS`, `sendShortlistCard`, and the `unlike:` remove-from-shortlist flow's card-based UI are superseded by this list-mode rendering — remove `MAX_SHORTLIST_CARDS`'s export and `sendShortlistCard` (dead code once `/shortlist` no longer calls it), and update `test/bot.test.ts` to delete/replace any test that imported them. Removing per-item 🗑️ buttons means `/shortlist` needs a text-based removal path instead — add `/unshortlist <n>` is out of scope creep; instead keep it simple: each list-mode entry line gets a trailing `(reply /remove <listing-id-suffix> to remove)` is also fiddly for a chat UI. Resolve this pragmatically: keep per-item Remove buttons by rendering each shortlist page as `LIST_MODE_PAGE_SIZE` individual short text messages (no photo, just the compact line) each with its own 🗑️ button, rather than one concatenated block — re-read this paragraph against the spec's "compact single-line entries... under one message" wording before implementing, and if a single concatenated message without per-item remove buttons is acceptable (removal still works fine via swiping past it / it naturally drops out of future candidate lists once passed elsewhere), prefer the simpler single-message version above and drop per-item removal from `/shortlist`'s list view; this is a small product-scope judgment call, not a technical constraint — pick the single-message version (matches the spec literally) and note in the PR/commit message that per-item shortlist removal was dropped in favor of pagination, flagging it for the user to confirm they're fine with that trade **before merging this task**, since it's a slight behavior removal the spec didn't explicitly call out.
+`/shortlist`, `sendShortlistTo`, `sendShortlistBrowseCard`, `shortlistNavButtons`, `replaceShortlistCard`, and the `unlike:` callback are untouched by this task — they already deliver one card at a time with working Prev/Next/🗑️Remove and are not part of the dump problem anymore.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1799,32 +1755,32 @@ Expected: PASS
 
 ```bash
 git add swipe-bot/src/bot.ts swipe-bot/test/bot.test.ts
-git commit -m "add aggregate match summary and list-mode pagination; switch /shortlist off per-card dumps"
+git commit -m "add aggregate match summary with a Browse button on profile activation"
 ```
 
 ---
 
-## Task 10: Push notification pacing/cap + list-mode grouping (results delivery, part 2)
+## Task 10: Push notification pacing/cap + grouping by profile (results delivery, part 2)
 
 **Files:**
 - Modify: `swipe-bot/src/notify.ts`
 - Test: `swipe-bot/test/notify.test.ts`
 
 **Interfaces:**
-- Consumes: `buildListModeEntries`, `LIST_MODE_PAGE_SIZE` from Task 9 (imported from `bot.ts`, matching this file's existing `import { sendCard, getCommuteLineFor, ... } from './bot.js'` pattern).
-- Produces: `notifyNewMatches`'s signature is unchanged; its internal behavior changes to grouped/paced/list-mode delivery. `PUSH_STAGGER_MS = 1500` (exported for test control — tests should inject a fake/no-op delay rather than actually sleeping 1.5s per assertion).
+- Consumes: `SearchProfile`/`getAllSearchProfiles`/`matchesPrefs` from Tasks 2-3 (unchanged import shape from this file's existing `import { ... } from './db.js'` pattern).
+- Produces: `formatPushEntry(l: ListingRow): string` (pure, local to this file — pushes are the only surface still needing a compact multi-listing format; `/shortlist` keeps its existing card-based browsing per Task 9's revision note, so nothing is imported from `bot.ts` for this). `notifyNewMatches`'s signature is unchanged; its internal behavior changes to grouped/paced delivery. `PUSH_STAGGER_MS = 1500` (exported for test control — tests should inject a fake/no-op delay rather than actually sleeping 1.5s per assertion).
 
 - [ ] **Step 1: Write the failing tests**
 
 ```typescript
 // swipe-bot/test/notify.test.ts (add/replace)
-test('notifyNewMatches sends one header + one list-mode message per matching profile, not one message per listing', async () => {
+test('notifyNewMatches sends one header + one compact-entries message per matching profile, not one message per listing', async () => {
   // Seed a profile matching 7 new listings; assert exactly 2 sendMessage calls for that chat
-  // (header line, then the list-mode block) — not 7 sendCard-style calls.
+  // (header line, then the compact-entries block) — not 7 sendCard-style calls.
 });
 
 test('notifyNewMatches caps each profile at MAX_PUSH_PER_USER matches shown, with a "+N more" note', async () => {
-  // 8 matches, MAX_PUSH_PER_USER = 5 -> list-mode block shows 5 entries plus a trailing "+3 more" line.
+  // 8 matches, MAX_PUSH_PER_USER = 5 -> compact-entries block shows 5 entries plus a trailing "+3 more" line.
 });
 
 test('notifyNewMatches header includes the profile name so multi-profile users know which search matched', async () => {
@@ -1846,7 +1802,12 @@ Expected: FAIL
 - [ ] **Step 3: Implement**
 
 ```typescript
-import { buildListModeEntries } from './bot.js';
+/** Pure — one compact line per listing for a push notification's body: title, price, size/rooms/district, link. Local to notify.ts: pushes are the only remaining place needing a compact multi-listing format now that /shortlist keeps its existing card-based Prev/Next/Remove browsing (see Task 9's revision note). */
+export function formatPushEntry(l: ListingRow): string {
+  const price = l.price != null ? `€${l.price}` : 'price n/a';
+  const details = [l.area != null ? `${l.area}m²` : null, l.rooms != null ? `${l.rooms} rooms` : null, l.district != null ? `district ${l.district}` : null].filter(Boolean).join(' · ');
+  return `${l.title}\n${price} · ${details}\n${l.url}`;
+}
 
 export const PUSH_STAGGER_MS = 1500;
 
@@ -1872,7 +1833,7 @@ export async function notifyNewMatches(
 
     const ranked = rankListings(matches, getSwipedWithDirection(db, profile.chatId));
     const toShow = ranked.slice(0, MAX_PUSH_PER_USER);
-    const entries = buildListModeEntries(toShow).join('\n\n');
+    const entries = toShow.map(formatPushEntry).join('\n\n');
     const remainder = matches.length > toShow.length ? `\n\n+${matches.length - toShow.length} more — check /next.` : '';
 
     await telegram.sendMessage(profile.chatId, `🏠 ${profile.name} — ${matches.length} new match${matches.length === 1 ? '' : 'es'}:`);
@@ -1909,7 +1870,7 @@ git commit -m "pace and group push notifications by profile instead of bursting 
 
 - [ ] **Step 1: Update HELP_TEXT and BOT_COMMANDS for the new command set**
 
-`HELP_TEXT` currently documents `/start`, `/next`, `/shortlist`, `/settings`. Rewrite it (through `t()`, adding an `en`/`ru`/`de` `help_full` key to the Task 4 locale files if it wasn't already fully covered there) to also mention `/searches` and `/language`, and to describe list-mode pagination and multi-profile pushes instead of the old "swipe through them one at a time" framing. `BOT_COMMANDS` gains `{ command: 'searches', description: 'Manage your saved searches' }` alongside the `language` entry Task 4 already added.
+`HELP_TEXT` currently documents `/start`, `/next`, `/shortlist`, `/settings`. Rewrite it (through `t()`, adding an `en`/`ru`/`de` `help_full` key to the Task 4 locale files if it wasn't already fully covered there) to also mention `/searches` and `/language`, and to describe the new aggregate activation summary and multi-profile pushes — `/shortlist`'s own description (one card at a time, Prev/Next/Remove) is unchanged by this plan. `BOT_COMMANDS` gains `{ command: 'searches', description: 'Manage your saved searches' }` alongside the `language` entry Task 4 already added.
 
 - [ ] **Step 2: Run the full test suite in both packages**
 
@@ -1937,9 +1898,9 @@ Per the spec's Testing section, using the bot's real Telegram chat (or a throwaw
 2. Run the full wizard end to end (name, budget chip, district taps + continue, rooms chip, an amenity toggle + continue, commute skip) → confirm the aggregate summary + Browse/List buttons appear.
 3. `/searches` → `+ Add another search` → run the wizard again with different values → confirm both profiles are listed, and switching between them via `/searches` changes what `/next` returns.
 4. `/settings` → edit just the budget field → confirm districts/rooms from the original setup are untouched afterward.
-5. Manually seed >5 shortlist entries (swipe 👍 on several `/next` cards) → `/shortlist` → confirm one paginated message with a working "Show N more" button, not a burst of individual cards.
-6. Trigger (or wait for) a poll cycle with >5 new matches for one profile → confirm the push arrives as one grouped, profile-named message, not a flood of individual cards.
-7. Confirm a listing with `mentionsPets: true` shows the 🐾 unverified badge, and one with `lift: true` shows the elevator badge, on both a `/next` card and a list-mode entry.
+5. Manually seed >5 shortlist entries (swipe 👍 on several `/next` cards) → `/shortlist` → confirm it still browses one card at a time with working Prev/Next/🗑️Remove (unchanged by this plan) — and separately, activate a profile with several matches → confirm the new aggregate summary message appears first, with a working "Browse top matches ▸" button.
+6. Trigger (or wait for) a poll cycle with >5 new matches for one profile → confirm the push arrives as one grouped, profile-named header plus one compact multi-entry message, not a flood of individual cards.
+7. Confirm a listing with `mentionsPets: true` shows the 🐾 unverified badge, and one with `lift: true` shows the elevator badge, on both a `/next` card and a push notification's compact entry.
 
 Record the outcome of this manual pass in the task's completion note (or PR description) — this step has no automated assertion, so its result must be stated explicitly rather than assumed from the automated suite being green.
 
@@ -1957,13 +1918,13 @@ git commit -m "update help text and commands for /searches and /language; final 
 **Spec coverage:**
 - Data model & multi-profile (search_profiles, chats, migration, 5-profile cap, swipes stay chat-keyed) → Task 2. ✅
 - Onboarding wizard (chip-driven, edit-in-place, progress bar, Back, name/budget/districts/rooms/amenities/commute steps, single-field /settings) → Tasks 5-7. ✅
-- Results delivery (aggregate summary, browse/list toggle, shortlist pagination, push pacing/cap/grouping) → Tasks 9-10. ✅
+- Results delivery (aggregate summary, push pacing/cap/grouping) → Tasks 9-10. ✅ **Revised 2026-08-16**: `/shortlist` pagination is no longer part of this plan's scope — `origin/main` already shipped one-card-at-a-time shortlist browsing with Prev/Next/Remove after the spec was written against a stale checkout, making the planned list-mode replacement a regression (it would have dropped the working Remove button). See Task 9's revision note. The spec doc's "Problem" section is accordingly stale on this one point; not rewritten there since the plan is the actionable artifact and carries the correction.
 - Amenity filters & pet badge (elevator/parking as real filters, floor/energy/availability/pet as card info, willhaben has no lift/parking data so those filters only ever match immoscout listings) → Tasks 1, 3, 8. ✅
 - i18n (en/ru/de catalog, `t()`, `/language`, listing content never translated) → Task 4, applied throughout Tasks 6-9's UI strings. ✅
 - Testing section's specific coverage list (wizard transitions incl. Back, prefs_json round-trip, matchesPrefs w/ elevator/parking, pet-keyword true/false cases, `t()` fallback, multi-profile cap, active-profile switching, migration test, pagination batch sizes, manual smoke test) → distributed across every task's own test step plus Task 11's consolidated pass. ✅
 - Open question "exact pet-keyword list" → resolved directly in Task 1's implementation (regex given) rather than left open. ✅
 - Open question "/language mid-wizard re-render" → **not explicitly resolved** — Task 4 wires `/language` as a standalone command; switching language mid-wizard does not re-render the in-progress wizard message in the new language (it takes effect on the *next* interaction, matching the spec's second stated option). Noting this explicitly here rather than leaving it silently unaddressed: this is the simpler of the two options the spec left open, and matches what Task 4's `t()`-based rendering naturally does (no special-casing needed) — flagged as a deliberate, spec-sanctioned choice, not a gap.
 
-**Placeholder scan:** No `TBD`/`TODO` remain. Task 9 contains one explicit product-scope judgment call (dropping per-item shortlist removal buttons in favor of pagination) that is resolved inline with a stated decision and rationale, not left as an open placeholder — flagged for the user to sign off on when that task lands, same as a real PR description would.
+**Placeholder scan:** No `TBD`/`TODO` remain. The user confirmed (2026-08-16) accepting the plan as revised — no shortlist-removal trade-off remains, since `/shortlist` is now untouched by this plan.
 
-**Type/signature consistency:** `SearchProfilePrefs`/`SearchProfile` (Task 2) are used with identical shape in Tasks 3, 5-10. `matchesPrefs`/`getCandidateListings` keep their exact names across the `UserPrefs` → `SearchProfilePrefs` swap (Task 3), so no caller in Tasks 6-10 needs a different function name than what exists in the current codebase today. `getWizardState`/`setWizardState`/`deleteWizardState` (Task 6) consistently replace `getOnboardingState`/`setOnboardingState`/`deleteOnboardingState` everywhere they're referenced (Tasks 6-7). `buildListModeEntries`/`LIST_MODE_PAGE_SIZE` (Task 9) are imported into `notify.ts` in Task 10 with matching names. `t()`'s signature (`db, chatId, key, params?`) is used identically in Tasks 4, 6, 8.
+**Type/signature consistency:** `SearchProfilePrefs`/`SearchProfile` (Task 2) are used with identical shape in Tasks 3, 5-10. `matchesPrefs`/`getCandidateListings` keep their exact names across the `UserPrefs` → `SearchProfilePrefs` swap (Task 3), so no caller in Tasks 6-10 needs a different function name than what exists in the current codebase today. `getWizardState`/`setWizardState`/`deleteWizardState` (Task 6) consistently replace `getOnboardingState`/`setOnboardingState`/`deleteOnboardingState` everywhere they're referenced (Tasks 6-7). `formatPushEntry` (Task 10) is defined locally in `notify.ts`, not imported from `bot.ts` — Task 9 no longer exports a list-mode formatter since `/shortlist` keeps its existing card-based browsing. `t()`'s signature (`db, chatId, key, params?`) is used identically in Tasks 4, 6, 8.
