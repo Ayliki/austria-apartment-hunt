@@ -1,12 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Telegram } from 'telegraf';
-import { notifyNewMatches, MAX_PUSH_PER_USER } from '../src/notify.js';
-import { openDb, createSearchProfile, MCP_CHAT_ID, type ListingRow, type CommuteTimes } from '../src/db.js';
+import { notifyNewMatches, MAX_PUSH_PER_USER, PUSH_STAGGER_MS, formatPushEntry, type DelayFn } from '../src/notify.js';
+import { openDb, createSearchProfile, MCP_CHAT_ID, type ListingRow } from '../src/db.js';
 import type { ComputeCommuteFn, GeocodeFn } from '../src/bot.js';
 
 const FAKE_COMPUTE_COMMUTE: ComputeCommuteFn = async () => ({ walkMinutes: null, transitMinutes: null, transitSummary: null });
 const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };
+
+/** Injectable no-op delay so tests don't actually sleep PUSH_STAGGER_MS per assertion. */
+function noSleepDelay(): { delay: DelayFn; calls: number[] } {
+  const calls: number[] = [];
+  const delay: DelayFn = async (ms) => { calls.push(ms); };
+  return { delay, calls };
+}
 
 function row(overrides: Partial<ListingRow>): ListingRow {
   return {
@@ -38,6 +45,16 @@ function testTelegram(): { telegram: Telegram; calls: Call[] } {
   return { telegram, calls };
 }
 
+test('formatPushEntry formats title, price, size/rooms/district, and link on separate lines', () => {
+  const text = formatPushEntry(row({ title: 'Nice flat', price: 700, area: 50, rooms: 2, district: 6, url: 'https://x/a' }));
+  assert.equal(text, 'Nice flat\n€700 · 50m² · 2 rooms · district 6\nhttps://x/a');
+});
+
+test('formatPushEntry falls back gracefully when price/area/rooms/district are missing', () => {
+  const text = formatPushEntry(row({ title: 'Mystery flat', price: null, area: null, rooms: null, district: null, url: 'https://x/b' }));
+  assert.equal(text, 'Mystery flat\nprice n/a · \nhttps://x/b');
+});
+
 test('notifyNewMatches does nothing when there are no new listings', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
@@ -46,15 +63,67 @@ test('notifyNewMatches does nothing when there are no new listings', async () =>
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches pushes a matching listing to a user whose prefs it satisfies', async () => {
+test('notifyNewMatches sends one header + one compact-entries message per matching profile, not one message per listing', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
+  const matches = Array.from({ length: 7 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
+  const { delay } = noSleepDelay();
+  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
 
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.match(texts[0] as string, /1 new listing just matched/);
+  const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(sendMessageCalls.length, 2);
+  assert.match(sendMessageCalls[0].payload.text as string, /🏠 Test — 7 new matches:/);
+  assert.match(sendMessageCalls[1].payload.text as string, /price n\/a|€700/); // compact entries block
+});
+
+test('notifyNewMatches caps each profile at MAX_PUSH_PER_USER matches shown, with a "+N more" note', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  const { telegram, calls } = testTelegram();
+
+  const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
+  const { delay } = noSleepDelay();
+  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
+
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.equal(texts.length, 2);
+  assert.match(texts[0], new RegExp(`${matches.length} new matches`));
+  assert.match(texts[1], /\+3 more — check \/next\./);
+  const entryCount = (texts[1].match(/€700/g) ?? []).length;
+  assert.equal(entryCount, MAX_PUSH_PER_USER);
+});
+
+test('notifyNewMatches header includes the profile name so multi-profile users know which search matched', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Cheap flats', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
+  createSearchProfile(db, 1, 'District 6 only', { priceFrom: null, priceTo: 2000, districts: [6], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
+  const { telegram, calls } = testTelegram();
+
+  const matches = [row({ id: 'willhaben:a', price: 700, district: 6 })];
+  const { delay } = noSleepDelay();
+  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
+
+  const headers = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).startsWith('🏠')).map((c) => c.payload.text as string);
+  assert.equal(headers.length, 2);
+  assert.ok(headers.some((h) => h.includes('Cheap flats')));
+  assert.ok(headers.some((h) => h.includes('District 6 only')));
+});
+
+test('notifyNewMatches staggers sends across profiles by PUSH_STAGGER_MS to avoid Telegram flood-control', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'First', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
+  createSearchProfile(db, 1, 'Second', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
+  createSearchProfile(db, 1, 'Third', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
+  const { telegram } = testTelegram();
+
+  const matches = [row({ id: 'willhaben:a', price: 700 })];
+  const { delay, calls: delayCalls } = noSleepDelay();
+  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
+
+  // 3 matching profiles -> delay called once per profile after the first (2 times), each PUSH_STAGGER_MS
+  assert.deepEqual(delayCalls, [PUSH_STAGGER_MS, PUSH_STAGGER_MS]);
 });
 
 test('notifyNewMatches skips a user whose prefs the listing does not satisfy', async () => {
@@ -77,22 +146,6 @@ test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches caps the burst per user and mentions the remainder', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
-
-  const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
-  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
-
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts[0], new RegExp(`${matches.length} new listings just matched`));
-  assert.match(texts.at(-1) as string, /\+3 more — check \/next\./);
-  // one card = at least one sendMessage (text-only, no images) per sent listing, capped at MAX_PUSH_PER_USER
-  const cardMessages = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('(no photo)'));
-  assert.equal(cardMessages.length, MAX_PUSH_PER_USER);
-});
-
 test('notifyNewMatches never pushes municipal/waitlist housing to a user who opted out', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
@@ -101,32 +154,6 @@ test('notifyNewMatches never pushes municipal/waitlist housing to a user who opt
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, requiresWaitlistTicket: true })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
 
   assert.equal(calls.length, 0);
-});
-
-test('notifyNewMatches includes the commute line on a pushed card when the user has a commute destination set', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
-  const { telegram, calls } = testTelegram();
-  const computeCommute: ComputeCommuteFn = async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' });
-
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, lat: 48.19, lon: 16.37 })], computeCommute, NEVER_GEOCODE);
-
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.ok(texts.some((t) => t.includes('18 min walk · 7 min by tram D to TU Wien')));
-});
-
-test('notifyNewMatches caches the commute computation across the same (chat, listing) pair', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
-  const { telegram } = testTelegram();
-  let calls = 0;
-  const computeCommute: ComputeCommuteFn = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 10, transitMinutes: null, transitSummary: null }; };
-  const listing = row({ id: 'willhaben:a', price: 700, lat: 48.19, lon: 16.37 });
-
-  await notifyNewMatches(telegram, db, [listing], computeCommute, NEVER_GEOCODE);
-  await notifyNewMatches(telegram, db, [listing], computeCommute, NEVER_GEOCODE); // same listing "found new" again — shouldn't recompute
-
-  assert.equal(calls, 1);
 });
 
 test('notifyNewMatches sends separate, independent pushes to different matching users', async () => {
@@ -139,4 +166,21 @@ test('notifyNewMatches sends separate, independent pushes to different matching 
 
   const chatIds = new Set(calls.map((c) => c.payload.chat_id));
   assert.deepEqual(chatIds, new Set([1])); // only chat 1's budget covers 700
+});
+
+test('notifyNewMatches keeps polling and pushing for inactive (non-current) saved searches, not just the active one', async () => {
+  const db = openDb(':memory:');
+  // Two profiles for the same chat; the second one deactivates the first (only one profile can be
+  // active at a time per createSearchProfile's default makeActive=true), mirroring a user who has
+  // switched their "current" search in /searches without deleting the old one.
+  createSearchProfile(db, 1, 'Old search', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'New search', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  const { telegram, calls } = testTelegram();
+
+  const { delay } = noSleepDelay();
+  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
+
+  const headers = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).startsWith('🏠')).map((c) => c.payload.text as string);
+  assert.ok(headers.some((h) => h.includes('Old search')), 'inactive/non-current profile should still be pushed to');
+  assert.ok(headers.some((h) => h.includes('New search')));
 });
