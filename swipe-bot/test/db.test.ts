@@ -12,6 +12,7 @@ import {
   createSearchProfile, getSearchProfiles, getSearchProfile, getActiveSearchProfile, setActiveSearchProfile,
   updateSearchProfile, renameSearchProfile, deleteSearchProfile, countSearchProfiles, getAllSearchProfiles,
   upsertActiveProfilePrefs, getChatLanguage, setChatLanguage, MAX_SEARCH_PROFILES_PER_CHAT,
+  getWizardState, setWizardState, deleteWizardState,
   type ListingRow, type SearchProfilePrefs,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
@@ -936,6 +937,64 @@ test('openDb migrates a pre-existing (chat_id, listing_id)-keyed commute_cache o
     const reopened = openDb(path); // migration must be a no-op the second time
     const reopenedProfile = getActiveSearchProfile(reopened, 9)!;
     assert.deepEqual(getCommuteTimes(reopened, reopenedProfile.id, 'willhaben:old'), { walkMinutes: 15, transitMinutes: 5, transitSummary: 'U1' });
+  } finally {
+    rmSync(path, { force: true });
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+  }
+});
+
+// --- Final-review fix wave: a legacy/malformed onboarding_state row must never brick a chat ---
+
+test('getWizardState returns null (not a malformed cast) and self-heals an old-shaped onboarding_state row', () => {
+  const db = openDb(':memory:');
+  // Simulates the pre-redesign linear-text onboarding's payload shape (a plain string[] of answers),
+  // which doesn't have stepIndex/partial/editingProfileId at all.
+  db.prepare('INSERT INTO onboarding_state (chat_id, answers, updated_at) VALUES (?, ?, ?)')
+    .run(1, JSON.stringify(['Studio Center', '700-900']), new Date().toISOString());
+
+  assert.equal(getWizardState(db, 1), null);
+  const row = db.prepare('SELECT * FROM onboarding_state WHERE chat_id = ?').get(1);
+  assert.equal(row, undefined); // self-healed: the malformed row is cleared, not left to keep failing
+});
+
+test('getWizardState returns null for genuinely corrupt (non-JSON) answers, without throwing', () => {
+  const db = openDb(':memory:');
+  db.prepare('INSERT INTO onboarding_state (chat_id, answers, updated_at) VALUES (?, ?, ?)')
+    .run(1, 'not even json', new Date().toISOString());
+
+  assert.equal(getWizardState(db, 1), null);
+});
+
+test('getWizardState round-trips a valid WizardState untouched', () => {
+  const db = openDb(':memory:');
+  const state = { stepIndex: 2, profileName: 'My Search', partial: { priceFrom: 700, priceTo: 900 }, editingProfileId: null };
+  setWizardState(db, 1, state);
+  assert.deepEqual(getWizardState(db, 1), state);
+});
+
+test('a Back tap on the very first step correctly stays null-cleared: deleteWizardState is idempotent on an already-empty chat', () => {
+  const db = openDb(':memory:');
+  assert.doesNotThrow(() => deleteWizardState(db, 1)); // no row to begin with
+});
+
+test('openDb clears a legacy/malformed onboarding_state row left over from before the button-wizard redesign, on startup', () => {
+  const path = `/tmp/swipe-bot-migration-test-onboarding-state-${Date.now()}.sqlite`;
+  try {
+    const preMigration = openDb(path);
+    // Overwrite with the pre-redesign shape (string[] of free-text answers) — simulates a chat that
+    // was mid-onboarding when this upgrade landed.
+    preMigration.prepare('INSERT INTO onboarding_state (chat_id, answers, updated_at) VALUES (?, ?, ?)')
+      .run(42, JSON.stringify(['Studio Center']), new Date().toISOString());
+    // A second, already-valid row (as if some chat was already mid-wizard on the NEW shape) must survive.
+    const validState = { stepIndex: 1, profileName: 'Kept', partial: {}, editingProfileId: null };
+    setWizardState(preMigration, 43, validState);
+    preMigration.close();
+
+    const migrated = openDb(path); // triggers migrate() -> migrateOnboardingState
+    assert.equal(getWizardState(migrated, 42), null); // legacy row cleared
+    assert.deepEqual(getWizardState(migrated, 43), validState); // valid row untouched
+    migrated.close();
   } finally {
     rmSync(path, { force: true });
     rmSync(`${path}-wal`, { force: true });

@@ -186,6 +186,50 @@ function migrate(db: DB): void {
 
   migrateUserPrefsToSearchProfiles(db);
   migrateCommuteCacheToProfileId(db);
+  migrateOnboardingState(db);
+}
+
+/**
+ * Clears any `onboarding_state` row whose payload doesn't match the current `WizardState` shape —
+ * a chat that was mid-onboarding when the button-wizard redesign shipped would otherwise get back a
+ * malformed/old-shaped object (the old linear-text onboarding stored a `string[]` in this same
+ * `answers` column) that doesn't satisfy `WIZARD_STEPS[state.stepIndex]` and friends, silently
+ * bricking that chat's text input into "please tap a button" forever. Old in-progress onboarding
+ * sessions aren't worth preserving across a schema change this size, so the row is just dropped
+ * rather than migrated — the chat picks back up cleanly via /start. Runs on every startup (like
+ * repairMissedWaitlistFlags above): a cheap no-op scan when every row is already valid, which is the
+ * common case after the first run.
+ */
+function migrateOnboardingState(db: DB): void {
+  const rows = db.prepare('SELECT chat_id, answers FROM onboarding_state').all() as { chat_id: number; answers: string }[];
+  const invalidChatIds = rows.filter((r) => !isValidWizardStateJson(r.answers)).map((r) => r.chat_id);
+  if (invalidChatIds.length === 0) return;
+  const del = db.prepare('DELETE FROM onboarding_state WHERE chat_id = ?');
+  const clear = db.transaction((chatIds: number[]) => {
+    for (const chatId of chatIds) del.run(chatId);
+  });
+  clear(invalidChatIds);
+}
+
+/** Parses + shape-checks a raw `onboarding_state.answers` JSON string. Shared by migrateOnboardingState (bulk, at startup) and getWizardState (per-read, self-healing) so both use the exact same definition of "valid". */
+function isValidWizardStateJson(json: string): boolean {
+  try {
+    return isValidWizardState(JSON.parse(json));
+  } catch {
+    return false; // not even valid JSON — definitely not a valid WizardState
+  }
+}
+
+/** Structural guard for a parsed `onboarding_state.answers` payload — catches both genuinely malformed JSON and a value that parses fine but doesn't have WizardState's shape (e.g. the old linear-text onboarding's `string[]`, or a future/older version's shape mismatch). */
+function isValidWizardState(x: unknown): x is WizardState {
+  if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
+  const s = x as Record<string, unknown>;
+  return (
+    typeof s.stepIndex === 'number' &&
+    (s.profileName === null || typeof s.profileName === 'string') &&
+    typeof s.partial === 'object' && s.partial !== null && !Array.isArray(s.partial) &&
+    (s.editingProfileId === null || typeof s.editingProfileId === 'number')
+  );
 }
 
 /**
@@ -588,7 +632,21 @@ export function setChatLanguage(db: DB, chatId: number, language: ChatLanguage):
 /** In-progress onboarding/edit wizard state for a chat, or null if not mid-wizard. Persisted so a process restart doesn't silently drop progress. Table/column names are unchanged from the old linear-text onboarding (`answers TEXT` already stores arbitrary JSON) — only the payload shape changed, from `string[]` to a `WizardState`. */
 export function getWizardState(db: DB, chatId: number): WizardState | null {
   const row = db.prepare('SELECT answers FROM onboarding_state WHERE chat_id = ?').get(chatId) as { answers: string } | undefined;
-  return row ? (JSON.parse(row.answers) as WizardState) : null;
+  if (!row) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.answers);
+  } catch {
+    parsed = null; // genuinely corrupt (non-JSON) — falls through to the shape guard below, which rejects it
+  }
+  if (!isValidWizardState(parsed)) {
+    // Malformed/old-shaped/corrupt row (see migrateOnboardingState's doc comment) that slipped past
+    // the startup migration somehow — self-heal by clearing it and reporting "not mid-wizard" rather
+    // than trusting the cast and letting a bad shape brick the chat's text input.
+    deleteWizardState(db, chatId);
+    return null;
+  }
+  return parsed;
 }
 
 export function setWizardState(db: DB, chatId: number, state: WizardState): void {
