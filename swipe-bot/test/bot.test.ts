@@ -163,8 +163,8 @@ test('shortlistNavButtons: a single-item shortlist omits both Prev and Next', ()
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove']);
 });
 
-test('BOT_COMMANDS lists start, next, shortlist, settings, help, each with a non-empty description', () => {
-  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'settings', 'help']);
+test('BOT_COMMANDS lists start, next, shortlist, settings, help, language, each with a non-empty description', () => {
+  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'settings', 'help', 'language']);
   assert.ok(BOT_COMMANDS.every((c) => c.description.length > 0 && c.description.length <= 256)); // Telegram's setMyCommands description limit
 });
 

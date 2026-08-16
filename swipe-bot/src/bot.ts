@@ -1,11 +1,13 @@
 import { Telegraf, Markup } from 'telegraf';
 import {
-  type DB, type SearchProfilePrefs, type ListingRow, type CommuteTimes,
+  type DB, type SearchProfilePrefs, type ListingRow, type CommuteTimes, type ChatLanguage,
   getActiveSearchProfile, upsertActiveProfilePrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
   getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes, setListingCoords,
+  setChatLanguage,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
+import { t, LOCALE_NAMES } from './locales.js';
 
 export type GeocodeFn = (address: string) => Promise<GeoPoint | null>;
 export type ComputeCommuteFn = (origin: GeoPoint, destination: GeoPoint) => Promise<CommuteTimes>;
@@ -51,6 +53,7 @@ export const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: 'shortlist', description: 'Browse everything you\'ve liked' },
   { command: 'settings', description: 'Change your preferences' },
   { command: 'help', description: 'How this bot works' },
+  { command: 'language', description: 'Change the bot\'s language' },
 ];
 
 /** Always-visible bottom keyboard for one-tap navigation — sent once (onboarding completion, or /start on an already-configured chat) and Telegram keeps it visible under the input field from then on. */
@@ -486,6 +489,20 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
 
   bot.command('help', async (ctx) => {
     await ctx.reply(HELP_TEXT, MAIN_KEYBOARD);
+  });
+
+  bot.command('language', async (ctx) => {
+    const buttons = Markup.inlineKeyboard(
+      (Object.keys(LOCALE_NAMES) as ChatLanguage[]).map((lang) => Markup.button.callback(LOCALE_NAMES[lang], `setlang:${lang}`))
+    );
+    await ctx.reply(t(db, ctx.chat.id, 'language_prompt'), buttons);
+  });
+
+  bot.action(/^setlang:(en|ru|de)$/, async (ctx) => {
+    const [, lang] = ctx.match as unknown as [string, ChatLanguage];
+    setChatLanguage(db, ctx.chat!.id, lang);
+    await ctx.answerCbQuery();
+    await ctx.reply(t(db, ctx.chat!.id, 'language_saved', { language: LOCALE_NAMES[lang] }));
   });
 
   bot.command('shortlist', async (ctx) => {
