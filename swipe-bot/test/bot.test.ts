@@ -1,13 +1,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createBot, parseOnboardingAnswers, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
-  appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
+  createBot, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
+  appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
-import { openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
+import {
+  openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
+  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, type ListingRow, type DB, type SearchProfilePrefs,
+} from '../src/db.js';
+import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
+
+function defaultPrefs(overrides: Partial<SearchProfilePrefs> = {}): SearchProfilePrefs {
+  return {
+    priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
+    includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false,
+    commuteDestination: null, commuteLat: null, commuteLon: null,
+    ...overrides,
+  };
+}
 
 function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
   return {
@@ -30,26 +43,6 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     ...overrides,
   };
 }
-
-test('parseOnboardingAnswers parses budget, districts, rooms, size, waitlist-housing, WG answers', () => {
-  const prefs = parseOnboardingAnswers(['800', '400', '1-9', '1-2', '30-60', 'no', 'yes']);
-  assert.deepEqual(prefs, {
-    priceTo: 800, priceFrom: 400, districts: [1, 2, 3, 4, 5, 6, 7, 8, 9],
-    roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60, includeWaitlistHousing: false, includeWg: true,
-  });
-});
-
-test('parseOnboardingAnswers treats "skip"/"any" as unbounded for optional answers', () => {
-  const prefs = parseOnboardingAnswers(['800', 'skip', 'any', 'any', 'any', 'yes', 'no']);
-  assert.deepEqual(prefs, {
-    priceTo: 800, priceFrom: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
-    includeWaitlistHousing: true, includeWg: false,
-  });
-});
-
-test('parseOnboardingAnswers rejects a non-numeric required budget', () => {
-  assert.throws(() => parseOnboardingAnswers(['not a number', 'skip', 'any', 'any', 'any', 'yes', 'no']), /budget/i);
-});
 
 test('nextCardFor returns null when the candidate queue is empty', () => {
   const db = openDb(':memory:');
@@ -268,38 +261,111 @@ function callbackUpdate(chatId: number, data: string, message: Record<string, un
   };
 }
 
-test('/start begins onboarding and asks the first question', async () => {
+test('/start with no existing profiles begins the wizard at the name step', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.match(texts[0] as string, /never transfer money/);
-  assert.match(texts[1] as string, /free text won't parse/);
-  assert.equal(texts[2], 'What\'s your max budget (cold, in EUR)?');
-  assert.deepEqual(getOnboardingState(db, 1), []);
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts[0], /never transfer money/); // safety notice first
+  assert.match(texts[1], /name this search/i);
+  const keyboard = (calls[1].payload.reply_markup as { inline_keyboard: { text: string }[][] }).inline_keyboard;
+  assert.ok(keyboard.flat().some((b) => b.text === 'Skip'));
+  assert.deepEqual(getWizardState(db, 1), initialWizardState());
 });
 
-test('/start on an already-configured chat points at /next, /shortlist, /settings instead of silently re-onboarding', async () => {
+test('/start when a profile already exists tells the user to use /searches or /settings instead of re-onboarding', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
 
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.equal(texts.length, 1);
   assert.match(texts[0], /\/next/);
-  assert.match(texts[0], /\/shortlist/);
+  assert.match(texts[0], /\/searches/);
   assert.match(texts[0], /\/settings/);
-  assert.equal(getOnboardingState(db, 1), null); // not put into onboarding
+  assert.equal(getWizardState(db, 1), null); // not put into the wizard
 });
 
-test('onboarding intro explains what happens after setup, not just how to answer', async () => {
+test('/start refuses a 6th profile once MAX_SEARCH_PROFILES_PER_CHAT is reached, pointing at /searches to delete one first', async () => {
   const db = openDb(':memory:');
+  for (let i = 0; i < MAX_SEARCH_PROFILES_PER_CHAT; i++) {
+    createSearchProfile(db, 1, `Search ${i + 1}`, defaultPrefs(), false);
+  }
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
+
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts[1], /~3h/); // poll cadence
-  assert.match(texts[1], /shortlist/i); // swiping builds a shortlist
+  assert.equal(texts.length, 2); // safety notice, then the cap refusal
+  assert.match(texts[1], new RegExp(String(MAX_SEARCH_PROFILES_PER_CHAT)));
+  assert.match(texts[1], /\/searches/);
+  assert.equal(getWizardState(db, 1), null); // never entered the wizard
+  assert.equal(getSearchProfiles(db, 1).length, MAX_SEARCH_PROFILES_PER_CHAT);
+});
+
+test('completing the wizard end-to-end creates an active SearchProfile with the chosen answers', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start')); // name step
+
+  await bot.handleUpdate(textUpdate(1, 'Studio Center')); // free-text name -> budget step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900')); // budget chip -> districts step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:district:6')); // toggle district 6
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:district:7')); // toggle district 7
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue')); // -> rooms/size step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1')); // rooms chip -> amenities step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenity:requireElevator')); // toggle elevator on
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue')); // -> commute step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip')); // completes the wizard
+
+  assert.equal(getWizardState(db, 1), null); // wizard state cleared on completion
+
+  const profiles = getSearchProfiles(db, 1);
+  assert.equal(profiles.length, 1);
+  const profile = profiles[0];
+  assert.equal(profile.active, true);
+  assert.equal(profile.name, 'Studio Center');
+  assert.deepEqual(profile.prefs, {
+    priceFrom: 700, priceTo: 900, districts: [6, 7], roomsFrom: 1, roomsTo: 1, areaFrom: null, areaTo: null,
+    includeWaitlistHousing: false, includeWg: false, requireElevator: true, requireParking: false,
+    commuteDestination: null, commuteLat: null, commuteLon: null,
+  });
+
+  const texts = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /Saved "Studio Center"/);
+});
+
+test('a Back tap during the wizard re-renders the previous step without losing earlier answers', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start')); // name step
+  await bot.handleUpdate(textUpdate(1, 'My Search')); // -> budget step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900')); // -> districts step
+
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:back')); // back to budget
+
+  const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(edits.at(-1) as string, /budget/i);
+  const state = getWizardState(db, 1)!;
+  assert.equal(state.stepIndex, 1); // back at the budget step
+  assert.equal(state.profileName, 'My Search'); // name answer preserved across the back-tap
+});
+
+test('a stale wizard button tap (from a step the wizard already moved past) is handled gracefully, not thrown as an unhandled error', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start')); // name step
+  await bot.handleUpdate(textUpdate(1, 'My Search')); // -> budget step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900')); // -> districts step
+
+  // Simulate a double-tap: the user's second tap on the (now-stale) budget chip arrives after the
+  // wizard already advanced to districts. applyWizardChoice would throw for this — the handler must
+  // not let that become an unhandled promise rejection.
+  await assert.doesNotReject(bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900')));
+
+  assert.ok(calls.some((c) => c.method === 'answerCallbackQuery')); // the tap's loading spinner is cleared
+  const state = getWizardState(db, 1)!;
+  assert.equal(state.stepIndex, 2); // still on districts — the stale tap did not move it backward or crash it
 });
 
 test('/help explains the bot without requiring prefs to already be set', async () => {
@@ -324,47 +390,9 @@ test('/help attaches the persistent nav keyboard', async () => {
   assert.deepEqual(keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
 });
 
-test('an invalid onboarding answer re-asks the same question without dropping prior progress', async () => {
-  const db = openDb(':memory:');
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  await bot.handleUpdate(textUpdate(1, 'not a number'));
-
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.match(texts.at(-1) as string, /doesn't look like a budget/);
-  // still waiting on question 0 — the bad answer was never recorded
-  assert.deepEqual(getOnboardingState(db, 1), []);
-});
-
-test('completing onboarding step by step saves prefs and reports no candidates yet', async () => {
-  const db = openDb(':memory:');
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
-  assert.equal(getOnboardingState(db, 1), null);
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.match(texts.at(-2) as string, /Preferences saved/);
-  assert.match(texts.at(-1) as string, /No new listings right now/);
-});
-
-test('finishing onboarding attaches the persistent nav keyboard to the confirmation message', async () => {
-  const db = openDb(':memory:');
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
-  const confirmation = calls.find((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('Preferences saved'));
-  assert.ok(confirmation, 'expected the confirmation message');
-  const keyboard = (confirmation!.payload.reply_markup as { keyboard: string[][] }).keyboard;
-  assert.deepEqual(keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
-});
-
 test('/start on an already-configured chat also attaches the persistent nav keyboard', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
   const reply = calls.find((c) => c.method === 'sendMessage');
@@ -374,7 +402,7 @@ test('/start on an already-configured chat also attaches the persistent nav keyb
 
 test('tapping "⏭ Next" on the persistent keyboard sends the next card, same as /next', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
   upsertListing(db, listing({ id: 'a', price: 500 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(textUpdate(1, '⏭ Next'));
@@ -390,133 +418,123 @@ test('tapping "📋 Shortlist" on the persistent keyboard sends the shortlist, s
   assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€500')));
 });
 
-test('tapping "⚙️ Settings" on the persistent keyboard restarts onboarding, same as /settings', async () => {
+test('tapping "⚙️ Settings" on the persistent keyboard starts the wizard, same as /settings', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
-  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes(ONBOARDING_INTRO)));
-  assert.deepEqual(getOnboardingState(db, 1), []);
-});
-
-test('mid-onboarding text always wins over a coincidentally-matching keyboard label', async () => {
-  const db = openDb(':memory:');
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
-  // Onboarding is now waiting on the waitlist-housing yes/no question — send a keyboard-label-shaped
-  // string instead of "yes"/"no" and confirm it's rejected as an invalid onboarding answer, not routed
-  // to Settings (which would silently reset onboarding progress).
   await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts.at(-1) as string, /reply with "yes" or "no"/);
-  assert.deepEqual(getOnboardingState(db, 1), ['800', 'skip', 'any', 'any', 'any']); // unchanged, not reset
+  assert.match(texts.at(-1) as string, /name this search/i);
+  assert.deepEqual(getWizardState(db, 1), initialWizardState());
 });
 
-test('an invalid answer to the waitlist-housing question re-asks it without losing the first five answers', async () => {
+test('free text mid-wizard on the name step is always taken as the profile name, even if it happens to match a keyboard label', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
-  await bot.handleUpdate(textUpdate(1, 'maybe'));
+  await bot.handleUpdate(commandUpdate(1, '/start')); // waiting on the name step
 
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.match(texts.at(-1) as string, /reply with "yes" or "no"/);
-  assert.deepEqual(getOnboardingState(db, 1), ['800', 'skip', 'any', 'any', 'any']);
+  // A keyboard-label-shaped string must be recorded as the (odd but valid) profile name, not
+  // silently rerouted to the "⚙️ Settings" shortcut — that shortcut only applies when the chat is
+  // not mid-wizard, and this one is.
+  await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
+
+  const state = getWizardState(db, 1)!;
+  assert.equal(state.profileName, '⚙️ Settings');
+  assert.equal(state.stepIndex, 1); // advanced to budget, wizard was not reset
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /budget/i);
 });
 
-test('opting out of waitlist housing during onboarding excludes it from the pushed queue', async () => {
+test('opting out of waitlist housing and WG rooms via the amenity chips excludes both from the pushed candidate queue', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'gemeindewohnung', price: 500, requiresWaitlistTicket: true }));
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'no', 'no', 'skip']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
-
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts.at(-1) as string, /No new listings right now/); // the only listing was waitlist housing, excluded
-});
-
-test('an invalid answer to the WG question re-asks it without losing the first six answers', async () => {
-  const db = openDb(':memory:');
-  const { bot, calls } = createTestBot(db);
-  await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
-  await bot.handleUpdate(textUpdate(1, 'maybe'));
-
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.match(texts.at(-1) as string, /reply with "yes" or "no"/);
-  assert.deepEqual(getOnboardingState(db, 1), ['800', 'skip', 'any', 'any', 'any', 'yes']);
-});
-
-test('opting out of WG/shared-flat listings during onboarding excludes them from the pushed queue, opting in includes them', async () => {
-  const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'wg-room', price: 500, title: 'WG-Zimmer frei', isWg: true }));
-  const { bot: optOutBot, calls: optOutCalls } = createTestBot(db);
-  await optOutBot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
-    await optOutBot.handleUpdate(textUpdate(1, answer));
-  }
-  const optOutTexts = optOutCalls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(optOutTexts.at(-1) as string, /No new listings right now/); // the only listing was a WG room, excluded
+  const { bot } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  await bot.handleUpdate(textUpdate(1, 'My Search'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue')); // neither amenity chip tapped -> both default false
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip'));
 
-  const { bot: optInBot, calls: optInCalls } = createTestBot(db);
-  await optInBot.handleUpdate(commandUpdate(2, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'yes', 'skip']) {
-    await optInBot.handleUpdate(textUpdate(2, answer));
-  }
-  const optInTexts = optInCalls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(optInTexts.at(-1) as string, /🚪 WG/);
+  const profile = getActiveSearchProfile(db, 1)!;
+  assert.equal(profile.prefs.includeWaitlistHousing, false);
+  assert.equal(profile.prefs.includeWg, false);
 });
 
-test('a successfully geocoded commute destination is saved and shown on the next card', async () => {
+test('opting in to waitlist housing and WG rooms via the amenity chips includes both in the pushed candidate queue', async () => {
   const db = openDb(':memory:');
-  upsertListing(db, listing({ id: 'a', price: 500, lat: 48.19, lon: 16.37 }));
+  upsertListing(db, listing({ id: 'gemeindewohnung', price: 500, requiresWaitlistTicket: true }));
+  upsertListing(db, listing({ id: 'wg-room', price: 500, title: 'WG-Zimmer frei', isWg: true }));
+  const { bot } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  await bot.handleUpdate(textUpdate(1, 'My Search'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenity:includeWaitlistHousing'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenity:includeWg'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip'));
+
+  const profile = getActiveSearchProfile(db, 1)!;
+  assert.equal(profile.prefs.includeWaitlistHousing, true);
+  assert.equal(profile.prefs.includeWg, true);
+});
+
+test('a successfully geocoded commute destination is saved on wizard completion', async () => {
+  const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db, {
     geocode: async () => ({ lat: 48.1986, lon: 16.3695 }),
     computeCommute: async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' }),
   });
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'TU Wien']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
+  await bot.handleUpdate(textUpdate(1, 'My Search'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
+  await bot.handleUpdate(textUpdate(1, 'TU Wien')); // commute step is free-text
 
   assert.equal(getActiveSearchProfile(db, 1)!.prefs.commuteDestination, 'TU Wien');
+  assert.equal(getWizardState(db, 1), null); // wizard completed and its state cleared
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts.at(-1) as string, /18 min walk · 7 min by tram D to TU Wien/);
+  assert.ok(texts.some((t) => /Saved "My Search"/.test(t)));
 });
 
-test('an unresolvable commute destination re-asks the question instead of saving garbage', async () => {
+test('an unresolvable commute destination re-asks instead of saving garbage or advancing the wizard', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'nowhere']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
+  await bot.handleUpdate(textUpdate(1, 'My Search'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
+  await bot.handleUpdate(textUpdate(1, 'nowhere'));
 
-  assert.equal(getOnboardingState(db, 1)?.length, 7); // still mid-onboarding, waiting on the commute question
+  const state = getWizardState(db, 1);
+  assert.ok(state, 'still mid-wizard, waiting on the commute step');
+  assert.equal(WIZARD_STEPS[state!.stepIndex], 'commute');
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.match(texts.at(-1) as string, /couldn't find that location/);
 });
 
-test('"skip" on the commute question saves no destination and shows no commute line', async () => {
+test('tapping Skip on the commute step saves no destination and completes the wizard', async () => {
   const db = openDb(':memory:');
-  upsertListing(db, listing({ id: 'a', price: 500, lat: 48.19, lon: 16.37 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
-  for (const answer of ['800', 'skip', 'any', 'any', 'any', 'yes', 'no', 'skip']) {
-    await bot.handleUpdate(textUpdate(1, answer));
-  }
+  await bot.handleUpdate(textUpdate(1, 'My Search'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip'));
 
   assert.equal(getActiveSearchProfile(db, 1)!.prefs.commuteDestination, null);
-  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.doesNotMatch(texts.at(-1) as string, /📍/);
+  assert.equal(getWizardState(db, 1), null);
+  const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(edits.at(-1) as string, /Saved "My Search"/);
 });
 
 const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };
@@ -575,20 +593,20 @@ test('getCommuteLineFor returns null, and persists nothing, when the address fai
   assert.equal(persisted.lat, null);
 });
 
-test('a restart mid-onboarding does not drop progress — this is the bug that shipped', async () => {
+test('a restart mid-wizard does not drop progress — this is the bug that shipped', async () => {
   const db = openDb(':memory:');
   const first = createTestBot(db);
   await first.bot.handleUpdate(commandUpdate(42, '/start'));
-  await first.bot.handleUpdate(textUpdate(42, '800')); // answers the budget question
+  await first.bot.handleUpdate(textUpdate(42, 'My Search')); // name step -> budget step
 
   // simulate a process restart: a brand-new Telegraf instance, same on-disk db.
   const second = createTestBot(db);
-  await second.bot.handleUpdate(textUpdate(42, 'skip')); // should continue onboarding, not be silently ignored
+  await second.bot.handleUpdate(callbackUpdate(42, 'wizard:budget:700:900')); // should continue the wizard, not be silently ignored
 
-  const texts = second.calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text);
-  assert.equal(texts.length, 1, 'the post-restart reply should continue the wizard, not stay silent');
-  assert.equal(texts[0], 'Districts? e.g. "1-9" or "6,7,9", or "any"');
-  assert.deepEqual(getOnboardingState(db, 42), ['800', 'skip']);
+  const state = getWizardState(db, 42)!;
+  assert.equal(WIZARD_STEPS[state.stepIndex], 'districts', 'the post-restart tap should have advanced the wizard, not stayed silent');
+  assert.equal(state.profileName, 'My Search'); // pre-restart progress preserved
+  assert.equal(state.partial.priceFrom, 700);
 });
 
 test('/next before onboarding is complete tells the user to /start instead of a misleading "no listings"', async () => {

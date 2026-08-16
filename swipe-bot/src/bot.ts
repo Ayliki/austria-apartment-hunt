@@ -1,13 +1,17 @@
 import { Telegraf, Markup } from 'telegraf';
 import {
-  type DB, type SearchProfilePrefs, type ListingRow, type CommuteTimes, type ChatLanguage,
-  getActiveSearchProfile, upsertActiveProfilePrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
-  getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes, setListingCoords,
-  setChatLanguage,
+  type DB, type SearchProfilePrefs, type SearchProfile, type ListingRow, type CommuteTimes, type ChatLanguage,
+  getActiveSearchProfile, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
+  getWizardState, setWizardState, deleteWizardState, getCommuteTimes, setCommuteTimes, setListingCoords,
+  setChatLanguage, createSearchProfile, countSearchProfiles, MAX_SEARCH_PROFILES_PER_CHAT,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
 import { t, LOCALE_NAMES } from './locales.js';
+import {
+  WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs,
+  type WizardState, type WizardChoice,
+} from './wizard.js';
 
 export type GeocodeFn = (address: string) => Promise<GeoPoint | null>;
 export type ComputeCommuteFn = (origin: GeoPoint, destination: GeoPoint) => Promise<CommuteTimes>;
@@ -21,14 +25,6 @@ export const SAFETY_NOTICE =
   'Standing safety rule: never transfer money or pay a deposit before an in-person viewing. ' +
   'Avoid international transfers and escrow/Treuhand arrangements. ' +
   'Only use the listing\'s official contact channel.';
-
-export const ONBOARDING_INTRO =
-  'I\'ll ask 8 quick questions to learn your budget, districts, size, and a few other preferences. ' +
-  'After that, I check willhaben and immobilienscout24 every ~3h and message you here as soon as ' +
-  'something matches — swipe 👍/👎 on each card to build your shortlist, and I\'ll learn what you ' +
-  'like over time. Preferences and shortlist are always editable later via /settings and /shortlist.\n\n' +
-  'Reply with just the value in the format shown in each question ' +
-  '(e.g. "800", not "my budget is 800 euros") — free text won\'t parse.';
 
 export const HELP_TEXT =
   'I find Vienna rental apartments matching your preferences and let you swipe through them, ' +
@@ -59,94 +55,72 @@ export const BOT_COMMANDS: { command: string; description: string }[] = [
 /** Always-visible bottom keyboard for one-tap navigation — sent once (onboarding completion, or /start on an already-configured chat) and Telegram keeps it visible under the input field from then on. */
 export const MAIN_KEYBOARD = Markup.keyboard([['⏭ Next', '📋 Shortlist', '⚙️ Settings']]).resize();
 
-/** Index of the commute-destination question — handled separately in bot.on('text') since it needs an async geocoding call, unlike every other step's synchronous parser. */
-const COMMUTE_STEP_INDEX = 7;
+/** Every locale key `renderWizardStep`/`wizardStrings` needs resolved for the chat's language, fetched once per render. */
+const WIZARD_STRING_KEYS = [
+  'wizard_progress', 'wizard_name_prompt', 'wizard_budget_prompt', 'wizard_districts_prompt', 'wizard_rooms_prompt',
+  'wizard_amenities_prompt', 'wizard_commute_prompt', 'btn_skip', 'btn_back', 'btn_continue', 'btn_custom_range',
+  'amenity_elevator', 'amenity_parking', 'amenity_include_waitlist', 'amenity_include_wg',
+] as const;
 
-const QUESTIONS = [
-  'What\'s your max budget (cold, in EUR)?',
-  'Min budget? (number, or "skip")',
-  'Districts? e.g. "1-9" or "6,7,9", or "any"',
-  'Rooms, min-max? e.g. "1-2", or "any"',
-  'Size in m², min-max? e.g. "30-60", or "any"',
-  'Include municipal/waitlist housing (Gemeindewohnung, Genossenschaft, Direktvergabe)? ' +
-  'These usually need a Vormerkschein, Wohnticket, or Wiener Wohnen registration — not everyone qualifies. Reply "yes" or "no".',
-  'Include WG/shared-flat rooms, co-living, and student rooms? Reply "yes" or "no".',
-  'Daily commute destination? e.g. "TU Wien" or an address — I\'ll show walk/transit times to it on every card. Reply "skip" for none.',
-];
-
-function parseRange(s: string): [number | null, number | null] {
-  const m = s.trim().match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
-  if (m) return [Number(m[1]), Number(m[2])];
-  const n = Number(s.trim());
-  if (Number.isFinite(n)) return [n, n];
-  throw new Error(`could not parse range "${s}" — use "min-max" or "any"`);
+function wizardStrings(db: DB, chatId: number): Record<string, string> {
+  return Object.fromEntries(WIZARD_STRING_KEYS.map((k) => [k, t(db, chatId, k)]));
 }
 
-function parseDistrictsAnswer(s: string): number[] | null {
-  const trimmed = s.trim().toLowerCase();
-  if (trimmed === 'any' || trimmed === 'skip') return null;
-  const out: number[] = [];
-  for (const part of s.split(',')) {
-    const range = part.trim().match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
-    if (range) {
-      for (let d = parseInt(range[1], 10); d <= parseInt(range[2], 10); d++) out.push(d);
-    } else if (/^\d{1,2}$/.test(part.trim())) {
-      out.push(parseInt(part.trim(), 10));
-    } else {
-      throw new Error(`could not parse districts "${s}"`);
+/**
+ * Builds the text + inline keyboard for whatever step `state` is currently on. Pure given `state`
+ * and the chat's language-resolved `strings` (built once per render by `wizardStrings`), so this
+ * stays directly testable without a DB — exported for that purpose.
+ */
+export function renderWizardStep(state: WizardState, strings: Record<string, string>): { text: string; keyboard: ReturnType<typeof Markup.inlineKeyboard> } {
+  const step = WIZARD_STEPS[state.stepIndex];
+  const progress = `${strings.wizard_progress} ${'●'.repeat(state.stepIndex + 1)}${'○'.repeat(WIZARD_STEPS.length - state.stepIndex - 1)}`;
+  const backRow = state.stepIndex > 0 ? [Markup.button.callback(strings.btn_back, 'wizard:back')] : [];
+
+  switch (step) {
+    case 'name':
+      return { text: `${progress}\n\n${strings.wizard_name_prompt}`, keyboard: Markup.inlineKeyboard([[Markup.button.callback(strings.btn_skip, 'wizard:name_skip')]]) };
+    case 'budget':
+      return {
+        text: `${progress}\n\n${strings.wizard_budget_prompt}`,
+        keyboard: Markup.inlineKeyboard([
+          ...BUDGET_BANDS.map((b) => [Markup.button.callback(b.label, `wizard:budget:${b.priceFrom ?? ''}:${b.priceTo}`)]),
+          backRow,
+        ].filter((row) => row.length > 0)),
+      };
+    case 'districts': {
+      const selected = new Set(state.partial.districts ?? []);
+      const rows = DISTRICT_GROUPS.map((g) => g.districts.map((d) =>
+        Markup.button.callback(selected.has(d) ? `✅ ${d}` : `${d}`, `wizard:district:${d}`)
+      ));
+      const continueRow = selected.size > 0 ? [Markup.button.callback(strings.btn_continue, 'wizard:districts_continue')] : [];
+      return { text: `${progress}\n\n${strings.wizard_districts_prompt}`, keyboard: Markup.inlineKeyboard([...rows, continueRow, backRow].filter((r) => r.length > 0)) };
     }
+    case 'rooms_size':
+      return {
+        text: `${progress}\n\n${strings.wizard_rooms_prompt}`,
+        keyboard: Markup.inlineKeyboard([
+          [Markup.button.callback('1', 'wizard:rooms:1:1'), Markup.button.callback('2', 'wizard:rooms:2:2'), Markup.button.callback('3+', 'wizard:rooms:3:')],
+          [Markup.button.callback(strings.btn_custom_range, 'wizard:rooms_custom')],
+          backRow,
+        ].filter((r) => r.length > 0)),
+      };
+    case 'amenities': {
+      const p = state.partial;
+      const chip = (label: string, on: boolean, field: string) => Markup.button.callback(on ? `✅ ${label}` : `⬜ ${label}`, `wizard:amenity:${field}`);
+      return {
+        text: `${progress}\n\n${strings.wizard_amenities_prompt}`,
+        keyboard: Markup.inlineKeyboard([
+          [chip(strings.amenity_elevator, Boolean(p.requireElevator), 'requireElevator'), chip(strings.amenity_parking, Boolean(p.requireParking), 'requireParking')],
+          [chip(strings.amenity_include_waitlist, Boolean(p.includeWaitlistHousing), 'includeWaitlistHousing')],
+          [chip(strings.amenity_include_wg, Boolean(p.includeWg), 'includeWg')],
+          [Markup.button.callback(strings.btn_continue, 'wizard:amenities_continue')],
+          backRow,
+        ].filter((r) => r.length > 0)),
+      };
+    }
+    case 'commute':
+      return { text: `${progress}\n\n${strings.wizard_commute_prompt}`, keyboard: Markup.inlineKeyboard([[Markup.button.callback(strings.btn_skip, 'wizard:commute_skip')], backRow].filter((r) => r.length > 0)) };
   }
-  return [...new Set(out)].sort((a, b) => a - b);
-}
-
-function parseBudgetMax(s: string): number {
-  const n = Number(s.trim());
-  if (!Number.isFinite(n)) throw new Error('that doesn\'t look like a budget — reply with a number, e.g. 800');
-  return n;
-}
-
-function parseBudgetMin(s: string): number | null {
-  const trimmed = s.trim().toLowerCase();
-  if (trimmed === 'skip' || trimmed === 'any') return null;
-  const n = Number(s.trim());
-  if (!Number.isFinite(n)) throw new Error('that doesn\'t look like a minimum budget — reply with a number or "skip"');
-  return n;
-}
-
-function parseRoomsOrSize(s: string): [number | null, number | null] {
-  if (s.trim().toLowerCase() === 'any') return [null, null];
-  return parseRange(s);
-}
-
-function parseYesNo(s: string): boolean {
-  const trimmed = s.trim().toLowerCase();
-  if (['yes', 'y', 'ja', 'j'].includes(trimmed)) return true;
-  if (['no', 'n', 'nein'].includes(trimmed)) return false;
-  throw new Error('reply with "yes" or "no"');
-}
-
-/** One parser per onboarding question, in order. Each throws Error with a user-facing message on invalid input. */
-const STEP_PARSERS: ((raw: string) => unknown)[] = [
-  parseBudgetMax, parseBudgetMin, parseDistrictsAnswer, parseRoomsOrSize, parseRoomsOrSize, parseYesNo, parseYesNo,
-];
-
-/** Validates a single onboarding answer against its question's parser. Throws on invalid input. */
-export function parseOnboardingStep(index: number, raw: string): void {
-  STEP_PARSERS[index](raw);
-}
-
-/** Pure parser for the first 6 (of 7) onboarding answers. The 7th (commute destination) needs an async geocode call and is resolved separately in finishOnboarding. Throws Error with a user-facing message. */
-export function parseOnboardingAnswers(
-  answers: string[],
-): Omit<SearchProfilePrefs, 'commuteDestination' | 'commuteLat' | 'commuteLon' | 'requireElevator' | 'requireParking'> {
-  const priceTo = parseBudgetMax(answers[0]);
-  const priceFrom = parseBudgetMin(answers[1]);
-  const districts = parseDistrictsAnswer(answers[2]);
-  const [roomsFrom, roomsTo] = parseRoomsOrSize(answers[3]);
-  const [areaFrom, areaTo] = parseRoomsOrSize(answers[4]);
-  const includeWaitlistHousing = parseYesNo(answers[5]);
-  const includeWg = parseYesNo(answers[6]);
-  return { priceFrom, priceTo, districts, roomsFrom, roomsTo, areaFrom, areaTo, includeWaitlistHousing, includeWg };
 }
 
 /** Top-ranked, not-yet-swiped listing for this user, or null if the queue is empty. */
@@ -427,26 +401,6 @@ async function replaceShortlistWithEmptyState(ctx: ShortlistCardCtx): Promise<vo
   }
 }
 
-/** Finishes onboarding: saves prefs (base fields + resolved commute destination), confirms, and shows what's already queued up. */
-async function finishOnboarding(
-  telegram: Telegraf['telegram'], db: DB, chatId: number, answers: string[],
-  commute: { destination: string | null; lat: number | null; lon: number | null }, deps: BotDeps,
-): Promise<void> {
-  deleteOnboardingState(db, chatId);
-  const parsed = parseOnboardingAnswers(answers);
-  upsertActiveProfilePrefs(db, chatId, {
-    ...parsed, requireElevator: false, requireParking: false,
-    commuteDestination: commute.destination, commuteLat: commute.lat, commuteLon: commute.lon,
-  });
-  await telegram.sendMessage(
-    chatId,
-    'Preferences saved. New listings get checked every ~3h, not instantly — ' +
-    'I\'ll message you here as soon as something matches. Anything I already have queued up:',
-    MAIN_KEYBOARD,
-  );
-  await sendNextCard(telegram, chatId, db, deps);
-}
-
 /** Sends the first shortlist card (or the empty-state message). Shared by /shortlist and the "📋 Shortlist" keyboard button — from there, browsing the rest happens via Prev/Next/Remove on that one message, not further /shortlist calls. */
 async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
   const items = getShortlist(db, chatId);
@@ -457,34 +411,105 @@ async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, d
   await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length);
 }
 
-/** Restarts the onboarding wizard from question 0. Shared by /settings and the "⚙️ Settings" keyboard button. */
-async function startSettingsFor(telegram: Telegraf['telegram'], chatId: number, db: DB): Promise<void> {
-  setOnboardingState(db, chatId, []);
-  await telegram.sendMessage(chatId, ONBOARDING_INTRO);
-  await telegram.sendMessage(chatId, QUESTIONS[0]);
+/**
+ * Placeholder for Task 9's full aggregate-match summary (match count, price range, top districts,
+ * and a "Browse top matches ▸" button). Wizard completion (both the callback-driven and the
+ * commute-free-text-driven paths, below) call this in place of jumping straight into the swipe
+ * deck, so a working forward reference exists now — Task 9 replaces this body with the real
+ * summary/browse-button implementation without changing its call sites.
+ */
+async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
+  const candidates = getCandidateListings(db, profile.chatId, profile.prefs);
+  await telegram.sendMessage(
+    profile.chatId,
+    candidates.length > 0
+      ? `${candidates.length} listing${candidates.length === 1 ? '' : 's'} already match "${profile.name}" — /next to start browsing.`
+      : `No matches yet for "${profile.name}" — I'll message you here as soon as something matches.`,
+    MAIN_KEYBOARD,
+  );
+}
+
+/** Starts a brand-new wizard run for `chatId`: refuses once the chat is at MAX_SEARCH_PROFILES_PER_CHAT, otherwise resets wizard state to step 0 and sends its prompt. Shared by /start (first-time setup) and /settings (redo-from-scratch, until Task 7 gives it single-field editing). */
+async function startWizard(telegram: Telegraf['telegram'], db: DB, chatId: number): Promise<void> {
+  if (countSearchProfiles(db, chatId) >= MAX_SEARCH_PROFILES_PER_CHAT) {
+    await telegram.sendMessage(chatId, `You already have ${MAX_SEARCH_PROFILES_PER_CHAT} searches — delete one with /searches first.`);
+    return;
+  }
+  const state = initialWizardState();
+  setWizardState(db, chatId, state);
+  const { text, keyboard } = renderWizardStep(state, wizardStrings(db, chatId));
+  await telegram.sendMessage(chatId, text, keyboard);
+}
+
+/** Minimal shape advanceWizard needs from a callback context — matches ShortlistCardCtx's pattern above. */
+interface WizardCtx {
+  chat?: { id: number };
+  telegram: Telegraf['telegram'];
+  editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+  answerCbQuery: (text?: string) => Promise<unknown>;
 }
 
 export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   const bot = new Telegraf(token);
 
+  /**
+   * Applies one wizard choice (a button tap) and re-renders: edits the triggering message in place
+   * to the next step's prompt, or — once the wizard is complete — to a save confirmation followed
+   * by the activation summary.
+   *
+   * `applyWizardChoice` throws when `choice` doesn't match the step the wizard is currently on. A
+   * normal Telegram user double-tapping a stale/superseded inline keyboard button (the message
+   * already advanced to the next step, but the old step's buttons are still visible/tappable until
+   * Telegram re-renders) triggers exactly this. That's not an error worth surfacing — the tap is
+   * simply too late — so it's caught here and treated as a no-op: answerCbQuery clears the tap's
+   * loading spinner and the message is left exactly as it already is (the current, correct step).
+   */
+  async function advanceWizard(ctx: WizardCtx, choice: WizardChoice): Promise<void> {
+    const chatId = ctx.chat!.id;
+    const current = getWizardState(db, chatId);
+    if (!current) { await ctx.answerCbQuery(); return; } // stale callback from a finished/abandoned wizard
+
+    let next: WizardState;
+    try {
+      next = applyWizardChoice(current, choice);
+    } catch {
+      await ctx.answerCbQuery(); // stale/duplicate tap on a step the wizard already moved past — see doc comment above
+      return;
+    }
+
+    if (isWizardComplete(next)) {
+      deleteWizardState(db, chatId);
+      const profile = createSearchProfile(db, chatId, next.profileName ?? `Search ${countSearchProfiles(db, chatId) + 1}`, finalizePrefs(next));
+      await ctx.answerCbQuery();
+      await ctx.editMessageText(`Saved "${profile.name}". New listings get checked every ~3h — I'll message you here as soon as something matches.`);
+      await sendProfileActivationSummary(ctx.telegram, db, profile);
+      return;
+    }
+    setWizardState(db, chatId, next);
+    await ctx.answerCbQuery();
+    const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId));
+    await ctx.editMessageText(text, keyboard);
+  }
+
   bot.start(async (ctx) => {
     const chatId = ctx.chat.id;
     if (getActiveSearchProfile(db, chatId)) {
       await ctx.reply(
-        'You\'re already set up. /next for a listing, /shortlist to browse what you\'ve liked, ' +
-        'or /settings to redo your preferences from scratch.',
+        'You already have a search set up — /next for a listing, /searches to manage your searches, ' +
+        'or /settings to edit one.',
         MAIN_KEYBOARD,
       );
       return;
     }
-    setOnboardingState(db, chatId, []);
     await ctx.reply(SAFETY_NOTICE);
-    await ctx.reply(ONBOARDING_INTRO);
-    await ctx.reply(QUESTIONS[0]);
+    await startWizard(ctx.telegram, db, chatId);
   });
 
   bot.command('settings', async (ctx) => {
-    await startSettingsFor(ctx.telegram, ctx.chat.id, db);
+    // Task 7 replaces this with single-field editing of the active profile; for now it keeps
+    // starting a brand new wizard run (same behavior as before this task's change), so the command
+    // stays functional in the interim. Task 7's own tests overwrite this handler's behavior.
+    await startWizard(ctx.telegram, db, ctx.chat.id);
   });
 
   bot.command('help', async (ctx) => {
@@ -513,45 +538,69 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     await sendNextCard(ctx.telegram, ctx.chat.id, db, deps);
   });
 
+  bot.action('wizard:back', (ctx) => advanceWizard(ctx, { kind: 'back' }));
+  bot.action('wizard:name_skip', (ctx) => advanceWizard(ctx, { kind: 'name', name: `Search ${countSearchProfiles(db, ctx.chat!.id) + 1}` }));
+  bot.action(/^wizard:budget:(-?\d*):(-?\d+|Infinity)$/, (ctx) => {
+    const [, fromRaw, toRaw] = ctx.match;
+    return advanceWizard(ctx, { kind: 'budget', priceFrom: fromRaw === '' ? null : Number(fromRaw), priceTo: toRaw === 'Infinity' ? Infinity : Number(toRaw) });
+  });
+  bot.action(/^wizard:district:(\d+)$/, (ctx) => advanceWizard(ctx, { kind: 'districts_toggle', district: Number(ctx.match[1]) }));
+  bot.action('wizard:districts_continue', (ctx) => advanceWizard(ctx, { kind: 'districts_continue' }));
+  bot.action(/^wizard:rooms:(\d+):(\d*)$/, (ctx) => {
+    const [, fromRaw, toRaw] = ctx.match;
+    return advanceWizard(ctx, { kind: 'rooms_size', roomsFrom: Number(fromRaw), roomsTo: toRaw === '' ? null : Number(toRaw), areaFrom: null, areaTo: null });
+  });
+  // No wizard step currently prompts for a custom rooms/size range via free text — the button exists
+  // (renderWizardStep's "Custom range ▸" chip) so the keyboard reads clearly, but tapping it today
+  // just clears the tap's loading spinner rather than hanging forever unanswered. A future task can
+  // wire it to an actual free-text prompt if the fixed 1/2/3+ chips prove too coarse in practice.
+  bot.action('wizard:rooms_custom', (ctx) => ctx.answerCbQuery('Custom ranges aren\'t supported yet — pick 1, 2, or 3+.'));
+  bot.action(/^wizard:amenity:(requireElevator|requireParking|includeWaitlistHousing|includeWg)$/, (ctx) =>
+    advanceWizard(ctx, { kind: 'amenity_toggle', field: ctx.match[1] as 'requireElevator' | 'requireParking' | 'includeWaitlistHousing' | 'includeWg' })
+  );
+  bot.action('wizard:amenities_continue', (ctx) => advanceWizard(ctx, { kind: 'amenities_continue' }));
+  bot.action('wizard:commute_skip', (ctx) => advanceWizard(ctx, { kind: 'commute_skip' }));
+
   bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
-    const answers = getOnboardingState(db, chatId);
-    if (!answers) {
-      // Not mid-onboarding: route the three persistent-keyboard button labels to the same logic
-      // their matching commands run. Anything else falls through unchanged (silently ignored).
+    const state = getWizardState(db, chatId);
+    if (!state) {
+      // Not mid-wizard: route the three persistent-keyboard button labels to the same logic their
+      // matching commands run. Anything else falls through unchanged (silently ignored).
       const text = ctx.message.text;
       if (text === '⏭ Next') { await sendNextCard(ctx.telegram, chatId, db, deps); return; }
       if (text === '📋 Shortlist') { await sendShortlistTo(ctx.telegram, chatId, db); return; }
-      if (text === '⚙️ Settings') { await startSettingsFor(ctx.telegram, chatId, db); return; }
+      if (text === '⚙️ Settings') { await startWizard(ctx.telegram, db, chatId); return; }
       return;
     }
-    const raw = ctx.message.text;
+    const step = WIZARD_STEPS[state.stepIndex];
+    const raw = ctx.message.text.trim();
 
-    if (answers.length === COMMUTE_STEP_INDEX) {
-      const trimmed = raw.trim();
-      if (trimmed.toLowerCase() === 'skip') {
-        await finishOnboarding(ctx.telegram, db, chatId, answers, { destination: null, lat: null, lon: null }, deps);
-        return;
-      }
+    if (step === 'name') {
+      const next = applyWizardChoice(state, { kind: 'name', name: raw });
+      setWizardState(db, chatId, next);
+      // First render of a new step after free text can't edit-in-place (no prior bot message to
+      // edit) — sends fresh. Every step after this one edits in place via the callback handlers above.
+      const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId));
+      await ctx.reply(text, keyboard);
+      return;
+    }
+    if (step === 'commute') {
+      const trimmed = raw;
       const point = await deps.geocode(trimmed);
       if (!point) {
-        await ctx.reply('couldn\'t find that location — try being more specific, or reply "skip"');
-        return; // keep the same question, don't advance or lose prior answers
+        await ctx.reply('couldn\'t find that location — try being more specific, or tap Skip');
+        return; // keep the same step, don't advance or lose prior answers
       }
-      await finishOnboarding(ctx.telegram, db, chatId, answers, { destination: trimmed, lat: point.lat, lon: point.lon }, deps);
+      const next = applyWizardChoice(state, { kind: 'commute_set', destination: trimmed, lat: point.lat, lon: point.lon });
+      deleteWizardState(db, chatId);
+      const profile = createSearchProfile(db, chatId, next.profileName ?? `Search ${countSearchProfiles(db, chatId) + 1}`, finalizePrefs(next));
+      await ctx.reply(`Saved "${profile.name}". New listings get checked every ~3h — I'll message you here as soon as something matches.`, MAIN_KEYBOARD);
+      await sendProfileActivationSummary(ctx.telegram, db, profile);
       return;
     }
-
-    try {
-      parseOnboardingStep(answers.length, raw);
-    } catch (err) {
-      await ctx.reply((err as Error).message);
-      return; // keep the same question, don't advance or lose prior answers
-    }
-
-    answers.push(raw);
-    setOnboardingState(db, chatId, answers);
-    await ctx.reply(QUESTIONS[answers.length]);
+    // Free text on any other step (name/commute are the only free-text-capable steps) is ignored —
+    // the wizard only advances via its buttons there.
   });
 
   bot.action(/^(like|pass):(.+)$/, async (ctx) => {

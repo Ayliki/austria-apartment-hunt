@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { detectWG, detectWaitlistTicket } from 'apt-hunter/dist/normalize.js';
+import type { WizardState } from './wizard.js';
 
 export type DB = Database.Database;
 
@@ -584,20 +585,20 @@ export function setChatLanguage(db: DB, chatId: number, language: ChatLanguage):
   `).run(chatId, language);
 }
 
-/** In-progress onboarding wizard answers for a chat, or null if not mid-onboarding. Persisted so a process restart doesn't silently drop progress. */
-export function getOnboardingState(db: DB, chatId: number): string[] | null {
+/** In-progress onboarding/edit wizard state for a chat, or null if not mid-wizard. Persisted so a process restart doesn't silently drop progress. Table/column names are unchanged from the old linear-text onboarding (`answers TEXT` already stores arbitrary JSON) — only the payload shape changed, from `string[]` to a `WizardState`. */
+export function getWizardState(db: DB, chatId: number): WizardState | null {
   const row = db.prepare('SELECT answers FROM onboarding_state WHERE chat_id = ?').get(chatId) as { answers: string } | undefined;
-  return row ? JSON.parse(row.answers) : null;
+  return row ? (JSON.parse(row.answers) as WizardState) : null;
 }
 
-export function setOnboardingState(db: DB, chatId: number, answers: string[]): void {
+export function setWizardState(db: DB, chatId: number, state: WizardState): void {
   db.prepare(`
     INSERT INTO onboarding_state (chat_id, answers, updated_at) VALUES (@chatId, @answers, @updatedAt)
     ON CONFLICT(chat_id) DO UPDATE SET answers = excluded.answers, updated_at = excluded.updated_at
-  `).run({ chatId, answers: JSON.stringify(answers), updatedAt: new Date().toISOString() });
+  `).run({ chatId, answers: JSON.stringify(state), updatedAt: new Date().toISOString() });
 }
 
-export function deleteOnboardingState(db: DB, chatId: number): void {
+export function deleteWizardState(db: DB, chatId: number): void {
   db.prepare('DELETE FROM onboarding_state WHERE chat_id = ?').run(chatId);
 }
 
