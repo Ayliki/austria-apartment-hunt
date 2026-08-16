@@ -1,11 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
+import { rmSync } from 'node:fs';
 import {
-  openDb, upsertListing, listingKey, getUserPrefs, setUserPrefs, getAllUserPrefs,
+  openDb,
+  upsertListing, listingKey,
   recordSwipe, getShortlist, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
   getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, setListingCoords,
   getListingsBySource, applyListingRefresh, setListingDelisted, deleteDelistedUnshortlisted,
-  getLastSwipe, undoSwipe, type ListingRow,
+  getLastSwipe, undoSwipe,
+  createSearchProfile, getSearchProfiles, getSearchProfile, getActiveSearchProfile, setActiveSearchProfile,
+  updateSearchProfile, renameSearchProfile, deleteSearchProfile, countSearchProfiles, getAllSearchProfiles,
+  upsertActiveProfilePrefs, getChatLanguage, setChatLanguage, MAX_SEARCH_PROFILES_PER_CHAT,
+  type ListingRow, type SearchProfilePrefs,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 
@@ -16,6 +23,7 @@ function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
     addressLine: null, lat: null, lon: null, isPrivate: true,
     requiresWaitlistTicket: false, isShortTerm: false, isWg: false, images: ['https://img/1.jpg'], description: 'A lovely flat.',
     dateCreated: '2026-08-01T00:00:00Z',
+    lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null, mentionsPets: false,
     ...overrides,
   };
 }
@@ -25,6 +33,16 @@ const defaultPrefs = (chatId: number) => ({
   roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true,
   includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null,
 });
+
+function prefs(overrides: Partial<SearchProfilePrefs> = {}): SearchProfilePrefs {
+  return {
+    priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null,
+    areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: false,
+    requireElevator: false, requireParking: false,
+    commuteDestination: null, commuteLat: null, commuteLon: null,
+    ...overrides,
+  };
+}
 
 test('upsertListing inserts new, ignores duplicate id', () => {
   const db = openDb(':memory:');
@@ -85,17 +103,14 @@ test('openDb migrates an older database file that predates the description colum
   migrated.close();
 });
 
-test('openDb migrates an older database predating requires_waitlist_ticket / include_waitlist_housing, defaulting existing rows to the pre-migration behavior (everything shown)', () => {
+test('openDb migrates an older database predating requires_waitlist_ticket, defaulting existing rows to the pre-migration behavior (everything shown)', () => {
   const path = `/tmp/swipe-bot-migration-test-waitlist-${Date.now()}.sqlite`;
   const preMigration = openDb(path);
   upsertListing(preMigration, listing({ id: 'a', district: 6 }));
-  setUserPrefs(preMigration, defaultPrefs(1));
   preMigration.exec('ALTER TABLE listings DROP COLUMN requires_waitlist_ticket');
-  preMigration.exec('ALTER TABLE user_prefs DROP COLUMN include_waitlist_housing');
   preMigration.close();
 
   const migrated = openDb(path);
-  assert.equal(getUserPrefs(migrated, 1)!.includeWaitlistHousing, true); // pre-migration behavior: nothing was ever filtered out
   const [row] = getCandidateListings(migrated, 1, defaultPrefs(1));
   assert.equal(row.requiresWaitlistTicket, false);
   migrated.close();
@@ -128,48 +143,58 @@ test('openDb\'s waitlist-ticket repair never flips an already-correctly-unflagge
   migrated.close();
 });
 
-test('openDb migrates an older database predating listings.lat/lon and user_prefs.commute_destination', () => {
+test('openDb migrates an older database predating listings.lat/lon', () => {
   const path = `/tmp/swipe-bot-migration-test-commute-${Date.now()}.sqlite`;
   const preMigration = openDb(path);
   upsertListing(preMigration, listing({ id: 'a', district: 6, lat: 48.19, lon: 16.37 }));
-  setUserPrefs(preMigration, { ...defaultPrefs(1), commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
   preMigration.exec('ALTER TABLE listings DROP COLUMN lat');
   preMigration.exec('ALTER TABLE listings DROP COLUMN lon');
-  preMigration.exec('ALTER TABLE user_prefs DROP COLUMN commute_destination');
-  preMigration.exec('ALTER TABLE user_prefs DROP COLUMN commute_lat');
-  preMigration.exec('ALTER TABLE user_prefs DROP COLUMN commute_lon');
   preMigration.close();
 
   const migrated = openDb(path);
-  const prefs = getUserPrefs(migrated, 1)!;
-  assert.equal(prefs.commuteDestination, null); // the old value is gone — the column itself was dropped — but reopening must not throw
   upsertListing(migrated, listing({ id: 'b', district: 6, lat: 48.2, lon: 16.4 }));
   const candidates = getCandidateListings(migrated, 1, defaultPrefs(1));
   assert.equal(candidates.find((c) => c.id === 'willhaben:b')!.lat, 48.2);
   migrated.close();
 });
 
+/**
+ * A genuinely ancient user_prefs table — missing the include_waitlist_housing/include_wg/
+ * commute_destination columns added in earlier migrations — must still migrate cleanly into
+ * search_profiles: the guarded ALTER TABLE steps in migrate() backfill those columns (with the
+ * same historical defaults as before) so migrateUserPrefsToSearchProfiles can read every row.
+ */
+test('openDb migrates a pre-waitlist/pre-WG/pre-commute user_prefs row into search_profiles, applying the historical column defaults first', () => {
+  const path = `/tmp/swipe-bot-migration-test-ancient-userprefs-${Date.now()}.sqlite`;
+  try {
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE user_prefs (
+        chat_id INTEGER PRIMARY KEY, price_from REAL, price_to REAL, districts TEXT,
+        rooms_from REAL, rooms_to REAL, area_from REAL, area_to REAL, updated_at TEXT NOT NULL
+      );
+    `);
+    seed.prepare('INSERT INTO user_prefs (chat_id, price_to, updated_at) VALUES (7, 750, ?)').run(new Date().toISOString());
+    seed.close();
+
+    const db = openDb(path);
+    const profiles = getSearchProfiles(db, 7);
+    assert.equal(profiles.length, 1);
+    assert.equal(profiles[0].prefs.priceTo, 750);
+    assert.equal(profiles[0].prefs.includeWaitlistHousing, true); // historical default: show everything
+    assert.equal(profiles[0].prefs.includeWg, false); // historical default: hide WGs
+    assert.equal(profiles[0].prefs.commuteDestination, null);
+    db.close();
+  } finally {
+    rmSync(path, { force: true });
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+  }
+});
+
 test('listingKey namespaces by source', () => {
   assert.equal(listingKey(listing({ source: 'willhaben', id: '1' })), 'willhaben:1');
   assert.equal(listingKey(listing({ source: 'immoscout', id: '1' })), 'immoscout:1');
-});
-
-test('setUserPrefs + getUserPrefs round-trip, getAllUserPrefs returns all', () => {
-  const db = openDb(':memory:');
-  assert.equal(getUserPrefs(db, 42), null);
-  setUserPrefs(db, { chatId: 42, priceFrom: 400, priceTo: 800, districts: [6, 7], roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: null, includeWaitlistHousing: false, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const prefs = getUserPrefs(db, 42);
-  assert.deepEqual(prefs, { chatId: 42, priceFrom: 400, priceTo: 800, districts: [6, 7], roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: null, includeWaitlistHousing: false, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
-  setUserPrefs(db, defaultPrefs(99));
-  assert.equal(getAllUserPrefs(db).length, 2);
-});
-
-test('setUserPrefs overwrites on re-call (same chatId)', () => {
-  const db = openDb(':memory:');
-  setUserPrefs(db, defaultPrefs(1));
-  setUserPrefs(db, { ...defaultPrefs(1), priceTo: 900 });
-  assert.equal(getUserPrefs(db, 1)!.priceTo, 900);
-  assert.equal(getAllUserPrefs(db).length, 1);
 });
 
 test('recordSwipe(like) adds to shortlist, recordSwipe(pass) does not', () => {
@@ -397,22 +422,12 @@ test('matchesPrefs: includeWg false excludes WG/shared-flat listings, true inclu
   assert.equal(matchesPrefs(row({ isWg: true }), { ...prefs, includeWg: true }), true);
 });
 
-test('setUserPrefs + getUserPrefs round-trips includeWg', () => {
-  const db = openDb(':memory:');
-  setUserPrefs(db, { ...defaultPrefs(1), includeWg: true });
-  assert.equal(getUserPrefs(db, 1)!.includeWg, true);
-  setUserPrefs(db, { ...defaultPrefs(1), includeWg: false });
-  assert.equal(getUserPrefs(db, 1)!.includeWg, false);
-});
-
-test('openDb migrates an older database predating is_wg / include_wg, backfilling is_wg from stored titles and defaulting include_wg to false (hide WGs by default)', () => {
+test('openDb migrates an older database predating is_wg, backfilling is_wg from stored titles', () => {
   const path = `/tmp/swipe-bot-migration-test-wg-${Date.now()}.sqlite`;
   const preMigration = openDb(path);
   upsertListing(preMigration, listing({ id: 'room', district: 6, title: 'WG-Zimmer frei', isWg: false })); // pre-migration: no is_wg column existed, so this couldn't have been flagged
   upsertListing(preMigration, listing({ id: 'flat', district: 6, title: 'Gemütliche 2-Zimmer-Wohnung', isWg: false }));
-  setUserPrefs(preMigration, defaultPrefs(1));
   preMigration.exec('ALTER TABLE listings DROP COLUMN is_wg');
-  preMigration.exec('ALTER TABLE user_prefs DROP COLUMN include_wg');
   preMigration.close();
 
   const migrated = openDb(path);
@@ -420,17 +435,7 @@ test('openDb migrates an older database predating is_wg / include_wg, backfillin
   const [flat] = getListingsByIds(migrated, ['willhaben:flat']);
   assert.equal(room.isWg, true); // backfilled from title on migration, not left stuck at false
   assert.equal(flat.isWg, false);
-  assert.equal(getUserPrefs(migrated, 1)!.includeWg, false); // unlike the waitlist migration, this one defaults to hiding — that's the whole point of the feature
   migrated.close();
-});
-
-test('setUserPrefs + getUserPrefs round-trips a commute destination', () => {
-  const db = openDb(':memory:');
-  setUserPrefs(db, { ...defaultPrefs(1), commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
-  const prefs = getUserPrefs(db, 1);
-  assert.equal(prefs!.commuteDestination, 'TU Wien');
-  assert.equal(prefs!.commuteLat, 48.1986);
-  assert.equal(prefs!.commuteLon, 16.3695);
 });
 
 test('upsertListing persists lat/lon, getCandidateListings round-trips them', () => {
@@ -608,4 +613,221 @@ test('openDb migrates an older database predating is_delisted, defaulting existi
   const [row] = getListingsByIds(migrated, ['willhaben:a']);
   assert.equal(row.isDelisted, false);
   migrated.close();
+});
+
+// --- search_profiles / chats -----------------------------------------------------------------
+
+test('createSearchProfile makes the first profile for a chat active by default', () => {
+  const db = openDb(':memory:');
+  const p = createSearchProfile(db, 1, 'Studio Center', prefs());
+  assert.equal(p.active, true);
+  assert.equal(getActiveSearchProfile(db, 1)!.id, p.id);
+});
+
+test('createSearchProfile with makeActive=false does not activate the new profile or deactivate an existing one', () => {
+  const db = openDb(':memory:');
+  const a = createSearchProfile(db, 1, 'A', prefs());
+  const b = createSearchProfile(db, 1, 'B', prefs(), false);
+  assert.equal(b.active, false);
+  assert.equal(getActiveSearchProfile(db, 1)!.id, a.id);
+});
+
+test('setActiveSearchProfile deactivates every other profile for that chat', () => {
+  const db = openDb(':memory:');
+  const a = createSearchProfile(db, 1, 'A', prefs());
+  const b = createSearchProfile(db, 1, 'B', prefs());
+  setActiveSearchProfile(db, 1, b.id);
+  assert.equal(getActiveSearchProfile(db, 1)!.id, b.id);
+  assert.equal(getSearchProfiles(db, 1).find((p) => p.id === a.id)!.active, false);
+});
+
+test('countSearchProfiles and the MAX_SEARCH_PROFILES_PER_CHAT cap', () => {
+  const db = openDb(':memory:');
+  for (let i = 0; i < MAX_SEARCH_PROFILES_PER_CHAT; i++) createSearchProfile(db, 1, `S${i}`, prefs());
+  assert.equal(countSearchProfiles(db, 1), MAX_SEARCH_PROFILES_PER_CHAT);
+});
+
+test('updateSearchProfile overwrites prefs without changing name/active/id', () => {
+  const db = openDb(':memory:');
+  const p = createSearchProfile(db, 1, 'Studio Center', prefs({ priceTo: 700 }));
+  updateSearchProfile(db, p.id, prefs({ priceTo: 900 }));
+  const updated = getSearchProfiles(db, 1)[0];
+  assert.equal(updated.prefs.priceTo, 900);
+  assert.equal(updated.name, 'Studio Center');
+  assert.equal(updated.id, p.id);
+  assert.equal(updated.active, true);
+});
+
+test('renameSearchProfile changes only the name', () => {
+  const db = openDb(':memory:');
+  const p = createSearchProfile(db, 1, 'Studio Center', prefs());
+  renameSearchProfile(db, p.id, 'Near TU');
+  const renamed = getSearchProfile(db, p.id)!;
+  assert.equal(renamed.name, 'Near TU');
+  assert.deepEqual(renamed.prefs, p.prefs);
+});
+
+test('getSearchProfile returns null for an unknown id', () => {
+  const db = openDb(':memory:');
+  assert.equal(getSearchProfile(db, 999), null);
+});
+
+test('deleteSearchProfile removes it; if it was active, no profile is active afterward', () => {
+  const db = openDb(':memory:');
+  const p = createSearchProfile(db, 1, 'Studio Center', prefs());
+  deleteSearchProfile(db, p.id);
+  assert.equal(getSearchProfiles(db, 1).length, 0);
+  assert.equal(getActiveSearchProfile(db, 1), null);
+});
+
+test('getAllSearchProfiles returns profiles across every chat', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'A', prefs());
+  createSearchProfile(db, 2, 'B', prefs());
+  assert.equal(getAllSearchProfiles(db).length, 2);
+});
+
+test('upsertActiveProfilePrefs creates a profile on first call, updates the same one on the next', () => {
+  const db = openDb(':memory:');
+  const created = upsertActiveProfilePrefs(db, 0, prefs({ priceTo: 500 }));
+  assert.equal(created.name, 'My Search');
+  const updated = upsertActiveProfilePrefs(db, 0, prefs({ priceTo: 600 }));
+  assert.equal(updated.id, created.id);
+  assert.equal(getSearchProfiles(db, 0).length, 1);
+  assert.equal(getSearchProfiles(db, 0)[0].prefs.priceTo, 600);
+});
+
+test('upsertActiveProfilePrefs honors a custom defaultName on first call', () => {
+  const db = openDb(':memory:');
+  const created = upsertActiveProfilePrefs(db, 0, prefs(), 'Custom Name');
+  assert.equal(created.name, 'Custom Name');
+});
+
+test('getChatLanguage defaults to "en", setChatLanguage persists a change', () => {
+  const db = openDb(':memory:');
+  assert.equal(getChatLanguage(db, 1), 'en');
+  setChatLanguage(db, 1, 'ru');
+  assert.equal(getChatLanguage(db, 1), 'ru');
+});
+
+test('setChatLanguage overwrites on re-call (same chatId)', () => {
+  const db = openDb(':memory:');
+  setChatLanguage(db, 1, 'de');
+  setChatLanguage(db, 1, 'ru');
+  assert.equal(getChatLanguage(db, 1), 'ru');
+});
+
+test('search profiles and chat languages are independent per chat', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'A', prefs());
+  setChatLanguage(db, 1, 'de');
+  assert.equal(getSearchProfiles(db, 2).length, 0);
+  assert.equal(getChatLanguage(db, 2), 'en');
+});
+
+test('upsertListing stores lift/parkingSpaces/floor/energyClass/availableFrom/mentionsPets from a NormalizedListing', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({
+    id: 'a', lift: true, parkingSpaces: 1, floor: '2. Stock', energyClass: 'A', availableFrom: '2026-10-01', mentionsPets: true,
+  }));
+  const row = getListingsByIds(db, ['willhaben:a'])[0];
+  assert.equal(row.lift, true);
+  assert.equal(row.parkingSpaces, 1);
+  assert.equal(row.floor, '2. Stock');
+  assert.equal(row.energyClass, 'A');
+  assert.equal(row.availableFrom, '2026-10-01');
+  assert.equal(row.mentionsPets, true);
+});
+
+test('upsertListing stores a null lift (unknown, distinct from false) and defaults mentionsPets to false', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'b', lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null, mentionsPets: false }));
+  const row = getListingsByIds(db, ['willhaben:b'])[0];
+  assert.equal(row.lift, null);
+  assert.equal(row.parkingSpaces, null);
+  assert.equal(row.mentionsPets, false);
+});
+
+test('openDb migrates an older database predating the amenity columns, defaulting lift/parkingSpaces/floor/energyClass/availableFrom to null and mentionsPets to false', () => {
+  const path = `/tmp/swipe-bot-migration-test-amenities-${Date.now()}.sqlite`;
+  const preMigration = openDb(path);
+  upsertListing(preMigration, listing({ id: 'a', district: 6, lift: true, parkingSpaces: 2, floor: '1. Stock', energyClass: 'B', availableFrom: '2026-09-01', mentionsPets: true }));
+  preMigration.exec('ALTER TABLE listings DROP COLUMN lift');
+  preMigration.exec('ALTER TABLE listings DROP COLUMN parking_spaces');
+  preMigration.exec('ALTER TABLE listings DROP COLUMN floor');
+  preMigration.exec('ALTER TABLE listings DROP COLUMN energy_class');
+  preMigration.exec('ALTER TABLE listings DROP COLUMN available_from');
+  preMigration.exec('ALTER TABLE listings DROP COLUMN mentions_pets');
+  preMigration.close();
+
+  const migrated = openDb(path);
+  const [row] = getListingsByIds(migrated, ['willhaben:a']);
+  assert.equal(row.lift, null); // old value gone with the dropped columns, but reopening must not throw
+  assert.equal(row.parkingSpaces, null);
+  assert.equal(row.floor, null);
+  assert.equal(row.energyClass, null);
+  assert.equal(row.availableFrom, null);
+  assert.equal(row.mentionsPets, false);
+  migrated.close();
+});
+
+test('a pre-existing user_prefs row is migrated into one active "My Search" search_profiles row on openDb, and the user_prefs table is dropped afterward', () => {
+  const path = `/tmp/swipe-bot-migration-test-${Date.now()}.sqlite`;
+  try {
+    // Build a DB on the OLD schema by hand — openDb() now creates the new schema (no user_prefs
+    // table at all), so it can't be used to seed the old one.
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE user_prefs (
+        chat_id INTEGER PRIMARY KEY, price_from REAL, price_to REAL, districts TEXT,
+        rooms_from REAL, rooms_to REAL, area_from REAL, area_to REAL,
+        include_waitlist_housing INTEGER NOT NULL DEFAULT 1, include_wg INTEGER NOT NULL DEFAULT 0,
+        commute_destination TEXT, commute_lat REAL, commute_lon REAL, updated_at TEXT NOT NULL
+      );
+    `);
+    seed.prepare(`INSERT INTO user_prefs (chat_id, price_to, include_waitlist_housing, include_wg, updated_at) VALUES (5, 700, 1, 0, ?)`)
+      .run(new Date().toISOString());
+    seed.close();
+
+    const db = openDb(path); // triggers migrate()
+    const profiles = getSearchProfiles(db, 5);
+    assert.equal(profiles.length, 1);
+    assert.equal(profiles[0].name, 'My Search');
+    assert.equal(profiles[0].active, true);
+    assert.equal(profiles[0].prefs.priceTo, 700);
+    assert.equal(profiles[0].prefs.requireElevator, false);
+    assert.equal(profiles[0].prefs.requireParking, false);
+    assert.equal(getChatLanguage(db, 5), 'en'); // a chats row is created alongside the migrated profile
+
+    const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_prefs'`).get();
+    assert.equal(tableExists, undefined); // dropped after migration
+  } finally {
+    rmSync(path, { force: true });
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+  }
+});
+
+test('re-opening a database that has already been migrated is a no-op (user_prefs stays absent, search_profiles untouched)', () => {
+  const path = `/tmp/swipe-bot-migration-test-idempotent-${Date.now()}.sqlite`;
+  try {
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE user_prefs (chat_id INTEGER PRIMARY KEY, price_to REAL, updated_at TEXT NOT NULL);
+    `);
+    seed.prepare('INSERT INTO user_prefs (chat_id, price_to, updated_at) VALUES (5, 700, ?)').run(new Date().toISOString());
+    seed.close();
+
+    const firstOpen = openDb(path);
+    firstOpen.close();
+
+    const secondOpen = openDb(path);
+    const profiles = getSearchProfiles(secondOpen, 5);
+    assert.equal(profiles.length, 1); // still exactly one — not duplicated by re-running migrate()
+    secondOpen.close();
+  } finally {
+    rmSync(path, { force: true });
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+  }
 });

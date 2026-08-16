@@ -7,25 +7,6 @@ export type DB = Database.Database;
 /** Fixed chatId used by the MCP server's stateless tool calls — never a real Telegram chat, so pushes must skip it. */
 export const MCP_CHAT_ID = 0;
 
-export interface UserPrefs {
-  chatId: number;
-  priceFrom: number | null;
-  priceTo: number | null;
-  districts: number[] | null;
-  roomsFrom: number | null;
-  roomsTo: number | null;
-  areaFrom: number | null;
-  areaTo: number | null;
-  /** False excludes listings that require a waitlist/registration (Gemeindewohnung etc.) — not everyone is eligible for those. */
-  includeWaitlistHousing: boolean;
-  /** False (the default) excludes WG-Zimmer, co-living, and student-room listings (apt-hunter's detectWG). */
-  includeWg: boolean;
-  /** Free-text label for the geocoded commute destination (e.g. "TU Wien"), or null if none set. */
-  commuteDestination: string | null;
-  commuteLat: number | null;
-  commuteLon: number | null;
-}
-
 export interface ListingRow {
   id: string;
   source: 'willhaben' | 'immoscout';
@@ -50,6 +31,14 @@ export interface ListingRow {
   lon: number | null;
   /** True once a refresh sweep gets a "not found" response for this listing — see refresh.ts. Rows shortlisted by someone are kept flagged rather than deleted. */
   isDelisted: boolean;
+  /** Structured amenity data — only ever populated from immoscout's detail fetch; willhaben has no equivalent fields. Mirrors apt-hunter's NormalizedListing. */
+  lift: boolean | null;
+  parkingSpaces: number | null;
+  floor: string | null;
+  energyClass: string | null;
+  availableFrom: string | null;
+  /** Best-effort keyword match on title+description — never a reliable filter, only a badge. */
+  mentionsPets: boolean;
 }
 
 const SCHEMA = `
@@ -68,19 +57,24 @@ CREATE TABLE IF NOT EXISTS listings (
   is_wg INTEGER NOT NULL DEFAULT 0,
   address_line TEXT,
   lat REAL, lon REAL,
-  is_delisted INTEGER NOT NULL DEFAULT 0
+  is_delisted INTEGER NOT NULL DEFAULT 0,
+  lift INTEGER, parking_spaces INTEGER, floor TEXT, energy_class TEXT, available_from TEXT,
+  mentions_pets INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS user_prefs (
+CREATE TABLE IF NOT EXISTS search_profiles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  prefs_json TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_search_profiles_chat_id ON search_profiles(chat_id);
+
+CREATE TABLE IF NOT EXISTS chats (
   chat_id INTEGER PRIMARY KEY,
-  price_from REAL, price_to REAL,
-  districts TEXT,
-  rooms_from REAL, rooms_to REAL,
-  area_from REAL, area_to REAL,
-  include_waitlist_housing INTEGER NOT NULL DEFAULT 1,
-  include_wg INTEGER NOT NULL DEFAULT 0,
-  commute_destination TEXT, commute_lat REAL, commute_lon REAL,
-  updated_at TEXT NOT NULL
+  language TEXT NOT NULL DEFAULT 'en'
 );
 
 CREATE TABLE IF NOT EXISTS commute_cache (
@@ -153,23 +147,73 @@ function migrate(db: DB): void {
   if (!listingColumns.includes('is_delisted')) {
     db.exec('ALTER TABLE listings ADD COLUMN is_delisted INTEGER NOT NULL DEFAULT 0');
   }
-
-  const prefsColumns = (db.prepare('PRAGMA table_info(user_prefs)').all() as { name: string }[]).map((c) => c.name);
-  if (!prefsColumns.includes('include_waitlist_housing')) {
-    // Default existing users to true (include) — matches pre-migration behavior of showing everything.
-    db.exec('ALTER TABLE user_prefs ADD COLUMN include_waitlist_housing INTEGER NOT NULL DEFAULT 1');
-  }
-  if (!prefsColumns.includes('include_wg')) {
-    // Default existing users to false (hide) — unlike waitlist housing, hiding WGs is the point of this feature.
-    db.exec('ALTER TABLE user_prefs ADD COLUMN include_wg INTEGER NOT NULL DEFAULT 0');
+  if (!listingColumns.includes('lift')) {
+    db.exec('ALTER TABLE listings ADD COLUMN lift INTEGER');
+    db.exec('ALTER TABLE listings ADD COLUMN parking_spaces INTEGER');
+    db.exec('ALTER TABLE listings ADD COLUMN floor TEXT');
+    db.exec('ALTER TABLE listings ADD COLUMN energy_class TEXT');
+    db.exec('ALTER TABLE listings ADD COLUMN available_from TEXT');
+    db.exec('ALTER TABLE listings ADD COLUMN mentions_pets INTEGER NOT NULL DEFAULT 0');
   }
   repairMissedWaitlistFlags(db);
 
-  if (!prefsColumns.includes('commute_destination')) {
-    db.exec('ALTER TABLE user_prefs ADD COLUMN commute_destination TEXT');
-    db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lat REAL');
-    db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lon REAL');
+  const shortlistColumns = (db.prepare('PRAGMA table_info(shortlist)').all() as { name: string }[]).map((c) => c.name);
+  if (!shortlistColumns.includes('profile_id')) {
+    db.exec('ALTER TABLE shortlist ADD COLUMN profile_id INTEGER');
   }
+
+  // user_prefs no longer exists on fresh installs (SCHEMA never creates it) — these column-backfill
+  // steps only matter for a genuinely old DB file still carrying the table, and only long enough for
+  // migrateUserPrefsToSearchProfiles below to read every row with every field present before dropping it.
+  const hasUserPrefs = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_prefs'`).get();
+  if (hasUserPrefs) {
+    const prefsColumns = (db.prepare('PRAGMA table_info(user_prefs)').all() as { name: string }[]).map((c) => c.name);
+    if (!prefsColumns.includes('include_waitlist_housing')) {
+      // Default existing users to true (include) — matches pre-migration behavior of showing everything.
+      db.exec('ALTER TABLE user_prefs ADD COLUMN include_waitlist_housing INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!prefsColumns.includes('include_wg')) {
+      // Default existing users to false (hide) — unlike waitlist housing, hiding WGs is the point of this feature.
+      db.exec('ALTER TABLE user_prefs ADD COLUMN include_wg INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!prefsColumns.includes('commute_destination')) {
+      db.exec('ALTER TABLE user_prefs ADD COLUMN commute_destination TEXT');
+      db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lat REAL');
+      db.exec('ALTER TABLE user_prefs ADD COLUMN commute_lon REAL');
+    }
+  }
+
+  migrateUserPrefsToSearchProfiles(db);
+}
+
+/**
+ * One-time migration: every pre-upgrade user_prefs row becomes one active search_profiles row
+ * named "My Search", carrying its exact prior filter values (new requireElevator/requireParking
+ * fields default to false, since no prior data existed for them). user_prefs is dropped once every
+ * row has been migrated so this function is a no-op (and the table absent) on every later startup.
+ */
+function migrateUserPrefsToSearchProfiles(db: DB): void {
+  const hasUserPrefs = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_prefs'`).get();
+  if (!hasUserPrefs) return;
+
+  const rows = db.prepare('SELECT * FROM user_prefs').all() as Record<string, unknown>[];
+  const migrateRows = db.transaction((rows: Record<string, unknown>[]) => {
+    for (const row of rows) {
+      const chatId = row.chat_id as number;
+      if (getActiveSearchProfile(db, chatId)) continue; // already migrated in a prior partial run
+      const prefsForChat = rowToPrefs(row);
+      createSearchProfile(db, chatId, 'My Search', {
+        priceFrom: prefsForChat.priceFrom, priceTo: prefsForChat.priceTo, districts: prefsForChat.districts,
+        roomsFrom: prefsForChat.roomsFrom, roomsTo: prefsForChat.roomsTo, areaFrom: prefsForChat.areaFrom, areaTo: prefsForChat.areaTo,
+        includeWaitlistHousing: prefsForChat.includeWaitlistHousing, includeWg: prefsForChat.includeWg,
+        requireElevator: false, requireParking: false,
+        commuteDestination: prefsForChat.commuteDestination, commuteLat: prefsForChat.commuteLat, commuteLon: prefsForChat.commuteLon,
+      });
+      db.prepare('INSERT OR IGNORE INTO chats (chat_id, language) VALUES (?, ?)').run(chatId, 'en');
+    }
+    db.exec('DROP TABLE user_prefs');
+  });
+  migrateRows(rows);
 }
 
 /**
@@ -218,6 +262,12 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
     lat: row.lat as number | null,
     lon: row.lon as number | null,
     isDelisted: Boolean(row.is_delisted),
+    lift: row.lift == null ? null : Boolean(row.lift),
+    parkingSpaces: row.parking_spaces as number | null,
+    floor: row.floor as string | null,
+    energyClass: row.energy_class as string | null,
+    availableFrom: row.available_from as string | null,
+    mentionsPets: Boolean(row.mentions_pets),
   };
 }
 
@@ -229,8 +279,8 @@ function rowToListing(row: Record<string, unknown>): ListingRow {
 export function upsertListing(db: DB, l: NormalizedListing): boolean {
   if (l.isShortTerm) return false;
   const result = db.prepare(`
-    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, is_wg, address_line, lat, lon)
-    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @isWg, @addressLine, @lat, @lon)
+    INSERT OR IGNORE INTO listings (id, source, title, price, price_per_sqm, area, rooms, district, is_private, images, description, url, value_flag, first_seen, requires_waitlist_ticket, is_wg, address_line, lat, lon, lift, parking_spaces, floor, energy_class, available_from, mentions_pets)
+    VALUES (@id, @source, @title, @price, @pricePerSqm, @area, @rooms, @district, @isPrivate, @images, @description, @url, @valueFlag, @firstSeen, @requiresWaitlistTicket, @isWg, @addressLine, @lat, @lon, @lift, @parkingSpaces, @floor, @energyClass, @availableFrom, @mentionsPets)
   `).run({
     id: listingKey(l),
     source: l.source,
@@ -248,6 +298,12 @@ export function upsertListing(db: DB, l: NormalizedListing): boolean {
     firstSeen: new Date().toISOString(),
     requiresWaitlistTicket: l.requiresWaitlistTicket ? 1 : 0,
     isWg: l.isWg ? 1 : 0,
+    lift: l.lift == null ? null : (l.lift ? 1 : 0),
+    parkingSpaces: l.parkingSpaces,
+    floor: l.floor,
+    energyClass: l.energyClass,
+    availableFrom: l.availableFrom,
+    mentionsPets: l.mentionsPets ? 1 : 0,
     addressLine: l.addressLine,
     lat: l.lat,
     lon: l.lon,
@@ -314,12 +370,22 @@ export function deleteDelistedUnshortlisted(db: DB): number {
   return rows.length;
 }
 
-export function getAllUserPrefs(db: DB): UserPrefs[] {
-  const rows = db.prepare('SELECT * FROM user_prefs').all() as Record<string, unknown>[];
-  return rows.map(rowToPrefs);
-}
-
-function rowToPrefs(row: Record<string, unknown>): UserPrefs {
+/** Shape of a legacy user_prefs row (pre-search-profiles) — only used by migrateUserPrefsToSearchProfiles, which is the only remaining reader of that table. */
+function rowToPrefs(row: Record<string, unknown>): {
+  chatId: number;
+  priceFrom: number | null;
+  priceTo: number | null;
+  districts: number[] | null;
+  roomsFrom: number | null;
+  roomsTo: number | null;
+  areaFrom: number | null;
+  areaTo: number | null;
+  includeWaitlistHousing: boolean;
+  includeWg: boolean;
+  commuteDestination: string | null;
+  commuteLat: number | null;
+  commuteLon: number | null;
+} {
   return {
     chatId: row.chat_id as number,
     priceFrom: row.price_from as number | null,
@@ -337,39 +403,129 @@ function rowToPrefs(row: Record<string, unknown>): UserPrefs {
   };
 }
 
-export function getUserPrefs(db: DB, chatId: number): UserPrefs | null {
-  const row = db.prepare('SELECT * FROM user_prefs WHERE chat_id = ?').get(chatId) as Record<string, unknown> | undefined;
-  return row ? rowToPrefs(row) : null;
+export interface SearchProfilePrefs {
+  priceFrom: number | null;
+  priceTo: number | null;
+  districts: number[] | null;
+  roomsFrom: number | null;
+  roomsTo: number | null;
+  areaFrom: number | null;
+  areaTo: number | null;
+  /** False excludes listings that require a waitlist/registration (Gemeindewohnung etc.) — not everyone is eligible for those. */
+  includeWaitlistHousing: boolean;
+  /** False (the default) excludes WG-Zimmer, co-living, and student-room listings (apt-hunter's detectWG). */
+  includeWg: boolean;
+  requireElevator: boolean;
+  requireParking: boolean;
+  /** Free-text label for the geocoded commute destination (e.g. "TU Wien"), or null if none set. */
+  commuteDestination: string | null;
+  commuteLat: number | null;
+  commuteLon: number | null;
 }
 
-export function setUserPrefs(db: DB, prefs: UserPrefs): void {
-  db.prepare(`
-    INSERT INTO user_prefs (chat_id, price_from, price_to, districts, rooms_from, rooms_to, area_from, area_to, include_waitlist_housing, include_wg, commute_destination, commute_lat, commute_lon, updated_at)
-    VALUES (@chatId, @priceFrom, @priceTo, @districts, @roomsFrom, @roomsTo, @areaFrom, @areaTo, @includeWaitlistHousing, @includeWg, @commuteDestination, @commuteLat, @commuteLon, @updatedAt)
-    ON CONFLICT(chat_id) DO UPDATE SET
-      price_from = excluded.price_from, price_to = excluded.price_to, districts = excluded.districts,
-      rooms_from = excluded.rooms_from, rooms_to = excluded.rooms_to,
-      area_from = excluded.area_from, area_to = excluded.area_to,
-      include_waitlist_housing = excluded.include_waitlist_housing,
-      include_wg = excluded.include_wg,
-      commute_destination = excluded.commute_destination, commute_lat = excluded.commute_lat, commute_lon = excluded.commute_lon,
-      updated_at = excluded.updated_at
-  `).run({
-    chatId: prefs.chatId,
-    priceFrom: prefs.priceFrom,
-    priceTo: prefs.priceTo,
-    districts: prefs.districts == null ? null : JSON.stringify(prefs.districts),
-    roomsFrom: prefs.roomsFrom,
-    roomsTo: prefs.roomsTo,
-    areaFrom: prefs.areaFrom,
-    areaTo: prefs.areaTo,
-    includeWaitlistHousing: prefs.includeWaitlistHousing ? 1 : 0,
-    includeWg: prefs.includeWg ? 1 : 0,
-    commuteDestination: prefs.commuteDestination,
-    commuteLat: prefs.commuteLat,
-    commuteLon: prefs.commuteLon,
-    updatedAt: new Date().toISOString(),
+export interface SearchProfile {
+  id: number;
+  chatId: number;
+  name: string;
+  active: boolean;
+  createdAt: string;
+  prefs: SearchProfilePrefs;
+}
+
+/** A chat may keep this many saved searches at once — the wizard/menus enforce the cap by calling countSearchProfiles before offering "add another search". */
+export const MAX_SEARCH_PROFILES_PER_CHAT = 5;
+
+function rowToSearchProfile(row: Record<string, unknown>): SearchProfile {
+  return {
+    id: row.id as number,
+    chatId: row.chat_id as number,
+    name: row.name as string,
+    active: Boolean(row.active),
+    createdAt: row.created_at as string,
+    prefs: JSON.parse(row.prefs_json as string) as SearchProfilePrefs,
+  };
+}
+
+/** Inserts a new search profile. By default it becomes the chat's one active profile (every other profile for that chat is deactivated first) — pass makeActive=false to add an inactive profile instead. */
+export function createSearchProfile(db: DB, chatId: number, name: string, prefs: SearchProfilePrefs, makeActive = true): SearchProfile {
+  if (makeActive) db.prepare('UPDATE search_profiles SET active = 0 WHERE chat_id = ?').run(chatId);
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    'INSERT INTO search_profiles (chat_id, name, prefs_json, active, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(chatId, name, JSON.stringify(prefs), makeActive ? 1 : 0, now);
+  return { id: result.lastInsertRowid as number, chatId, name, active: makeActive, createdAt: now, prefs };
+}
+
+export function getSearchProfiles(db: DB, chatId: number): SearchProfile[] {
+  const rows = db.prepare('SELECT * FROM search_profiles WHERE chat_id = ? ORDER BY created_at ASC').all(chatId) as Record<string, unknown>[];
+  return rows.map(rowToSearchProfile);
+}
+
+export function getSearchProfile(db: DB, profileId: number): SearchProfile | null {
+  const row = db.prepare('SELECT * FROM search_profiles WHERE id = ?').get(profileId) as Record<string, unknown> | undefined;
+  return row ? rowToSearchProfile(row) : null;
+}
+
+export function getActiveSearchProfile(db: DB, chatId: number): SearchProfile | null {
+  const row = db.prepare('SELECT * FROM search_profiles WHERE chat_id = ? AND active = 1').get(chatId) as Record<string, unknown> | undefined;
+  return row ? rowToSearchProfile(row) : null;
+}
+
+/** Deactivates every other profile for the chat before activating this one, so a chat never has more than one active profile at a time. */
+export function setActiveSearchProfile(db: DB, chatId: number, profileId: number): void {
+  const setActive = db.transaction(() => {
+    db.prepare('UPDATE search_profiles SET active = 0 WHERE chat_id = ?').run(chatId);
+    db.prepare('UPDATE search_profiles SET active = 1 WHERE id = ? AND chat_id = ?').run(profileId, chatId);
   });
+  setActive();
+}
+
+export function updateSearchProfile(db: DB, profileId: number, prefs: SearchProfilePrefs): void {
+  db.prepare('UPDATE search_profiles SET prefs_json = ? WHERE id = ?').run(JSON.stringify(prefs), profileId);
+}
+
+export function renameSearchProfile(db: DB, profileId: number, name: string): void {
+  db.prepare('UPDATE search_profiles SET name = ? WHERE id = ?').run(name, profileId);
+}
+
+/** If the deleted profile was active, no profile is active afterward — the caller (bot.ts) prompts the user to pick a new one if any remain. */
+export function deleteSearchProfile(db: DB, profileId: number): void {
+  db.prepare('DELETE FROM search_profiles WHERE id = ?').run(profileId);
+}
+
+export function countSearchProfiles(db: DB, chatId: number): number {
+  const row = db.prepare('SELECT COUNT(*) as n FROM search_profiles WHERE chat_id = ?').get(chatId) as { n: number };
+  return row.n;
+}
+
+/** Every search profile across every chat — used by the poller/notifier to sweep all active searches in one pass, replacing the old getAllUserPrefs. */
+export function getAllSearchProfiles(db: DB): SearchProfile[] {
+  const rows = db.prepare('SELECT * FROM search_profiles').all() as Record<string, unknown>[];
+  return rows.map(rowToSearchProfile);
+}
+
+/** Used only by the MCP server, which has no wizard/multi-profile UI: creates the chat's one profile on first call, updates it on every later call. */
+export function upsertActiveProfilePrefs(db: DB, chatId: number, prefs: SearchProfilePrefs, defaultName = 'My Search'): SearchProfile {
+  const active = getActiveSearchProfile(db, chatId);
+  if (active) {
+    updateSearchProfile(db, active.id, prefs);
+    return { ...active, prefs };
+  }
+  return createSearchProfile(db, chatId, defaultName, prefs);
+}
+
+export type ChatLanguage = 'en' | 'ru' | 'de';
+
+export function getChatLanguage(db: DB, chatId: number): ChatLanguage {
+  const row = db.prepare('SELECT language FROM chats WHERE chat_id = ?').get(chatId) as { language: ChatLanguage } | undefined;
+  return row?.language ?? 'en';
+}
+
+export function setChatLanguage(db: DB, chatId: number, language: ChatLanguage): void {
+  db.prepare(`
+    INSERT INTO chats (chat_id, language) VALUES (?, ?)
+    ON CONFLICT(chat_id) DO UPDATE SET language = excluded.language
+  `).run(chatId, language);
 }
 
 /** In-progress onboarding wizard answers for a chat, or null if not mid-onboarding. Persisted so a process restart doesn't silently drop progress. */
