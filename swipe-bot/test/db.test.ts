@@ -15,6 +15,7 @@ import {
   type ListingRow, type SearchProfilePrefs,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
+import { initialWizardState, applyWizardChoice, finalizePrefs, BUDGET_BANDS } from '../src/wizard.js';
 
 function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
   return {
@@ -702,6 +703,21 @@ test('a profile created with priceTo: Infinity round-trips as priceTo: null (JSO
   createSearchProfile(db, 1, 'No limit', prefs({ priceTo: Infinity }));
   const [loaded] = getSearchProfiles(db, 1);
   assert.equal(loaded.prefs.priceTo, null);
+});
+
+test('createSearchProfile itself returns priceTo: null (not Infinity) for prefs produced by the wizard\'s top "no limit" budget band — the caller-facing object must already be normalized, not just a later re-read of the row (createSearchProfile hands back the caller\'s in-memory prefs verbatim, without re-reading the inserted row)', () => {
+  const db = openDb(':memory:');
+  let s = initialWizardState();
+  s = applyWizardChoice(s, { kind: 'name', name: 'No limit' });
+  const topBand = BUDGET_BANDS[BUDGET_BANDS.length - 1];
+  s = applyWizardChoice(s, { kind: 'budget', priceFrom: topBand.priceFrom, priceTo: topBand.priceTo });
+  s = applyWizardChoice(s, { kind: 'districts_continue' });
+  s = applyWizardChoice(s, { kind: 'rooms_size', roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  s = applyWizardChoice(s, { kind: 'amenities_continue' });
+  s = applyWizardChoice(s, { kind: 'commute_skip' });
+  const wizardPrefs = finalizePrefs(s);
+  const created = createSearchProfile(db, 1, 'No limit', wizardPrefs);
+  assert.equal(created.prefs.priceTo, null);
 });
 
 test('renameSearchProfile changes only the name', () => {

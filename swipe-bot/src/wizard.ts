@@ -138,7 +138,15 @@ export function finalizePrefs(state: WizardState): SearchProfilePrefs {
   const p = state.partial;
   return {
     priceFrom: p.priceFrom ?? null,
-    priceTo: p.priceTo ?? Infinity,
+    // Normalize BUDGET_BANDS' Infinity (and an unvisited budget step) to null here, rather than
+    // relying on JSON.stringify(Infinity) -> null happening later at the db.ts persistence layer.
+    // createSearchProfile() returns the caller's in-memory prefs object verbatim (it doesn't
+    // re-read the inserted row), so without this normalization the object handed back right after
+    // profile creation would still carry priceTo: Infinity while a subsequent DB read of the same
+    // profile would show priceTo: null — an inconsistency. null is the established "no upper
+    // bound" convention (see db.ts's matchesPrefs/getCandidateListings), so this removes the
+    // second/inconsistent encoding entirely instead of working around it downstream.
+    priceTo: p.priceTo === Infinity || p.priceTo == null ? null : p.priceTo,
     districts: p.districts && p.districts.length > 0 ? p.districts : null,
     roomsFrom: p.roomsFrom ?? null,
     roomsTo: p.roomsTo ?? null,

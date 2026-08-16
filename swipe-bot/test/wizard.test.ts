@@ -133,3 +133,29 @@ test('finalizePrefs fills neutral defaults for a step whose partial was never po
   assert.equal(prefs.includeWg, false);
   assert.equal(prefs.commuteDestination, null);
 });
+
+test('finalizePrefs defaults an unvisited budget step to priceTo: null, not Infinity (matches every other unvisited field defaulting to null/false)', () => {
+  let s = initialWizardState();
+  s = applyWizardChoice(s, { kind: 'name', name: 'X' });
+  s = { ...s, stepIndex: s.stepIndex + 1 }; // skip past budget without visiting it
+  s = applyWizardChoice(s, { kind: 'districts_continue' });
+  s = applyWizardChoice(s, { kind: 'rooms_size', roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  s = applyWizardChoice(s, { kind: 'amenities_continue' });
+  s = applyWizardChoice(s, { kind: 'commute_skip' });
+  assert.equal(isWizardComplete(s), true);
+  const prefs = finalizePrefs(s);
+  assert.equal(prefs.priceTo, null);
+});
+
+test('finalizePrefs normalizes the top BUDGET_BANDS choice (priceTo: Infinity) to priceTo: null', () => {
+  let s = initialWizardState();
+  s = applyWizardChoice(s, { kind: 'name', name: 'X' });
+  const topBand = BUDGET_BANDS[BUDGET_BANDS.length - 1];
+  s = applyWizardChoice(s, { kind: 'budget', priceFrom: topBand.priceFrom, priceTo: topBand.priceTo });
+  s = applyWizardChoice(s, { kind: 'districts_continue' });
+  s = applyWizardChoice(s, { kind: 'rooms_size', roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null });
+  s = applyWizardChoice(s, { kind: 'amenities_continue' });
+  s = applyWizardChoice(s, { kind: 'commute_skip' });
+  const prefs = finalizePrefs(s);
+  assert.equal(prefs.priceTo, null);
+});
