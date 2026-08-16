@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   createBot, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
+  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
@@ -209,6 +210,52 @@ test('buildMediaGroup caps at Telegram\'s 10-item limit', () => {
   const group = buildMediaGroup(images, 'caption');
   assert.equal(group.length, MAX_MEDIA_GROUP_ITEMS);
   assert.deepEqual(group.map((item) => item.media), images.slice(0, MAX_MEDIA_GROUP_ITEMS));
+});
+
+test('summarizeMatches computes count, price range/avg, and top districts', () => {
+  const listings = [row({ id: 'a', price: 650, district: 6 }), row({ id: 'b', price: 890, district: 6 }), row({ id: 'c', price: 700, district: 10 })];
+  const s = summarizeMatches(listings);
+  assert.equal(s.count, 3);
+  assert.equal(s.priceMin, 650);
+  assert.equal(s.priceMax, 890);
+  assert.equal(Math.round(s.priceAvg!), 747);
+  assert.deepEqual(s.topDistricts, [6, 10]); // district 6 appears twice, sorted by frequency
+});
+
+test('summarizeMatches handles an empty list without throwing, all price fields null', () => {
+  const s = summarizeMatches([]);
+  assert.equal(s.count, 0);
+  assert.equal(s.priceMin, null);
+  assert.equal(s.priceMax, null);
+  assert.equal(s.priceAvg, null);
+  assert.deepEqual(s.topDistricts, []);
+});
+
+test('summarizeMatches ignores listings with a null district when tallying top districts', () => {
+  const listings = [row({ id: 'a', price: 500, district: null }), row({ id: 'b', price: 600, district: 3 })];
+  const s = summarizeMatches(listings);
+  assert.deepEqual(s.topDistricts, [3]);
+});
+
+test('formatAggregateSummary renders the profile name, count, price range/avg, and district breakdown', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Studio Center', defaultPrefs());
+  const profile = getSearchProfiles(db, 1)[0];
+  const text = formatAggregateSummary(profile, summarizeMatches([row({ price: 650, district: 6 }), row({ price: 890, district: 6 })]));
+  assert.match(text, /Studio Center/);
+  assert.match(text, /€650-890/);
+  assert.match(text, /avg €770/);
+  assert.match(text, /district(s)? 6/i);
+});
+
+test('formatAggregateSummary handles zero matches without a price range or district breakdown', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Empty Search', defaultPrefs());
+  const profile = getSearchProfiles(db, 1)[0];
+  const text = formatAggregateSummary(profile, summarizeMatches([]));
+  assert.match(text, /Empty Search/);
+  assert.match(text, /0 matches/);
+  assert.doesNotMatch(text, /district/i);
 });
 
 // --- Handler-level tests: drive createBot() through real Telegraf update dispatch, ---
@@ -1239,4 +1286,72 @@ test('a swipe on a message that already has no reply markup is a no-op edit, not
   // No text/photo at all on the callback message — should not throw, still sends the next-card message.
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));
   assert.ok(calls.some((c) => c.method === 'sendMessage'));
+});
+
+// --- Task 9: aggregate match summary on profile activation ---
+
+test('sendProfileActivationSummary sends the aggregate summary with a single Browse button when matches exist', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Studio Center', defaultPrefs({ priceTo: null }));
+  const profile = getSearchProfiles(db, 1)[0];
+  upsertListing(db, listing({ id: 'a', price: 650, district: 6 }));
+  upsertListing(db, listing({ id: 'b', price: 890, district: 6 }));
+  upsertListing(db, listing({ id: 'c', price: 700, district: 10 }));
+  const { bot, calls } = createTestBot(db);
+
+  await sendProfileActivationSummary(bot.telegram, db, profile);
+
+  const summaryCall = calls.find((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('Studio Center'));
+  assert.ok(summaryCall, 'expected the aggregate summary message');
+  assert.match(summaryCall!.payload.text as string, /3 matches/);
+  const inlineKeyboard = (summaryCall!.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  assert.equal(inlineKeyboard.flat().length, 1);
+  assert.equal(inlineKeyboard[0][0].callback_data, `browse:${profile.id}`);
+
+  const navCall = calls.find((c) => c.method === 'sendMessage' && (c.payload.reply_markup as { keyboard?: unknown } | undefined)?.keyboard);
+  assert.ok(navCall, 'expected a message restoring MAIN_KEYBOARD');
+  assert.deepEqual((navCall!.payload.reply_markup as { keyboard: string[][] }).keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('sendProfileActivationSummary sends a "no matches yet" message with no inline button when candidates is empty, and still attaches MAIN_KEYBOARD', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Empty Search', defaultPrefs());
+  const profile = getSearchProfiles(db, 1)[0];
+  const { bot, calls } = createTestBot(db);
+
+  await sendProfileActivationSummary(bot.telegram, db, profile);
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].payload.text as string, /no matches yet/i);
+  const reply_markup = calls[0].payload.reply_markup as { keyboard?: unknown; inline_keyboard?: unknown };
+  assert.equal(reply_markup.inline_keyboard, undefined);
+  assert.deepEqual(reply_markup.keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('tapping browse:<profileId> calls sendNextCard for that profile\'s chat', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  const profile = getSearchProfiles(db, 1)[0];
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(callbackUpdate(1, `browse:${profile.id}`));
+
+  assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€500')));
+});
+
+test('completing the wizard via buttons still attaches MAIN_KEYBOARD, even though editMessageText cannot carry it', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start')); // name step
+  await bot.handleUpdate(textUpdate(1, 'Studio Center')); // free-text name -> budget step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900')); // -> districts step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue')); // -> rooms/size step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:1:1')); // -> amenities step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:amenities_continue')); // -> commute step
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:commute_skip')); // completes the wizard via a button
+
+  const navMessage = calls.find((c) => c.method === 'sendMessage' && (c.payload.reply_markup as { keyboard?: unknown } | undefined)?.keyboard);
+  assert.ok(navMessage, 'expected MAIN_KEYBOARD to be attached to some message after button-driven wizard completion');
+  assert.deepEqual((navMessage!.payload.reply_markup as { keyboard: string[][] }).keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
 });

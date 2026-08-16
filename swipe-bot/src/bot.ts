@@ -439,29 +439,67 @@ async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, d
 }
 
 /**
- * Placeholder for Task 9's full aggregate-match summary (match count, price range, top districts,
- * and a "Browse top matches ▸" button). Wizard completion (both the callback-driven and the
- * commute-free-text-driven paths, below) call this in place of jumping straight into the swipe
- * deck, so a working forward reference exists now — Task 9 replaces this body with the real
- * summary/browse-button implementation without changing its call sites.
- *
- * *** CONTRACT TASK 9 MUST PRESERVE ***
- * The callback-driven completion path (advanceWizard, below) finishes with `ctx.editMessageText`,
- * which structurally CANNOT attach a reply keyboard. This function's `sendMessage(..., MAIN_KEYBOARD)`
- * call is therefore the ONLY place a wizard-completing-via-buttons user gets `MAIN_KEYBOARD` (the
- * persistent ⏭ Next / 📋 Shortlist / ⚙️ Settings nav bar) re-attached to their chat. When Task 9
- * replaces this body, it MUST keep passing `MAIN_KEYBOARD` on whatever message it ends up sending —
- * dropping it silently removes the nav bar for every button-wizard user.
+ * Aggregate stats over a profile's already-matching candidates — match count, price range/avg, and
+ * the (up to 3) districts with the most matches, sorted by frequency. Pure and exported so
+ * formatAggregateSummary's rendering can be tested independently of the price-math/district-tally.
  */
-async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
+export function summarizeMatches(listings: ListingRow[]): { count: number; priceMin: number | null; priceMax: number | null; priceAvg: number | null; topDistricts: number[] } {
+  const prices = listings.map((l) => l.price).filter((p): p is number => p != null);
+  const districtCounts = new Map<number, number>();
+  for (const l of listings) {
+    if (l.district != null) districtCounts.set(l.district, (districtCounts.get(l.district) ?? 0) + 1);
+  }
+  const topDistricts = [...districtCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([d]) => d);
+  return {
+    count: listings.length,
+    priceMin: prices.length ? Math.min(...prices) : null,
+    priceMax: prices.length ? Math.max(...prices) : null,
+    priceAvg: prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : null,
+    topDistricts,
+  };
+}
+
+/** Renders summarizeMatches' output into the one-line aggregate summary shown on profile activation. Pure. */
+export function formatAggregateSummary(profile: SearchProfile, s: ReturnType<typeof summarizeMatches>): string {
+  const priceRange = s.priceMin != null && s.priceMax != null ? `€${s.priceMin}-${s.priceMax} (avg €${Math.round(s.priceAvg!)})` : 'price n/a';
+  const districts = s.topDistricts.length > 0 ? ` · mostly district${s.topDistricts.length > 1 ? 's' : ''} ${s.topDistricts.join(', ')}` : '';
+  return `🏠 ${profile.name}: ${s.count} match${s.count === 1 ? '' : 'es'} · ${priceRange}${districts}`;
+}
+
+/**
+ * Sends the aggregate match summary + a single "Browse top matches ▸" button on profile activation
+ * (both the button-driven and free-text-driven wizard completion paths). The button's
+ * `browse:<profileId>` callback (registered in createBot, below) is what actually starts the swipe
+ * deck via sendNextCard — this function itself never sends a card.
+ *
+ * *** CONTRACT FROM TASK 6'S REVIEW, STILL BINDING ***
+ * The callback-driven wizard-completion path (advanceWizard, below) finishes with `ctx.editMessageText`,
+ * which structurally CANNOT attach a reply keyboard, so this function is the ONLY place a
+ * wizard-completing-via-buttons user gets `MAIN_KEYBOARD` (the persistent ⏭ Next / 📋 Shortlist /
+ * ⚙️ Settings nav bar) re-attached to their chat. Telegram's `reply_markup` is a closed union — a
+ * single message can carry an inline keyboard (the Browse button) OR a persistent reply keyboard
+ * (MAIN_KEYBOARD), never both — so when there are matches, restoring the nav bar takes a second,
+ * short message rather than being bolted onto the summary message itself. Both branches below MUST
+ * keep sending a `MAIN_KEYBOARD`-carrying message — dropping it silently removes the nav bar for
+ * every button-wizard user.
+ */
+export async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
   const candidates = getCandidateListings(db, profile.chatId, profile.prefs);
+  if (candidates.length === 0) {
+    await telegram.sendMessage(
+      profile.chatId,
+      `🏠 ${profile.name}: no matches yet — I'll message you here as soon as something matches.`,
+      MAIN_KEYBOARD,
+    );
+    return;
+  }
+  const summary = summarizeMatches(candidates);
   await telegram.sendMessage(
     profile.chatId,
-    candidates.length > 0
-      ? `${candidates.length} listing${candidates.length === 1 ? '' : 's'} already match "${profile.name}" — /next to start browsing.`
-      : `No matches yet for "${profile.name}" — I'll message you here as soon as something matches.`,
-    MAIN_KEYBOARD,
+    formatAggregateSummary(profile, summary),
+    Markup.inlineKeyboard([[Markup.button.callback('Browse top matches ▸', `browse:${profile.id}`)]]),
   );
+  await telegram.sendMessage(profile.chatId, 'Use the buttons below anytime.', MAIN_KEYBOARD);
 }
 
 /** Starts a brand-new wizard run for `chatId`: refuses once the chat is at MAX_SEARCH_PROFILES_PER_CHAT, otherwise resets wizard state to step 0 and sends its prompt. Shared by /start (first-time setup) and the "+ Add another search" button from /searches. */
@@ -733,6 +771,12 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   );
   bot.action('wizard:amenities_continue', (ctx) => advanceWizard(ctx, { kind: 'amenities_continue' }));
   bot.action('wizard:commute_skip', (ctx) => advanceWizard(ctx, { kind: 'commute_skip' }));
+
+  /** The activation summary's only button — starts the swipe deck the same way /next or "⏭ Next" would. */
+  bot.action(/^browse:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendNextCard(ctx.telegram, ctx.chat!.id, db, deps);
+  });
 
   bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
