@@ -5,7 +5,7 @@ import {
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, ONBOARDING_INTRO, type BotDeps, type GeocodeFn,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
-import { openDb, upsertListing, setUserPrefs, getUserPrefs, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
+import { openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getOnboardingState, recordSwipe, getShortlist, getCandidateListings, type ListingRow, type DB } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -53,13 +53,13 @@ test('parseOnboardingAnswers rejects a non-numeric required budget', () => {
 
 test('nextCardFor returns null when the candidate queue is empty', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   assert.equal(nextCardFor(db, 1), null);
 });
 
 test('nextCardFor returns the top-ranked candidate, excluding already-swiped', () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   upsertListing(db, listing({ id: 'b', price: 700 }));
   recordSwipe(db, 1, 'willhaben:a', 'pass');
@@ -281,7 +281,7 @@ test('/start begins onboarding and asks the first question', async () => {
 
 test('/start on an already-configured chat points at /next, /shortlist, /settings instead of silently re-onboarding', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
 
@@ -364,7 +364,7 @@ test('finishing onboarding attaches the persistent nav keyboard to the confirmat
 
 test('/start on an already-configured chat also attaches the persistent nav keyboard', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(commandUpdate(1, '/start'));
   const reply = calls.find((c) => c.method === 'sendMessage');
@@ -374,7 +374,7 @@ test('/start on an already-configured chat also attaches the persistent nav keyb
 
 test('tapping "⏭ Next" on the persistent keyboard sends the next card, same as /next', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(textUpdate(1, '⏭ Next'));
@@ -487,7 +487,7 @@ test('a successfully geocoded commute destination is saved and shown on the next
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
-  assert.equal(getUserPrefs(db, 1)!.commuteDestination, 'TU Wien');
+  assert.equal(getActiveSearchProfile(db, 1)!.prefs.commuteDestination, 'TU Wien');
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.match(texts.at(-1) as string, /18 min walk · 7 min by tram D to TU Wien/);
 });
@@ -514,7 +514,7 @@ test('"skip" on the commute question saves no destination and shows no commute l
     await bot.handleUpdate(textUpdate(1, answer));
   }
 
-  assert.equal(getUserPrefs(db, 1)!.commuteDestination, null);
+  assert.equal(getActiveSearchProfile(db, 1)!.prefs.commuteDestination, null);
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
   assert.doesNotMatch(texts.at(-1) as string, /📍/);
 });
@@ -523,7 +523,7 @@ const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should n
 
 test('getCommuteLineFor returns null when the user has no commute destination, or the listing has neither coordinates nor an address to fall back on', async () => {
   const db = openDb(':memory:');
-  const noDestPrefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const noDestPrefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(await getCommuteLineFor(db, 1, row({ lat: 48.19, lon: 16.37 }), noDestPrefs, async () => ({ walkMinutes: 10, transitMinutes: null, transitSummary: null }), NEVER_GEOCODE), null);
 
   const withDestPrefs = { ...noDestPrefs, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
@@ -532,7 +532,7 @@ test('getCommuteLineFor returns null when the user has no commute destination, o
 
 test('getCommuteLineFor caches the computed result and does not recompute on a second call', async () => {
   const db = openDb(':memory:');
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
   let calls = 0;
   const computeCommute = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 12, transitMinutes: null, transitSummary: null }; };
 
@@ -547,7 +547,7 @@ test('getCommuteLineFor caches the computed result and does not recompute on a s
 test('getCommuteLineFor falls back to geocoding the listing\'s address when it has no coordinates, and persists the resolved coordinates onto the listing', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', district: 6, lat: null, lon: null, addressLine: '1110 Wien, Simmering' }));
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
   const geocode: GeocodeFn = async () => ({ lat: 48.11, lon: 16.4 });
   const computeCommute = async (): Promise<CommuteTimes> => ({ walkMinutes: 20, transitMinutes: 10, transitSummary: 'U3' });
 
@@ -563,7 +563,7 @@ test('getCommuteLineFor falls back to geocoding the listing\'s address when it h
 test('getCommuteLineFor returns null, and persists nothing, when the address fails to geocode', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', district: 6, lat: null, lon: null, addressLine: 'nonsense address' }));
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 };
   const geocode: GeocodeFn = async () => null;
   const computeCommute = async (): Promise<CommuteTimes> => ({ walkMinutes: 20, transitMinutes: null, transitSummary: null });
 
@@ -608,7 +608,7 @@ test('free text outside onboarding is ignored, not echoed or errored', async () 
 
 test('a 👍 swipe records the shortlist entry and sends the next card', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   upsertListing(db, listing({ id: 'a', price: 500 }));
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a'));
@@ -618,7 +618,7 @@ test('a 👍 swipe records the shortlist entry and sends the next card', async (
 
 test('a 👍 swipe on a listing deleted mid-flight (e.g. by the refresh sweep) tells the user instead of silently losing the like', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   // Note: no upsertListing — 'willhaben:a' doesn't exist, simulating one hard-deleted between card send and swipe.
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));

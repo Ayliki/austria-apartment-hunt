@@ -8,7 +8,8 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: ['https://img/1.jpg', 'https://img/2.jpg'],
     description: 'A lovely flat.', url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, isWg: false, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, lat: null, lon: null, addressLine: null, isDelisted: false,
+    lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null, mentionsPets: false,
     ...overrides,
   };
 }
@@ -49,21 +50,21 @@ test('formatCardPayload surfaces isWg so Claude can flag shared-flat/co-living/s
   assert.equal(formatCardPayload(row({ isWg: true })).isWg, true);
 });
 
-test('mapPrefsArgs maps structured MCP args to UserPrefs, defaulting missing optional bounds to null, waitlist housing to included, and WG listings to excluded', () => {
+test('mapPrefsArgs maps structured MCP args to SearchProfilePrefs, defaulting missing optional bounds to null, waitlist housing to included, WG listings to excluded, and elevator/parking to not required', () => {
   const prefs = mapPrefsArgs({ price_to: 800, districts: [6, 7] });
   assert.deepEqual(prefs, {
     priceTo: 800, priceFrom: null, districts: [6, 7], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
-    includeWaitlistHousing: true, includeWg: false,
+    includeWaitlistHousing: true, includeWg: false, requireElevator: false, requireParking: false,
   });
 });
 
 test('mapPrefsArgs passes through all bounds when fully specified', () => {
   const prefs = mapPrefsArgs({
     price_to: 800, price_from: 400, districts: [1, 2], rooms_from: 1, rooms_to: 2, area_from: 30, area_to: 60,
-    include_waitlist_housing: false, include_wg: true,
+    include_waitlist_housing: false, include_wg: true, require_elevator: true, require_parking: true,
   });
   assert.deepEqual(prefs, {
     priceTo: 800, priceFrom: 400, districts: [1, 2], roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60,
-    includeWaitlistHousing: false, includeWg: true,
+    includeWaitlistHousing: false, includeWg: true, requireElevator: true, requireParking: true,
   });
 });

@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import {
-  type DB, type UserPrefs, type ListingRow, type CommuteTimes,
-  getUserPrefs, setUserPrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
+  type DB, type SearchProfilePrefs, type ListingRow, type CommuteTimes,
+  getActiveSearchProfile, upsertActiveProfilePrefs, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
   getOnboardingState, setOnboardingState, deleteOnboardingState, getCommuteTimes, setCommuteTimes, setListingCoords,
 } from './db.js';
 import { rankListings } from './scoring.js';
@@ -133,7 +133,9 @@ export function parseOnboardingStep(index: number, raw: string): void {
 }
 
 /** Pure parser for the first 6 (of 7) onboarding answers. The 7th (commute destination) needs an async geocode call and is resolved separately in finishOnboarding. Throws Error with a user-facing message. */
-export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chatId' | 'commuteDestination' | 'commuteLat' | 'commuteLon'> {
+export function parseOnboardingAnswers(
+  answers: string[],
+): Omit<SearchProfilePrefs, 'commuteDestination' | 'commuteLat' | 'commuteLon' | 'requireElevator' | 'requireParking'> {
   const priceTo = parseBudgetMax(answers[0]);
   const priceFrom = parseBudgetMin(answers[1]);
   const districts = parseDistrictsAnswer(answers[2]);
@@ -146,9 +148,9 @@ export function parseOnboardingAnswers(answers: string[]): Omit<UserPrefs, 'chat
 
 /** Top-ranked, not-yet-swiped listing for this user, or null if the queue is empty. */
 export function nextCardFor(db: DB, chatId: number): ListingRow | null {
-  const prefs = getUserPrefs(db, chatId);
-  if (!prefs) return null;
-  const candidates = getCandidateListings(db, chatId, prefs);
+  const profile = getActiveSearchProfile(db, chatId);
+  if (!profile) return null;
+  const candidates = getCandidateListings(db, chatId, profile.prefs);
   if (candidates.length === 0) return null;
   const swiped = getSwipedWithDirection(db, chatId);
   return rankListings(candidates, swiped)[0];
@@ -270,7 +272,7 @@ async function sendShortlistBrowseCard(
  * ever, not once per view.
  */
 export async function getCommuteLineFor(
-  db: DB, chatId: number, listing: ListingRow, prefs: UserPrefs, computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
+  db: DB, chatId: number, listing: ListingRow, prefs: SearchProfilePrefs, computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
 ): Promise<string | null> {
   if (prefs.commuteDestination == null || prefs.commuteLat == null || prefs.commuteLon == null) return null;
 
@@ -291,8 +293,8 @@ export async function getCommuteLineFor(
 }
 
 async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: DB, deps: BotDeps): Promise<void> {
-  const prefs = getUserPrefs(db, chatId);
-  if (!prefs) {
+  const profile = getActiveSearchProfile(db, chatId);
+  if (!profile) {
     await telegram.sendMessage(chatId, 'You haven\'t set your preferences yet — send /start to get set up.');
     return;
   }
@@ -301,7 +303,7 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
     await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
     return;
   }
-  const commuteLine = await getCommuteLineFor(db, chatId, card, prefs, deps.computeCommute, deps.geocode);
+  const commuteLine = await getCommuteLineFor(db, chatId, card, profile.prefs, deps.computeCommute, deps.geocode);
   await sendCard(telegram, chatId, card, commuteLine);
 }
 
@@ -426,8 +428,8 @@ async function finishOnboarding(
 ): Promise<void> {
   deleteOnboardingState(db, chatId);
   const parsed = parseOnboardingAnswers(answers);
-  setUserPrefs(db, {
-    chatId, ...parsed,
+  upsertActiveProfilePrefs(db, chatId, {
+    ...parsed, requireElevator: false, requireParking: false,
     commuteDestination: commute.destination, commuteLat: commute.lat, commuteLon: commute.lon,
   });
   await telegram.sendMessage(
@@ -461,7 +463,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
 
   bot.start(async (ctx) => {
     const chatId = ctx.chat.id;
-    if (getUserPrefs(db, chatId)) {
+    if (getActiveSearchProfile(db, chatId)) {
       await ctx.reply(
         'You\'re already set up. /next for a listing, /shortlist to browse what you\'ve liked, ' +
         'or /settings to redo your preferences from scratch.',

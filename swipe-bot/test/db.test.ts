@@ -28,10 +28,11 @@ function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
   };
 }
 
-const defaultPrefs = (chatId: number) => ({
-  chatId, priceFrom: null, priceTo: 800, districts: null,
+const defaultPrefs = (_chatId: number): SearchProfilePrefs => ({
+  priceFrom: null, priceTo: 800, districts: null,
   roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true,
-  includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null,
+  includeWg: true, requireElevator: false, requireParking: false,
+  commuteDestination: null, commuteLat: null, commuteLon: null,
 });
 
 function prefs(overrides: Partial<SearchProfilePrefs> = {}): SearchProfilePrefs {
@@ -74,7 +75,7 @@ test('getAllListingIds returns an empty set for a fresh db', () => {
 test('upsertListing persists description, getCandidateListings round-trips it', () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', district: 6, description: 'Sunny two-room flat near the park.' }));
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   const [row] = getCandidateListings(db, 1, prefs);
   assert.equal(row.description, 'Sunny two-room flat near the park.');
 });
@@ -82,7 +83,7 @@ test('upsertListing persists description, getCandidateListings round-trips it', 
 test('upsertListing stores null description as null, not the string "null"', () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', district: 6, description: null }));
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   const [row] = getCandidateListings(db, 1, prefs);
   assert.equal(row.description, null);
 });
@@ -97,7 +98,7 @@ test('openDb migrates an older database file that predates the description colum
   // Reopening through openDb must not throw, and must add the column back.
   const migrated = openDb(path);
   upsertListing(migrated, listing({ id: 'a', district: 6, description: 'Migrated fine.' }));
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   const [row] = getCandidateListings(migrated, 1, prefs);
   assert.equal(row.description, 'Migrated fine.');
   migrated.close();
@@ -313,7 +314,7 @@ test('getCandidateListings excludes already-swiped and filters by prefs', () => 
   upsertListing(db, listing({ id: 'wrong-district', price: 500, district: 20 }));
   recordSwipe(db, 1, 'willhaben:cheap', 'pass');
 
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: [6, 7], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: 800, districts: [6, 7], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   const candidates = getCandidateListings(db, 1, prefs);
   assert.deepEqual(candidates.map((c) => c.id), []); // 'cheap' already swiped, 'expensive' over budget, 'wrong-district' filtered
 });
@@ -381,35 +382,36 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
     requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null, isDelisted: false,
+    lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null, mentionsPets: false,
     ...overrides,
   };
 }
 
 test('matchesPrefs: a null listing field always passes price/area/rooms bounds', () => {
-  const prefs = { chatId: 1, priceFrom: 500, priceTo: 800, districts: null, roomsFrom: 1, roomsTo: 3, areaFrom: 30, areaTo: 60 , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: 500, priceTo: 800, districts: null, roomsFrom: 1, roomsTo: 3, areaFrom: 30, areaTo: 60 , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(matchesPrefs(row({ price: null, area: null, rooms: null }), prefs), true);
 });
 
 test('matchesPrefs: an out-of-range price/area/rooms fails', () => {
-  const prefs = { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(matchesPrefs(row({ price: 900 }), prefs), false);
   assert.equal(matchesPrefs(row({ price: 700 }), prefs), true);
 });
 
 test('matchesPrefs: a null district FAILS a district restriction (mirrors the SQL IN clause, no OR-NULL escape hatch)', () => {
-  const prefs = { chatId: 1, priceFrom: null, priceTo: null, districts: [6, 7], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: null, districts: [6, 7], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(matchesPrefs(row({ district: null }), prefs), false);
   assert.equal(matchesPrefs(row({ district: 6 }), prefs), true);
   assert.equal(matchesPrefs(row({ district: 9 }), prefs), false);
 });
 
 test('matchesPrefs: unrestricted prefs (all null) match anything', () => {
-  const prefs = { chatId: 1, priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null , includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(matchesPrefs(row({ price: 5000, area: 5, rooms: 10, district: 23 }), prefs), true);
 });
 
 test('matchesPrefs: includeWaitlistHousing false excludes municipal/waitlist housing, true includes it', () => {
-  const prefs = { chatId: 1, priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null };
+  const prefs = { priceFrom: null, priceTo: null, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null };
   assert.equal(matchesPrefs(row({ requiresWaitlistTicket: true }), prefs), false);
   assert.equal(matchesPrefs(row({ requiresWaitlistTicket: false }), prefs), true);
   assert.equal(matchesPrefs(row({ requiresWaitlistTicket: true }), { ...prefs, includeWaitlistHousing: true }), true);
@@ -420,6 +422,28 @@ test('matchesPrefs: includeWg false excludes WG/shared-flat listings, true inclu
   assert.equal(matchesPrefs(row({ isWg: true }), prefs), false);
   assert.equal(matchesPrefs(row({ isWg: false }), prefs), true);
   assert.equal(matchesPrefs(row({ isWg: true }), { ...prefs, includeWg: true }), true);
+});
+
+test('matchesPrefs requires lift=true when requireElevator is set, excluding null/false', () => {
+  const wantsElevator = prefs({ requireElevator: true });
+  assert.equal(matchesPrefs(row({ lift: true }), wantsElevator), true);
+  assert.equal(matchesPrefs(row({ lift: false }), wantsElevator), false);
+  assert.equal(matchesPrefs(row({ lift: null }), wantsElevator), false);
+});
+
+test('matchesPrefs requires parkingSpaces > 0 when requireParking is set', () => {
+  const wantsParking = prefs({ requireParking: true });
+  assert.equal(matchesPrefs(row({ parkingSpaces: 1 }), wantsParking), true);
+  assert.equal(matchesPrefs(row({ parkingSpaces: 0 }), wantsParking), false);
+  assert.equal(matchesPrefs(row({ parkingSpaces: null }), wantsParking), false);
+});
+
+test('getCandidateListings applies the same elevator/parking filters via SQL', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'has-lift', lift: true }));
+  upsertListing(db, listing({ id: 'no-lift', lift: false }));
+  const results = getCandidateListings(db, 1, prefs({ requireElevator: true }));
+  assert.deepEqual(results.map((r) => r.id), ['willhaben:has-lift']);
 });
 
 test('openDb migrates an older database predating is_wg, backfilling is_wg from stored titles', () => {

@@ -608,7 +608,7 @@ export function removeFromShortlist(db: DB, chatId: number, listingId: string): 
   db.prepare('DELETE FROM shortlist WHERE chat_id = ? AND listing_id = ?').run(chatId, listingId);
 }
 
-export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): ListingRow[] {
+export function getCandidateListings(db: DB, chatId: number, prefs: SearchProfilePrefs): ListingRow[] {
   const clauses: string[] = [
     'l.id NOT IN (SELECT listing_id FROM swipes WHERE chat_id = @chatId)',
     'l.is_delisted = 0',
@@ -632,6 +632,8 @@ export function getCandidateListings(db: DB, chatId: number, prefs: UserPrefs): 
   if (!prefs.includeWg) {
     clauses.push('l.is_wg = 0');
   }
+  if (prefs.requireElevator) { clauses.push('l.lift = 1'); }
+  if (prefs.requireParking) { clauses.push('l.parking_spaces > 0'); }
 
   const rows = db.prepare(`SELECT l.* FROM listings l WHERE ${clauses.join(' AND ')}`).all(params) as Record<string, unknown>[];
   return rows.map(rowToListing);
@@ -653,7 +655,7 @@ export function getListingsByIds(db: DB, ids: string[]): ListingRow[] {
 }
 
 /** Pure equivalent of getCandidateListings's WHERE clause, for filtering an in-memory batch (e.g. a poll's fresh inserts) without a query per listing. Mirrors its null-handling exactly: a null listing field always passes price/area/rooms bounds, but a null district fails a district restriction. */
-export function matchesPrefs(l: ListingRow, prefs: UserPrefs): boolean {
+export function matchesPrefs(l: ListingRow, prefs: SearchProfilePrefs): boolean {
   if (prefs.priceFrom != null && l.price != null && l.price < prefs.priceFrom) return false;
   if (prefs.priceTo != null && l.price != null && l.price > prefs.priceTo) return false;
   if (prefs.areaFrom != null && l.area != null && l.area < prefs.areaFrom) return false;
@@ -665,6 +667,8 @@ export function matchesPrefs(l: ListingRow, prefs: UserPrefs): boolean {
   }
   if (!prefs.includeWaitlistHousing && l.requiresWaitlistTicket) return false;
   if (!prefs.includeWg && l.isWg) return false;
+  if (prefs.requireElevator && l.lift !== true) return false;
+  if (prefs.requireParking && !(l.parkingSpaces != null && l.parkingSpaces > 0)) return false;
   return true;
 }
 

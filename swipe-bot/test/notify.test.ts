@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Telegram } from 'telegraf';
 import { notifyNewMatches, MAX_PUSH_PER_USER } from '../src/notify.js';
-import { openDb, setUserPrefs, MCP_CHAT_ID, type ListingRow, type CommuteTimes } from '../src/db.js';
+import { openDb, createSearchProfile, MCP_CHAT_ID, type ListingRow, type CommuteTimes } from '../src/db.js';
 import type { ComputeCommuteFn, GeocodeFn } from '../src/bot.js';
 
 const FAKE_COMPUTE_COMMUTE: ComputeCommuteFn = async () => ({ walkMinutes: null, transitMinutes: null, transitSummary: null });
@@ -13,7 +13,8 @@ function row(overrides: Partial<ListingRow>): ListingRow {
     id: 'willhaben:1', source: 'willhaben', title: 'Flat', price: 650, pricePerSqm: 15,
     area: 43, rooms: 2, district: 6, isPrivate: true, images: [],
     description: null, url: 'https://x/1', valueFlag: 'fair', firstSeen: '2026-08-01T00:00:00Z',
-    requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null,
+    requiresWaitlistTicket: false, isWg: false, addressLine: null, lat: null, lon: null, isDelisted: false,
+    lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null, mentionsPets: false,
     ...overrides,
   };
 }
@@ -39,7 +40,7 @@ function testTelegram(): { telegram: Telegram; calls: Call[] } {
 
 test('notifyNewMatches does nothing when there are no new listings', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
   await notifyNewMatches(telegram, db, [], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
   assert.equal(calls.length, 0);
@@ -47,7 +48,7 @@ test('notifyNewMatches does nothing when there are no new listings', async () =>
 
 test('notifyNewMatches pushes a matching listing to a user whose prefs it satisfies', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
@@ -58,7 +59,7 @@ test('notifyNewMatches pushes a matching listing to a user whose prefs it satisf
 
 test('notifyNewMatches skips a user whose prefs the listing does not satisfy', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 900 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
@@ -68,7 +69,7 @@ test('notifyNewMatches skips a user whose prefs the listing does not satisfy', a
 
 test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: MCP_CHAT_ID, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, MCP_CHAT_ID, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
@@ -78,7 +79,7 @@ test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
 
 test('notifyNewMatches caps the burst per user and mentions the remainder', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700 }));
@@ -94,7 +95,7 @@ test('notifyNewMatches caps the burst per user and mentions the remainder', asyn
 
 test('notifyNewMatches never pushes municipal/waitlist housing to a user who opted out', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, requiresWaitlistTicket: true })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
@@ -104,7 +105,7 @@ test('notifyNewMatches never pushes municipal/waitlist housing to a user who opt
 
 test('notifyNewMatches includes the commute line on a pushed card when the user has a commute destination set', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
   const { telegram, calls } = testTelegram();
   const computeCommute: ComputeCommuteFn = async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' });
 
@@ -116,7 +117,7 @@ test('notifyNewMatches includes the commute line on a pushed card when the user 
 
 test('notifyNewMatches caches the commute computation across the same (chat, listing) pair', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 });
   const { telegram } = testTelegram();
   let calls = 0;
   const computeCommute: ComputeCommuteFn = async (): Promise<CommuteTimes> => { calls++; return { walkMinutes: 10, transitMinutes: null, transitSummary: null }; };
@@ -130,8 +131,8 @@ test('notifyNewMatches caches the commute computation across the same (chat, lis
 
 test('notifyNewMatches sends separate, independent pushes to different matching users', async () => {
   const db = openDb(':memory:');
-  setUserPrefs(db, { chatId: 1, priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
-  setUserPrefs(db, { chatId: 2, priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  createSearchProfile(db, 2, 'Test', { priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
   const { telegram, calls } = testTelegram();
 
   await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);

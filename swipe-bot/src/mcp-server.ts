@@ -5,8 +5,8 @@ import { z } from 'zod';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  type DB, type ListingRow, type UserPrefs,
-  openDb, recordSwipe, getShortlist, getUserPrefs, setUserPrefs, MCP_CHAT_ID,
+  type DB, type ListingRow, type SearchProfilePrefs,
+  openDb, recordSwipe, getShortlist, getActiveSearchProfile, upsertActiveProfilePrefs, MCP_CHAT_ID,
 } from './db.js';
 import { nextCardFor, getCommuteLineFor, type GeocodeFn, type ComputeCommuteFn } from './bot.js';
 import { geocode as realGeocode, computeCommute as realComputeCommute } from './commute.js';
@@ -46,10 +46,12 @@ interface PrefsArgs {
   area_to?: number;
   include_waitlist_housing?: boolean;
   include_wg?: boolean;
+  require_elevator?: boolean;
+  require_parking?: boolean;
 }
 
 /** Maps the non-commute fields; commute_destination needs an async geocode call, handled separately in the swipe_set_prefs handler. */
-export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId' | 'commuteDestination' | 'commuteLat' | 'commuteLon'> {
+export function mapPrefsArgs(args: PrefsArgs): Omit<SearchProfilePrefs, 'commuteDestination' | 'commuteLat' | 'commuteLon'> {
   return {
     priceTo: args.price_to,
     priceFrom: args.price_from ?? null,
@@ -60,6 +62,8 @@ export function mapPrefsArgs(args: PrefsArgs): Omit<UserPrefs, 'chatId' | 'commu
     areaTo: args.area_to ?? null,
     includeWaitlistHousing: args.include_waitlist_housing ?? true,
     includeWg: args.include_wg ?? false,
+    requireElevator: args.require_elevator ?? false,
+    requireParking: args.require_parking ?? false,
   };
 }
 
@@ -72,8 +76,8 @@ function errorResult(err: unknown) {
 }
 
 async function cardWithCommute(db: DB, deps: McpDeps, card: ListingRow) {
-  const prefs = getUserPrefs(db, MCP_CHAT_ID);
-  const commuteLine = prefs ? await getCommuteLineFor(db, MCP_CHAT_ID, card, prefs, deps.computeCommute, deps.geocode) : null;
+  const profile = getActiveSearchProfile(db, MCP_CHAT_ID);
+  const commuteLine = profile ? await getCommuteLineFor(db, MCP_CHAT_ID, card, profile.prefs, deps.computeCommute, deps.geocode) : null;
   return formatCardPayload(card, commuteLine);
 }
 
@@ -90,7 +94,7 @@ function buildServer(db: DB, deps: McpDeps): McpServer {
     },
     async () => {
       try {
-        if (!getUserPrefs(db, MCP_CHAT_ID)) {
+        if (!getActiveSearchProfile(db, MCP_CHAT_ID)) {
           return jsonResult({ message: 'No preferences set yet — call swipe_set_prefs first.' });
         }
         const card = nextCardFor(db, MCP_CHAT_ID);
@@ -158,6 +162,12 @@ function buildServer(db: DB, deps: McpDeps): McpServer {
           'Include WG-Zimmer (shared-flat rooms), co-living, and student rooms — not whole apartments? ' +
           'Defaults to false.'
         ),
+        require_elevator: z.boolean().optional().describe(
+          'Only show listings with a confirmed elevator/lift? Defaults to false (no requirement).'
+        ),
+        require_parking: z.boolean().optional().describe(
+          'Only show listings with at least one confirmed parking space? Defaults to false (no requirement).'
+        ),
         commute_destination: z.string().optional().describe(
           'Daily commute destination, e.g. "TU Wien" or an address. Geocoded server-side; every future ' +
           'card will show walk/transit ETAs to it. Omit to clear any previously set destination.'
@@ -173,7 +183,7 @@ function buildServer(db: DB, deps: McpDeps): McpServer {
           if (!point) return errorResult(new Error(`couldn't find location "${args.commute_destination}"`));
           commute = { commuteDestination: args.commute_destination, commuteLat: point.lat, commuteLon: point.lon };
         }
-        setUserPrefs(db, { chatId: MCP_CHAT_ID, ...mapPrefsArgs(args), ...commute });
+        upsertActiveProfilePrefs(db, MCP_CHAT_ID, { ...mapPrefsArgs(args), ...commute });
         return jsonResult({ saved: true });
       } catch (err) {
         return errorResult(err);
