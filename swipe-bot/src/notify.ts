@@ -4,7 +4,7 @@ import {
   getAllSearchProfiles, getSwipedWithDirection, matchesPrefs, MCP_CHAT_ID,
 } from './db.js';
 import { rankListings } from './scoring.js';
-import type { ComputeCommuteFn, GeocodeFn } from './bot.js';
+import { getCommuteLineFor, type ComputeCommuteFn, type GeocodeFn } from './bot.js';
 
 /** Caps a single push burst per user — protects against a preference change (or a big poll) flooding a chat. */
 export const MAX_PUSH_PER_USER = 5;
@@ -23,18 +23,21 @@ const realDelay: DelayFn = (ms) => new Promise((resolve) => setTimeout(resolve, 
 
 /**
  * Pure — one compact line per listing for a push notification's body: title, price, size/rooms/district,
- * link. Local to this file: pushes are the only remaining surface needing a compact multi-listing format
- * now that /shortlist keeps its existing card-based Prev/Next/Remove browsing (see Task 9's revision note),
- * so nothing is shared with or imported from bot.ts here.
+ * an optional appended commute line, and the link. Local to this file: pushes are the only remaining
+ * surface needing a compact multi-listing format now that /shortlist keeps its existing card-based
+ * Prev/Next/Remove browsing (see Task 9's revision note), so nothing is shared with or imported from
+ * bot.ts here — `commuteLine` is a plain string computed by the caller via bot.ts's getCommuteLineFor
+ * helper, not a shared formatter.
  */
-export function formatPushEntry(l: ListingRow): string {
-  const price = l.price != null ? `€${l.price}` : 'price n/a';
-  const details = [
+export function formatPushEntry(l: ListingRow, commuteLine: string | null = null): string {
+  const parts = [
+    l.price != null ? `€${l.price}` : 'price n/a',
     l.area != null ? `${l.area}m²` : null,
     l.rooms != null ? `${l.rooms} rooms` : null,
     l.district != null ? `district ${l.district}` : null,
   ].filter(Boolean).join(' · ');
-  return `${l.title}\n${price} · ${details}\n${l.url}`;
+  const commuteSuffix = commuteLine ? `\n${commuteLine}` : '';
+  return `${l.title}\n${parts}${commuteSuffix}\n${l.url}`;
 }
 
 /**
@@ -46,6 +49,10 @@ export function formatPushEntry(l: ListingRow): string {
  * matching profile gets a header (naming the profile, since Tasks 7-9 let one chat hold several
  * saved searches) followed by one compact-entries message capped at MAX_PUSH_PER_USER, with a
  * stagger between profiles to avoid Telegram flood-control on chats with multiple active searches.
+ * The grouping/stagger/cap is what controls Telegram message *count* — it says nothing about how
+ * much work backs each message, so each shown listing still gets its commute line computed via
+ * bot.ts's getCommuteLineFor (same as /next), and this remains the only poll-time caller that warms
+ * the commute cache and backfills listing coordinates ahead of the user's next /next.
  *
  * Product decision (flagged by Task 3's review, resolved here): getAllSearchProfiles returns every
  * saved profile for a chat regardless of its `active` flag, and this function deliberately does not
@@ -63,11 +70,6 @@ export async function notifyNewMatches(
   delay: DelayFn = realDelay,
 ): Promise<void> {
   if (newListings.length === 0) return;
-  // computeCommute/geocode are accepted (unused) to keep this signature stable for index.ts's call
-  // site — pushes intentionally skip commute computation to stay fast during a burst; commute lines
-  // remain available via /next and /shortlist, which already cache per (profile, listing) pair.
-  void computeCommute;
-  void geocode;
 
   let first = true;
   for (const profile of getAllSearchProfiles(db)) {
@@ -81,7 +83,18 @@ export async function notifyNewMatches(
 
     const ranked = rankListings(matches, getSwipedWithDirection(db, profile.chatId));
     const toShow = ranked.slice(0, MAX_PUSH_PER_USER);
-    const entries = toShow.map(formatPushEntry).join('\n\n');
+    const entries = (await Promise.all(toShow.map(async (l) => {
+      // A single Routes API failure must degrade this one listing to no commute line, not abort the
+      // whole profile's push (the old pre-Task-10 caller effectively could, since it awaited commute
+      // inline with no isolation between listings) — genuinely more resilient than prior behavior.
+      let commuteLine: string | null = null;
+      try {
+        commuteLine = await getCommuteLineFor(db, profile.id, l, profile.prefs, computeCommute, geocode);
+      } catch {
+        commuteLine = null;
+      }
+      return formatPushEntry(l, commuteLine);
+    }))).join('\n\n');
     const remainder = matches.length > toShow.length ? `\n\n+${matches.length - toShow.length} more — check /next.` : '';
 
     await telegram.sendMessage(profile.chatId, `🏠 ${profile.name} — ${matches.length} new match${matches.length === 1 ? '' : 'es'}:`);
