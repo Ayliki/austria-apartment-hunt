@@ -49,12 +49,24 @@ export const MAIN_KEYBOARD = Markup.keyboard([['⏭ Next', '📋 Shortlist', '�
 /** Every locale key `renderWizardStep`/`wizardStrings` needs resolved for the chat's language, fetched once per render. */
 const WIZARD_STRING_KEYS = [
   'wizard_progress', 'wizard_name_prompt', 'wizard_budget_prompt', 'wizard_districts_prompt', 'wizard_rooms_prompt',
-  'wizard_amenities_prompt', 'wizard_commute_prompt', 'btn_skip', 'btn_back', 'btn_continue', 'btn_custom_range',
+  'wizard_amenities_prompt', 'wizard_commute_prompt', 'btn_skip', 'btn_back', 'btn_continue',
   'amenity_elevator', 'amenity_parking', 'amenity_include_waitlist', 'amenity_include_wg',
 ] as const;
 
-function wizardStrings(db: DB, chatId: number): Record<string, string> {
-  return Object.fromEntries(WIZARD_STRING_KEYS.map((k) => [k, t(db, chatId, k)]));
+/**
+ * Resolves every wizard-screen locale key for the chat's language, substituting `params` into
+ * whichever keys need them (`wizard_progress`'s `{step}`/`{total}`, `wizard_name_prompt`'s `{n}`).
+ * Without `params`, `t()` leaves an unmatched `{placeholder}` in the output verbatim (see locales.ts)
+ * — every call site below must pass `wizardParams` for the state actually being rendered so screens
+ * never show a literal `Step {step}/{total}`.
+ */
+function wizardStrings(db: DB, chatId: number, params: Record<string, string | number> = {}): Record<string, string> {
+  return Object.fromEntries(WIZARD_STRING_KEYS.map((k) => [k, t(db, chatId, k, params)]));
+}
+
+/** Builds the `{step}`/`{total}`/`{n}` params `wizardStrings` needs for rendering `state` — one place so every render call site stays in sync. */
+function wizardParams(db: DB, chatId: number, state: WizardState): Record<string, string | number> {
+  return { step: state.stepIndex + 1, total: WIZARD_STEPS.length, n: countSearchProfiles(db, chatId) + 1 };
 }
 
 /**
@@ -91,7 +103,7 @@ export function renderWizardStep(state: WizardState, strings: Record<string, str
         text: `${progress}\n\n${strings.wizard_rooms_prompt}`,
         keyboard: Markup.inlineKeyboard([
           [Markup.button.callback('1', 'wizard:rooms:1:1'), Markup.button.callback('2', 'wizard:rooms:2:2'), Markup.button.callback('3+', 'wizard:rooms:3:')],
-          [Markup.button.callback(strings.btn_custom_range, 'wizard:rooms_custom')],
+          [Markup.button.callback('Any', 'wizard:rooms_any')],
           backRow,
         ].filter((r) => r.length > 0)),
       };
@@ -476,9 +488,17 @@ export function formatAggregateSummary(profile: SearchProfile, s: ReturnType<typ
 export async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
   const candidates = getCandidateListings(db, profile.chatId, profile.prefs);
   if (candidates.length === 0) {
+    // lift/parkingSpaces are only ever populated from immoscout's detail fetch (never willhaben,
+    // and only for a capped batch of newly-enriched listings per poll — see db.ts's ListingRow doc
+    // comment), so requiring either can silently starve the deck to near-empty with no explanation.
+    // Hardcoded English (not threaded through t()) is a deliberate, deferred i18n gap for this one
+    // message — see the review ledger.
+    const elevatorParkingNote = (profile.prefs.requireElevator || profile.prefs.requireParking)
+      ? ' Note: elevator/parking data is only available for some listings, so this filter may be more restrictive than it looks.'
+      : '';
     await telegram.sendMessage(
       profile.chatId,
-      `🏠 ${profile.name}: no matches yet — I'll message you here as soon as something matches.`,
+      `🏠 ${profile.name}: no matches yet — I'll message you here as soon as something matches.${elevatorParkingNote}`,
       MAIN_KEYBOARD,
     );
     return;
@@ -500,7 +520,7 @@ async function startWizard(telegram: Telegraf['telegram'], db: DB, chatId: numbe
   }
   const state = initialWizardState();
   setWizardState(db, chatId, state);
-  const { text, keyboard } = renderWizardStep(state, wizardStrings(db, chatId));
+  const { text, keyboard } = renderWizardStep(state, wizardStrings(db, chatId, wizardParams(db, chatId, state)));
   await telegram.sendMessage(chatId, text, keyboard);
 }
 
@@ -524,7 +544,15 @@ const SETTINGS_FIELD_BUTTONS: [string, WizardStepId][] = [
  * directly in the `text` listener since those two steps bypass advanceWizard entirely).
  */
 function finalizeFieldEdit(db: DB, chatId: number, editingProfileId: number, next: WizardState): string {
-  const profile = getSearchProfile(db, editingProfileId)!;
+  const profile = getSearchProfile(db, editingProfileId);
+  // TOCTOU: the profile being edited can be deleted (via /searches) between opening the edit
+  // session and tapping the wizard chip that finalizes it. Treat that as a graceful no-op rather
+  // than crashing on a non-null assertion — the wizard state must still be cleared either way, or
+  // the chat is left permanently stuck believing it's mid-edit for a profile that no longer exists.
+  if (!profile) {
+    deleteWizardState(db, chatId);
+    return 'That search no longer exists.';
+  }
   updateSearchProfile(db, profile.id, { ...profile.prefs, ...next.partial });
   if (next.profileName && next.profileName !== profile.name) renameSearchProfile(db, profile.id, next.profileName);
   deleteWizardState(db, chatId);
@@ -576,7 +604,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       if (next.stepIndex === current.stepIndex) {
         setWizardState(db, chatId, next);
         await ctx.answerCbQuery();
-        const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId));
+        const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId, wizardParams(db, chatId, next)));
         await ctx.editMessageText(text, keyboard);
         return;
       }
@@ -596,7 +624,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     }
     setWizardState(db, chatId, next);
     await ctx.answerCbQuery();
-    const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId));
+    const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId, wizardParams(db, chatId, next)));
     await ctx.editMessageText(text, keyboard);
   }
 
@@ -658,6 +686,9 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery('That search no longer exists.'); return; }
     setActiveSearchProfile(db, chatId, profileId);
     await ctx.answerCbQuery('Switched.');
+    // /help promises switching to a search with matches waiting sends the activation summary — this
+    // is that promise's only call site for the switch path (wizard completion is the other one).
+    await sendProfileActivationSummary(ctx.telegram, db, profile);
   });
 
   bot.action(/^deleteprofile:(\d+)$/, async (ctx) => {
@@ -696,7 +727,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const state: WizardState = { stepIndex, profileName: profile.name, partial: profile.prefs, editingProfileId: profileId };
     setWizardState(db, ctx.chat!.id, state);
     await ctx.answerCbQuery();
-    const { text, keyboard } = renderWizardStep(state, wizardStrings(db, ctx.chat!.id));
+    const { text, keyboard } = renderWizardStep(state, wizardStrings(db, ctx.chat!.id, wizardParams(db, ctx.chat!.id, state)));
     await ctx.editMessageText(text, keyboard);
   });
 
@@ -749,13 +780,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   bot.action('wizard:districts_continue', (ctx) => advanceWizard(ctx, { kind: 'districts_continue' }));
   bot.action(/^wizard:rooms:(\d+):(\d*)$/, (ctx) => {
     const [, fromRaw, toRaw] = ctx.match;
-    return advanceWizard(ctx, { kind: 'rooms_size', roomsFrom: Number(fromRaw), roomsTo: toRaw === '' ? null : Number(toRaw), areaFrom: null, areaTo: null });
+    return advanceWizard(ctx, { kind: 'rooms_size', roomsFrom: Number(fromRaw), roomsTo: toRaw === '' ? null : Number(toRaw) });
   });
-  // No wizard step currently prompts for a custom rooms/size range via free text — the button exists
-  // (renderWizardStep's "Custom range ▸" chip) so the keyboard reads clearly, but tapping it today
-  // just clears the tap's loading spinner rather than hanging forever unanswered. A future task can
-  // wire it to an actual free-text prompt if the fixed 1/2/3+ chips prove too coarse in practice.
-  bot.action('wizard:rooms_custom', (ctx) => ctx.answerCbQuery('Custom ranges aren\'t supported yet — pick 1, 2, or 3+.'));
+  // "Any" — no room-count restriction at all, the escape hatch the fixed 1/2/3+ chips otherwise lack.
+  bot.action('wizard:rooms_any', (ctx) => advanceWizard(ctx, { kind: 'rooms_size', roomsFrom: null, roomsTo: null }));
   bot.action(/^wizard:amenity:(requireElevator|requireParking|includeWaitlistHousing|includeWg)$/, (ctx) =>
     advanceWizard(ctx, { kind: 'amenity_toggle', field: ctx.match[1] as 'requireElevator' | 'requireParking' | 'includeWaitlistHousing' | 'includeWg' })
   );
@@ -793,7 +821,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       setWizardState(db, chatId, next);
       // First render of a new step after free text can't edit-in-place (no prior bot message to
       // edit) — sends fresh. Every step after this one edits in place via the callback handlers above.
-      const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId));
+      const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId, wizardParams(db, chatId, next)));
       await ctx.reply(text, keyboard);
       return;
     }

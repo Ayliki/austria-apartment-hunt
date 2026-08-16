@@ -8,7 +8,7 @@ import {
 import type { CommuteTimes } from '../src/db.js';
 import {
   openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
-  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, type ListingRow, type DB, type SearchProfilePrefs,
+  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, type ListingRow, type DB, type SearchProfilePrefs,
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
@@ -342,6 +342,31 @@ test('/start with no existing profiles begins the wizard at the name step', asyn
   assert.deepEqual(getWizardState(db, 1), initialWizardState());
 });
 
+// --- Final-review fix wave: cross-task findings ---
+
+test('the wizard progress header substitutes {step}/{total} with real numbers, not the literal placeholders', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start')); // name step (step 1 of 6)
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts[1], /^Step 1\/6/);
+  assert.doesNotMatch(texts[1], /\{step\}|\{total\}/);
+
+  await bot.handleUpdate(textUpdate(1, 'My Search')); // -> budget step (step 2 of 6)
+  const laterTexts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(laterTexts.at(-1) as string, /^Step 2\/6/);
+});
+
+test('the name-step "Skip" suggestion substitutes {n} with the next profile number, not the literal placeholder', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Existing Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:new')); // starts a second search -> "Search 2" suggestion
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /Search 2/);
+  assert.doesNotMatch(texts.at(-1) as string, /\{n\}/);
+});
+
 test('/start when a profile already exists tells the user to use /searches or /settings instead of re-onboarding', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', defaultPrefs());
@@ -660,6 +685,18 @@ test('/searches with no profiles points at /start instead of showing an empty li
   assert.match(reply.payload.text as string, /\/start/);
 });
 
+test('switching profiles sends the activation summary, matching what /help promises', async () => {
+  const db = openDb(':memory:');
+  const first = createSearchProfile(db, 1, 'Studio Center', defaultPrefs(), false);
+  createSearchProfile(db, 1, 'Family Flat', defaultPrefs(), true);
+  upsertListing(db, listing({ id: 'a', price: 500 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `switchprofile:${first.id}`));
+
+  const summaryCall = calls.find((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('Studio Center'));
+  assert.ok(summaryCall, 'expected sendProfileActivationSummary to have been triggered on switch');
+});
+
 test('tapping switchprofile:<id> makes that profile active', async () => {
   const db = openDb(':memory:');
   const first = createSearchProfile(db, 1, 'Studio Center', defaultPrefs(), false);
@@ -804,6 +841,56 @@ test('editing the districts field requires its own Continue tap before saving, j
   assert.match(confirmations.at(-1) as string, /Updated "My Search"/);
 });
 
+test('editing only the rooms/size field via /settings does not wipe an existing area filter', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ areaFrom: 30, areaTo: 60, roomsFrom: null, roomsTo: null }));
+  const { bot } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:rooms_size`));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms:2:2')); // pick "2 rooms" — must not touch area
+
+  const updated = getActiveSearchProfile(db, 1)!;
+  assert.equal(updated.prefs.roomsFrom, 2);
+  assert.equal(updated.prefs.roomsTo, 2);
+  assert.equal(updated.prefs.areaFrom, 30); // unchanged
+  assert.equal(updated.prefs.areaTo, 60); // unchanged
+});
+
+test('the rooms/size step offers an "Any" chip with no room-count restriction, and no longer offers a dead-end "Custom range" chip', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ roomsFrom: 2, roomsTo: 2 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:rooms_size`));
+
+  const edit = calls.find((c) => c.method === 'editMessageText')!;
+  const keyboard = (edit.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const flat = keyboard.flat();
+  assert.ok(!flat.some((b) => /custom range/i.test(b.text)), 'no dead-end "Custom range" chip should be offered');
+  assert.ok(flat.some((b) => b.text === 'Any' && b.callback_data === 'wizard:rooms_any'));
+
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:rooms_any'));
+  const updated = getActiveSearchProfile(db, 1)!;
+  assert.equal(updated.prefs.roomsFrom, null);
+  assert.equal(updated.prefs.roomsTo, null);
+});
+
+test('the budget step offers a "no minimum" chip below the lowest fixed band', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:budget`));
+
+  const edit = calls.find((c) => c.method === 'editMessageText')!;
+  const keyboard = (edit.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const flat = keyboard.flat();
+  const noMinButton = flat.find((b) => b.text === 'Under €500');
+  assert.ok(noMinButton, 'expected an "Under €500" / no-minimum chip on the budget step');
+
+  await bot.handleUpdate(callbackUpdate(1, noMinButton!.callback_data));
+  const updated = getActiveSearchProfile(db, 1)!;
+  assert.equal(updated.prefs.priceFrom, null);
+  assert.equal(updated.prefs.priceTo, 500);
+});
+
 test('editing the name field via free text updates only the name, not the rest of the profile', async () => {
   const db = openDb(':memory:');
   const profile = createSearchProfile(db, 1, 'Old Name', defaultPrefs({ priceTo: 900 }));
@@ -849,6 +936,21 @@ test('a Back tap during a single-field edit cancels the edit rather than saving 
   assert.equal(getActiveSearchProfile(db, 1)!.prefs.priceTo, 800); // unchanged
   const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
   assert.match(edits.at(-1) as string, /cancel/i);
+});
+
+test('finalizing a single-field edit whose profile was deleted mid-session (TOCTOU) is handled gracefully, not a crash, and clears the stale wizard state', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ priceTo: 800 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:budget`)); // opens the edit session
+
+  deleteSearchProfile(db, profile.id); // the profile is deleted out from under the in-progress edit
+
+  await assert.doesNotReject(bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'))); // tap a chip to finish the (now-orphaned) edit
+
+  assert.equal(getWizardState(db, 1), null); // stale edit session cleared, not left stuck
+  const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(edits.at(-1) as string, /no longer exists/i);
 });
 
 // --- Task 7 review fixes ---
@@ -1332,6 +1434,28 @@ test('sendProfileActivationSummary sends a "no matches yet" message with no inli
   const reply_markup = calls[0].payload.reply_markup as { keyboard?: unknown; inline_keyboard?: unknown };
   assert.equal(reply_markup.inline_keyboard, undefined);
   assert.deepEqual(reply_markup.keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('sendProfileActivationSummary\'s "no matches yet" message explains that elevator/parking data is incomplete, when either filter is active', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Accessible Search', defaultPrefs({ requireElevator: true }));
+  const profile = getSearchProfiles(db, 1)[0];
+  const { bot, calls } = createTestBot(db);
+
+  await sendProfileActivationSummary(bot.telegram, db, profile);
+
+  assert.match(calls[0].payload.text as string, /elevator\/parking data is only available for some listings/i);
+});
+
+test('sendProfileActivationSummary\'s "no matches yet" message omits the elevator/parking note when neither filter is active', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Plain Search', defaultPrefs());
+  const profile = getSearchProfiles(db, 1)[0];
+  const { bot, calls } = createTestBot(db);
+
+  await sendProfileActivationSummary(bot.telegram, db, profile);
+
+  assert.doesNotMatch(calls[0].payload.text as string, /elevator\/parking/i);
 });
 
 test('tapping browse:<profileId> calls sendNextCard for that profile\'s chat', async () => {
