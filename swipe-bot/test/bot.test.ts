@@ -6,7 +6,7 @@ import {
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
-  openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
+  openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
   getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, type ListingRow, type DB, type SearchProfilePrefs,
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
@@ -780,6 +780,65 @@ test('a Back tap during a single-field edit cancels the edit rather than saving 
   assert.equal(getActiveSearchProfile(db, 1)!.prefs.priceTo, 800); // unchanged
   const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
   assert.match(edits.at(-1) as string, /cancel/i);
+});
+
+// --- Task 7 review fixes ---
+
+test('tapping Skip during a single-field name edit cancels the edit instead of renaming the profile to a generic default', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Real Name', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:name`));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:name_skip'));
+
+  assert.equal(getWizardState(db, 1), null); // edit session closed
+  assert.equal(getActiveSearchProfile(db, 1)!.name, 'My Real Name'); // not renamed to "Search N"
+  const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(edits.at(-1) as string, /cancel/i);
+});
+
+test('tapping Skip on the name step during the full onboarding wizard still applies a generated default name', async () => {
+  const db = openDb(':memory:');
+  const { bot } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start'));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:name_skip'));
+
+  const state = getWizardState(db, 1);
+  assert.ok(state, 'still mid full wizard, not finalized yet');
+  assert.equal(state!.profileName, 'Search 1');
+});
+
+test('a stale switchprofile: tap for an already-deleted profile does not touch the active profile', async () => {
+  const db = openDb(':memory:');
+  const active = createSearchProfile(db, 1, 'Active One', defaultPrefs(), true);
+  const doomed = createSearchProfile(db, 1, 'Doomed', defaultPrefs(), false);
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `deleteprofile:${doomed.id}`));
+  await bot.handleUpdate(callbackUpdate(1, `switchprofile:${doomed.id}`)); // stale tap on the deleted profile's old button
+
+  assert.equal(getActiveSearchProfile(db, 1)!.id, active.id); // still active, not left with none
+  const answers = calls.filter((c) => c.method === 'answerCallbackQuery').map((c) => c.payload.text as string);
+  assert.match(answers.at(-1) as string, /no longer exists/i);
+});
+
+test('deleteprofile: and editfield: refuse to act on a profile belonging to a different chat (cross-chat IDOR)', async () => {
+  const db = openDb(':memory:');
+  const victim = createSearchProfile(db, 42, 'Chat A Search', defaultPrefs({ priceTo: 900 }));
+  const { bot: deleteBot, calls: deleteCalls } = createTestBot(db);
+  await deleteBot.handleUpdate(callbackUpdate(999, `deleteprofile:${victim.id}`)); // acting as a different chat
+
+  assert.equal(getSearchProfiles(db, 42).length, 1, "victim chat's profile must survive"); // not deleted
+  const deleteAnswers = deleteCalls.filter((c) => c.method === 'answerCallbackQuery').map((c) => c.payload.text as string);
+  assert.match(deleteAnswers.at(-1) as string, /no longer exists/i);
+
+  const { bot: editBot, calls: editCalls } = createTestBot(db);
+  await editBot.handleUpdate(callbackUpdate(999, `editfield:${victim.id}:budget`)); // acting as a different chat
+  await editBot.handleUpdate(callbackUpdate(999, 'wizard:budget:700:900'));
+
+  assert.equal(getSearchProfile(db, victim.id)!.prefs.priceTo, 900); // untouched by the attempted edit
+  assert.equal(getWizardState(db, 999), null); // no edit session was ever established for the attacking chat
+  const editAnswers = editCalls.filter((c) => c.method === 'answerCallbackQuery').map((c) => c.payload.text as string);
+  assert.match(editAnswers[0], /no longer exists/i);
 });
 
 const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };

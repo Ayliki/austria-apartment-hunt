@@ -600,13 +600,19 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   });
 
   bot.action(/^switchprofile:(\d+)$/, async (ctx) => {
-    setActiveSearchProfile(db, ctx.chat!.id, Number(ctx.match[1]));
+    const chatId = ctx.chat!.id;
+    const profileId = Number(ctx.match[1]);
+    const profile = getSearchProfile(db, profileId);
+    if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery('That search no longer exists.'); return; }
+    setActiveSearchProfile(db, chatId, profileId);
     await ctx.answerCbQuery('Switched.');
   });
 
   bot.action(/^deleteprofile:(\d+)$/, async (ctx) => {
     const chatId = ctx.chat!.id;
     const profileId = Number(ctx.match[1]);
+    const target = getSearchProfile(db, profileId);
+    if (!target || target.chatId !== chatId) { await ctx.answerCbQuery('This search no longer exists.'); return; }
     const wasActive = getActiveSearchProfile(db, chatId)?.id === profileId;
     deleteSearchProfile(db, profileId);
     await ctx.answerCbQuery('Deleted.');
@@ -633,7 +639,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const [, profileIdRaw, field] = ctx.match;
     const profileId = Number(profileIdRaw);
     const profile = getSearchProfile(db, profileId);
-    if (!profile) { await ctx.answerCbQuery('This search no longer exists.'); return; }
+    if (!profile || profile.chatId !== ctx.chat!.id) { await ctx.answerCbQuery('This search no longer exists.'); return; }
     const stepIndex = WIZARD_STEPS.indexOf(field as WizardStepId);
     const state: WizardState = { stepIndex, profileName: profile.name, partial: profile.prefs, editingProfileId: profileId };
     setWizardState(db, ctx.chat!.id, state);
@@ -669,7 +675,20 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
   });
 
   bot.action('wizard:back', (ctx) => advanceWizard(ctx, { kind: 'back' }));
-  bot.action('wizard:name_skip', (ctx) => advanceWizard(ctx, { kind: 'name', name: `Search ${countSearchProfiles(db, ctx.chat!.id) + 1}` }));
+  bot.action('wizard:name_skip', async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const current = getWizardState(db, chatId);
+    if (current?.editingProfileId != null) {
+      // Single-field edit mode: Skip means "leave the name as it is", not "generate a new default
+      // name" — the latter would silently overwrite the profile's real name via finalizeFieldEdit's
+      // rename-on-mismatch logic. Treat it exactly like Back: cancel the edit, don't touch the name.
+      deleteWizardState(db, chatId);
+      await ctx.answerCbQuery();
+      await ctx.editMessageText('Edit cancelled.');
+      return;
+    }
+    await advanceWizard(ctx, { kind: 'name', name: `Search ${countSearchProfiles(db, chatId) + 1}` });
+  });
   bot.action(/^wizard:budget:(-?\d*):(-?\d+|Infinity)$/, (ctx) => {
     const [, fromRaw, toRaw] = ctx.match;
     return advanceWizard(ctx, { kind: 'budget', priceFrom: fromRaw === '' ? null : Number(fromRaw), priceTo: toRaw === 'Infinity' ? Infinity : Number(toRaw) });
