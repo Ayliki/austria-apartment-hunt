@@ -1311,6 +1311,12 @@ test('sendProfileActivationSummary sends the aggregate summary with a single Bro
   const navCall = calls.find((c) => c.method === 'sendMessage' && (c.payload.reply_markup as { keyboard?: unknown } | undefined)?.keyboard);
   assert.ok(navCall, 'expected a message restoring MAIN_KEYBOARD');
   assert.deepEqual((navCall!.payload.reply_markup as { keyboard: string[][] }).keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+
+  // The nav-restore (MAIN_KEYBOARD) message must be sent BEFORE the summary+Browse-button message,
+  // so the Browse button — the actual call-to-action — is the last/most prominent thing in the chat.
+  const navIndex = calls.indexOf(navCall!);
+  const summaryIndex = calls.indexOf(summaryCall!);
+  assert.ok(navIndex < summaryIndex, 'expected the MAIN_KEYBOARD nav-restore message to be sent before the summary+Browse message');
 });
 
 test('sendProfileActivationSummary sends a "no matches yet" message with no inline button when candidates is empty, and still attaches MAIN_KEYBOARD', async () => {

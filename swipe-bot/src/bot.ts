@@ -478,10 +478,12 @@ export function formatAggregateSummary(profile: SearchProfile, s: ReturnType<typ
  * wizard-completing-via-buttons user gets `MAIN_KEYBOARD` (the persistent ⏭ Next / 📋 Shortlist /
  * ⚙️ Settings nav bar) re-attached to their chat. Telegram's `reply_markup` is a closed union — a
  * single message can carry an inline keyboard (the Browse button) OR a persistent reply keyboard
- * (MAIN_KEYBOARD), never both — so when there are matches, restoring the nav bar takes a second,
- * short message rather than being bolted onto the summary message itself. Both branches below MUST
- * keep sending a `MAIN_KEYBOARD`-carrying message — dropping it silently removes the nav bar for
- * every button-wizard user.
+ * (MAIN_KEYBOARD), never both — so when there are matches, restoring the nav bar takes a short lead-in
+ * message SENT FIRST, with the summary + Browse button sent LAST so the call-to-action is the most
+ * recent/prominent thing in the chat (Telegram's reply keyboard is chat-global and doesn't need to be
+ * attached to the final message to take effect). Both branches below MUST keep sending a
+ * `MAIN_KEYBOARD`-carrying message — dropping it silently removes the nav bar for every button-wizard
+ * user.
  */
 export async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
   const candidates = getCandidateListings(db, profile.chatId, profile.prefs);
@@ -494,12 +496,12 @@ export async function sendProfileActivationSummary(telegram: Telegraf['telegram'
     return;
   }
   const summary = summarizeMatches(candidates);
+  await telegram.sendMessage(profile.chatId, "Here's what's already out there for it:", MAIN_KEYBOARD);
   await telegram.sendMessage(
     profile.chatId,
     formatAggregateSummary(profile, summary),
     Markup.inlineKeyboard([[Markup.button.callback('Browse top matches ▸', `browse:${profile.id}`)]]),
   );
-  await telegram.sendMessage(profile.chatId, 'Use the buttons below anytime.', MAIN_KEYBOARD);
 }
 
 /** Starts a brand-new wizard run for `chatId`: refuses once the chat is at MAX_SEARCH_PROFILES_PER_CHAT, otherwise resets wizard state to step 0 and sends its prompt. Shared by /start (first-time setup) and the "+ Add another search" button from /searches. */
