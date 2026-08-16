@@ -130,10 +130,17 @@ launchctl load ~/Library/LaunchAgents/com.hq.swipe-bot.plist
 
 ### Usage
 
-DM the bot on Telegram: `/start` asks for budget, districts, rooms, and size,
-then starts sending cards. 👍 saves to `/shortlist`; 👍/👎 both advance to the
-next card. `/settings` re-runs the preference wizard. `/next` re-checks the
-queue on demand (useful right after a poll lands new listings).
+DM the bot on Telegram: `/start` walks you through a tap-driven wizard (name,
+budget, districts, rooms & size, must-haves like elevator/parking, an optional
+commute address) instead of typing free text. Finishing it shows a summary of
+what already matches, with a "Browse top matches ▸" button to jump straight
+into swiping. 👍 saves a card to `/shortlist`; 👍/👎 both advance to the next
+card. `/searches` lists, switches between, or deletes your saved searches (up
+to 5 per chat) — each one polls and pushes independently. `/settings` edits a
+single field (budget, districts, etc.) of the active search without re-running
+the whole wizard. `/next` re-checks the queue on demand (useful right after a
+poll lands new listings). `/language` switches the bot's UI between English,
+Russian, and German (listing content itself is never translated).
 
 Runs entirely on your Mac — no inbound port needed (Telegram long-polling).
 The bot is offline while your Mac is off or asleep.

@@ -21,5 +21,25 @@ export default {
   pet_badge: '🐾 mentions pets — check listing',
   language_prompt: 'Choose your language:',
   language_saved: 'Language set to {language}.',
+  help_full:
+    'I find Vienna rental apartments matching your preferences and let you swipe through them, ' +
+    'like a dating app.\n\n' +
+    'How it works: every ~3h I check willhaben and immobilienscout24 for new matches for each of your ' +
+    'searches. If there are several, I group them into one paced push per search instead of flooding you ' +
+    'card by card. Swipe 👍 on a card to save it to your shortlist, or 👎 to pass — each card keeps an ' +
+    '↩️ Undo button until you swipe the next one. The more you swipe, the better matches get: I learn ' +
+    'which price/size/district combos you tend to like.\n\n' +
+    'When you finish setting up a search (or switch to one with matches waiting), I send a summary of ' +
+    'what\'s already out there with a "Browse top matches ▸" button to start swiping right away.\n\n' +
+    'Commands:\n' +
+    '/next — see another listing right now, without waiting for the next poll\n' +
+    '/shortlist — browse everything you\'ve liked, one card at a time, with a 🗑️ Remove button on each\n' +
+    '/searches — list, switch between, or delete your saved searches (up to ' + '{maxProfiles}' + ')\n' +
+    '/settings — change your budget, districts, or other preferences for the active search\n' +
+    '/start — set up a new search\n' +
+    '/language — change the bot\'s language\n\n' +
+    'The ⏭ Next / 📋 Shortlist / ⚙️ Settings buttons below the message box do the same as the ' +
+    'matching commands, one tap instead of typing.\n\n' +
+    '{safetyNotice}',
   // Task 5-9 add further keys here as each screen is built; keep this file the single source of truth for the key set.
 } as const;
