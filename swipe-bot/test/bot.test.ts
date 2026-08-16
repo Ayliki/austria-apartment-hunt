@@ -444,6 +444,20 @@ test('free text mid-wizard on the name step is always taken as the profile name,
   assert.match(texts.at(-1) as string, /budget/i);
 });
 
+test('free text mid-wizard on a button-only step (e.g. budget) nudges the user back to the buttons instead of staying silent', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/start')); // name step
+  await bot.handleUpdate(textUpdate(1, 'My Search')); // -> budget step, a button-only step
+
+  await bot.handleUpdate(textUpdate(1, 'somewhere around 800 euros'));
+
+  const state = getWizardState(db, 1)!;
+  assert.equal(state.stepIndex, 1); // still on budget, wizard did not advance
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /tap one of the buttons/i);
+});
+
 test('opting out of waitlist housing and WG rooms via the amenity chips excludes both from the pushed candidate queue', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'gemeindewohnung', price: 500, requiresWaitlistTicket: true }));

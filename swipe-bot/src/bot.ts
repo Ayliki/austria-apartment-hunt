@@ -417,6 +417,14 @@ async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, d
  * commute-free-text-driven paths, below) call this in place of jumping straight into the swipe
  * deck, so a working forward reference exists now — Task 9 replaces this body with the real
  * summary/browse-button implementation without changing its call sites.
+ *
+ * *** CONTRACT TASK 9 MUST PRESERVE ***
+ * The callback-driven completion path (advanceWizard, below) finishes with `ctx.editMessageText`,
+ * which structurally CANNOT attach a reply keyboard. This function's `sendMessage(..., MAIN_KEYBOARD)`
+ * call is therefore the ONLY place a wizard-completing-via-buttons user gets `MAIN_KEYBOARD` (the
+ * persistent ⏭ Next / 📋 Shortlist / ⚙️ Settings nav bar) re-attached to their chat. When Task 9
+ * replaces this body, it MUST keep passing `MAIN_KEYBOARD` on whatever message it ends up sending —
+ * dropping it silently removes the nav bar for every button-wizard user.
  */
 async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: DB, profile: SearchProfile): Promise<void> {
   const candidates = getCandidateListings(db, profile.chatId, profile.prefs);
@@ -599,8 +607,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       await sendProfileActivationSummary(ctx.telegram, db, profile);
       return;
     }
-    // Free text on any other step (name/commute are the only free-text-capable steps) is ignored —
-    // the wizard only advances via its buttons there.
+    // Free text on any other step (name/commute are the only free-text-capable steps) doesn't
+    // advance the wizard — but staying totally silent is a bad failure mode if the inline buttons
+    // scrolled off-screen, so nudge the user back to them instead of dropping the message.
+    await ctx.reply('Please tap one of the buttons above to continue.');
   });
 
   bot.action(/^(like|pass):(.+)$/, async (ctx) => {
