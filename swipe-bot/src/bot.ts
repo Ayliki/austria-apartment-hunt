@@ -4,13 +4,14 @@ import {
   getActiveSearchProfile, getCandidateListings, getSwipedWithDirection, recordSwipe, getShortlist, removeFromShortlist, undoSwipe,
   getWizardState, setWizardState, deleteWizardState, getCommuteTimes, setCommuteTimes, setListingCoords,
   setChatLanguage, createSearchProfile, countSearchProfiles, MAX_SEARCH_PROFILES_PER_CHAT,
+  getSearchProfiles, getSearchProfile, setActiveSearchProfile, deleteSearchProfile, updateSearchProfile, renameSearchProfile,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
 import { t, LOCALE_NAMES } from './locales.js';
 import {
   WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs,
-  type WizardState, type WizardChoice,
+  type WizardState, type WizardChoice, type WizardStepId,
 } from './wizard.js';
 
 export type GeocodeFn = (address: string) => Promise<GeoPoint | null>;
@@ -36,8 +37,9 @@ export const HELP_TEXT =
   'Commands:\n' +
   '/next — see another listing right now, without waiting for the next poll\n' +
   '/shortlist — browse everything you\'ve liked, with a 🗑️ Remove button on each\n' +
-  '/settings — change your budget, districts, or other preferences\n' +
-  '/start — redo the setup questions from scratch\n\n' +
+  '/searches — list, switch between, or delete your saved searches (up to ' + MAX_SEARCH_PROFILES_PER_CHAT + ')\n' +
+  '/settings — change your budget, districts, or other preferences for the active search\n' +
+  '/start — set up a new search\n\n' +
   'The ⏭ Next / 📋 Shortlist / ⚙️ Settings buttons below the message box do the same as the ' +
   'matching commands, one tap instead of typing.\n\n' +
   SAFETY_NOTICE;
@@ -47,6 +49,7 @@ export const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: 'start', description: 'Set up (or redo) your search preferences' },
   { command: 'next', description: 'See another listing right now' },
   { command: 'shortlist', description: 'Browse everything you\'ve liked' },
+  { command: 'searches', description: 'List, switch, or delete your searches' },
   { command: 'settings', description: 'Change your preferences' },
   { command: 'help', description: 'How this bot works' },
   { command: 'language', description: 'Change the bot\'s language' },
@@ -437,7 +440,7 @@ async function sendProfileActivationSummary(telegram: Telegraf['telegram'], db: 
   );
 }
 
-/** Starts a brand-new wizard run for `chatId`: refuses once the chat is at MAX_SEARCH_PROFILES_PER_CHAT, otherwise resets wizard state to step 0 and sends its prompt. Shared by /start (first-time setup) and /settings (redo-from-scratch, until Task 7 gives it single-field editing). */
+/** Starts a brand-new wizard run for `chatId`: refuses once the chat is at MAX_SEARCH_PROFILES_PER_CHAT, otherwise resets wizard state to step 0 and sends its prompt. Shared by /start (first-time setup) and the "+ Add another search" button from /searches. */
 async function startWizard(telegram: Telegraf['telegram'], db: DB, chatId: number): Promise<void> {
   if (countSearchProfiles(db, chatId) >= MAX_SEARCH_PROFILES_PER_CHAT) {
     await telegram.sendMessage(chatId, `You already have ${MAX_SEARCH_PROFILES_PER_CHAT} searches — delete one with /searches first.`);
@@ -455,6 +458,25 @@ interface WizardCtx {
   telegram: Telegraf['telegram'];
   editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
   answerCbQuery: (text?: string) => Promise<unknown>;
+}
+
+/** Field labels + step ids offered by /settings' per-field edit menu and validated by the editfield: callback regex — single source of truth for both. */
+const SETTINGS_FIELD_BUTTONS: [string, WizardStepId][] = [
+  ['Name', 'name'], ['Budget', 'budget'], ['Districts', 'districts'], ['Rooms & size', 'rooms_size'], ['Amenities', 'amenities'], ['Commute', 'commute'],
+];
+
+/**
+ * Applies the answer(s) accumulated in `next.partial`/`next.profileName` onto the profile being
+ * single-field-edited, and clears the wizard state — the terminal step of an editfield: flow,
+ * reached either via a button tap (advanceWizard) or free text (the name/commute steps, handled
+ * directly in the `text` listener since those two steps bypass advanceWizard entirely).
+ */
+function finalizeFieldEdit(db: DB, chatId: number, editingProfileId: number, next: WizardState): string {
+  const profile = getSearchProfile(db, editingProfileId)!;
+  updateSearchProfile(db, profile.id, { ...profile.prefs, ...next.partial });
+  if (next.profileName && next.profileName !== profile.name) renameSearchProfile(db, profile.id, next.profileName);
+  deleteWizardState(db, chatId);
+  return `Updated "${next.profileName ?? profile.name}".`;
 }
 
 export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
@@ -482,6 +504,33 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       next = applyWizardChoice(current, choice);
     } catch {
       await ctx.answerCbQuery(); // stale/duplicate tap on a step the wizard already moved past — see doc comment above
+      return;
+    }
+
+    // Single-field /settings edit (editfield: jumped stepIndex straight to the one field being
+    // edited, see bot.command('settings') below) — never runs the full onboarding's step-by-step
+    // advancement or profile creation. A tap that doesn't move stepIndex (e.g. toggling one of
+    // several districts before Continue) just re-renders the same step so multi-select fields still
+    // work; a tap that does advance the step (or a Back tap, which moves it backward) is treated as
+    // the field's final answer — Back cancels the edit outright rather than "saving" a decremented,
+    // now-inconsistent partial state.
+    if (current.editingProfileId != null) {
+      if (choice.kind === 'back') {
+        deleteWizardState(db, chatId);
+        await ctx.answerCbQuery();
+        await ctx.editMessageText('Edit cancelled.');
+        return;
+      }
+      if (next.stepIndex === current.stepIndex) {
+        setWizardState(db, chatId, next);
+        await ctx.answerCbQuery();
+        const { text, keyboard } = renderWizardStep(next, wizardStrings(db, chatId));
+        await ctx.editMessageText(text, keyboard);
+        return;
+      }
+      const message = finalizeFieldEdit(db, chatId, current.editingProfileId, next);
+      await ctx.answerCbQuery();
+      await ctx.editMessageText(message);
       return;
     }
 
@@ -513,11 +562,84 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     await startWizard(ctx.telegram, db, chatId);
   });
 
+  /** Sends the active profile's per-field edit menu, or a "no active search" nudge if none exists. Shared by /settings and the "⚙️ Settings" persistent-keyboard button. */
+  async function sendSettingsMenu(chatId: number): Promise<void> {
+    const profile = getActiveSearchProfile(db, chatId);
+    if (!profile) {
+      await bot.telegram.sendMessage(chatId, 'No active search — /start to set one up.');
+      return;
+    }
+    await bot.telegram.sendMessage(
+      chatId,
+      `Editing "${profile.name}" — pick a field:`,
+      Markup.inlineKeyboard(SETTINGS_FIELD_BUTTONS.map(([label, field]) => [Markup.button.callback(label, `editfield:${profile.id}:${field}`)])),
+    );
+  }
+
   bot.command('settings', async (ctx) => {
-    // Task 7 replaces this with single-field editing of the active profile; for now it keeps
-    // starting a brand new wizard run (same behavior as before this task's change), so the command
-    // stays functional in the interim. Task 7's own tests overwrite this handler's behavior.
-    await startWizard(ctx.telegram, db, ctx.chat.id);
+    await sendSettingsMenu(ctx.chat.id);
+  });
+
+  bot.command('searches', async (ctx) => {
+    const chatId = ctx.chat.id;
+    const profiles = getSearchProfiles(db, chatId);
+    if (profiles.length === 0) {
+      await ctx.reply('No searches yet — /start to set one up.');
+      return;
+    }
+    const lines = profiles.map((p) => `${p.active ? '▶ ' : '  '}${p.name}`).join('\n');
+    const buttons = profiles.flatMap((p) => [
+      ...(p.active ? [] : [Markup.button.callback(`Switch to "${p.name}"`, `switchprofile:${p.id}`)]),
+      Markup.button.callback(`🗑️ Delete "${p.name}"`, `deleteprofile:${p.id}`),
+    ]);
+    const addButton = profiles.length < MAX_SEARCH_PROFILES_PER_CHAT ? [Markup.button.callback(t(db, chatId, 'btn_add_another_search'), 'wizard:new')] : [];
+    await ctx.reply(
+      `Your searches:\n${lines}`,
+      Markup.inlineKeyboard([...buttons.map((b) => [b]), addButton].filter((row) => row.length > 0)),
+    );
+  });
+
+  bot.action(/^switchprofile:(\d+)$/, async (ctx) => {
+    setActiveSearchProfile(db, ctx.chat!.id, Number(ctx.match[1]));
+    await ctx.answerCbQuery('Switched.');
+  });
+
+  bot.action(/^deleteprofile:(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const profileId = Number(ctx.match[1]);
+    const wasActive = getActiveSearchProfile(db, chatId)?.id === profileId;
+    deleteSearchProfile(db, profileId);
+    await ctx.answerCbQuery('Deleted.');
+    if (!wasActive) return;
+    // The deleted profile was active — db.ts's deleteSearchProfile leaves no profile active
+    // afterward (see its doc comment), so prompt the user to pick a new one if any remain.
+    const remaining = getSearchProfiles(db, chatId);
+    if (remaining.length === 0) {
+      await ctx.reply('Deleted your last search — /start to set up a new one.');
+      return;
+    }
+    await ctx.reply(
+      'Deleted. No search is active now — pick one to switch to:',
+      Markup.inlineKeyboard(remaining.map((p) => [Markup.button.callback(`Switch to "${p.name}"`, `switchprofile:${p.id}`)])),
+    );
+  });
+
+  bot.action('wizard:new', async (ctx) => {
+    await ctx.answerCbQuery();
+    await startWizard(ctx.telegram, db, ctx.chat!.id);
+  });
+
+  bot.action(/^editfield:(\d+):(name|budget|districts|rooms_size|amenities|commute)$/, async (ctx) => {
+    const [, profileIdRaw, field] = ctx.match;
+    const profileId = Number(profileIdRaw);
+    const profile = getSearchProfile(db, profileId);
+    if (!profile) { await ctx.answerCbQuery('This search no longer exists.'); return; }
+    const stepIndex = WIZARD_STEPS.indexOf(field as WizardStepId);
+    const state: WizardState = { stepIndex, profileName: profile.name, partial: profile.prefs, editingProfileId: profileId };
+    setWizardState(db, ctx.chat!.id, state);
+    await ctx.answerCbQuery();
+    const { text, keyboard } = renderWizardStep(state, wizardStrings(db, ctx.chat!.id));
+    await ctx.editMessageText(text, keyboard);
   });
 
   bot.command('help', async (ctx) => {
@@ -578,7 +700,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       const text = ctx.message.text;
       if (text === '⏭ Next') { await sendNextCard(ctx.telegram, chatId, db, deps); return; }
       if (text === '📋 Shortlist') { await sendShortlistTo(ctx.telegram, chatId, db); return; }
-      if (text === '⚙️ Settings') { await startWizard(ctx.telegram, db, chatId); return; }
+      if (text === '⚙️ Settings') { await sendSettingsMenu(chatId); return; }
       return;
     }
     const step = WIZARD_STEPS[state.stepIndex];
@@ -586,6 +708,11 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
 
     if (step === 'name') {
       const next = applyWizardChoice(state, { kind: 'name', name: raw });
+      if (state.editingProfileId != null) {
+        const message = finalizeFieldEdit(db, chatId, state.editingProfileId, next);
+        await ctx.reply(message);
+        return;
+      }
       setWizardState(db, chatId, next);
       // First render of a new step after free text can't edit-in-place (no prior bot message to
       // edit) — sends fresh. Every step after this one edits in place via the callback handlers above.
@@ -601,6 +728,11 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
         return; // keep the same step, don't advance or lose prior answers
       }
       const next = applyWizardChoice(state, { kind: 'commute_set', destination: trimmed, lat: point.lat, lon: point.lon });
+      if (state.editingProfileId != null) {
+        const message = finalizeFieldEdit(db, chatId, state.editingProfileId, next);
+        await ctx.reply(message);
+        return;
+      }
       deleteWizardState(db, chatId);
       const profile = createSearchProfile(db, chatId, next.profileName ?? `Search ${countSearchProfiles(db, chatId) + 1}`, finalizePrefs(next));
       await ctx.reply(`Saved "${profile.name}". New listings get checked every ~3h — I'll message you here as soon as something matches.`, MAIN_KEYBOARD);

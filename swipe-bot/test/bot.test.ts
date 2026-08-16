@@ -156,8 +156,8 @@ test('shortlistNavButtons: a single-item shortlist omits both Prev and Next', ()
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove']);
 });
 
-test('BOT_COMMANDS lists start, next, shortlist, settings, help, language, each with a non-empty description', () => {
-  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'settings', 'help', 'language']);
+test('BOT_COMMANDS lists start, next, shortlist, searches, settings, help, language, each with a non-empty description', () => {
+  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'searches', 'settings', 'help', 'language']);
   assert.ok(BOT_COMMANDS.every((c) => c.description.length > 0 && c.description.length <= 256)); // Telegram's setMyCommands description limit
 });
 
@@ -418,13 +418,22 @@ test('tapping "📋 Shortlist" on the persistent keyboard sends the shortlist, s
   assert.ok(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€500')));
 });
 
-test('tapping "⚙️ Settings" on the persistent keyboard starts the wizard, same as /settings', async () => {
+test('tapping "⚙️ Settings" on the persistent keyboard opens the per-field edit menu, same as /settings', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'My Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /pick a field/i);
+  assert.equal(getWizardState(db, 1), null); // no wizard run started
+});
+
+test('tapping "⚙️ Settings" with no active search nudges the user to /start instead of erroring', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
   await bot.handleUpdate(textUpdate(1, '⚙️ Settings'));
   const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
-  assert.match(texts.at(-1) as string, /name this search/i);
-  assert.deepEqual(getWizardState(db, 1), initialWizardState());
+  assert.match(texts.at(-1) as string, /No active search/);
 });
 
 test('free text mid-wizard on the name step is always taken as the profile name, even if it happens to match a keyboard label', async () => {
@@ -549,6 +558,228 @@ test('tapping Skip on the commute step saves no destination and completes the wi
   assert.equal(getWizardState(db, 1), null);
   const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
   assert.match(edits.at(-1) as string, /Saved "My Search"/);
+});
+
+// --- Task 7: /searches (list/switch/delete) + /settings single-field editing ---
+
+test('/searches lists every profile for the chat with a switch button, marking the active one', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Studio Center', defaultPrefs(), false);
+  createSearchProfile(db, 1, 'Family Flat', defaultPrefs(), true); // second one active
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/searches'));
+
+  const reply = calls.find((c) => c.method === 'sendMessage')!;
+  const text = reply.payload.text as string;
+  assert.match(text, /Studio Center/);
+  assert.match(text, /Family Flat/);
+  assert.match(text, /▶ Family Flat/); // active one visually marked
+
+  const keyboard = (reply.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const flat = keyboard.flat();
+  assert.ok(flat.some((b) => b.text.includes('Studio Center') && b.callback_data.startsWith('switchprofile:')));
+  assert.ok(flat.some((b) => b.text.includes('Family Flat') && b.callback_data.startsWith('deleteprofile:')));
+  // the active profile gets no switch button (nothing to switch to from itself)
+  assert.ok(!flat.some((b) => b.callback_data.startsWith('switchprofile:') && b.text.includes('Family Flat')));
+});
+
+test('/searches with no profiles points at /start instead of showing an empty list', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/searches'));
+  const reply = calls.find((c) => c.method === 'sendMessage')!;
+  assert.match(reply.payload.text as string, /\/start/);
+});
+
+test('tapping switchprofile:<id> makes that profile active', async () => {
+  const db = openDb(':memory:');
+  const first = createSearchProfile(db, 1, 'Studio Center', defaultPrefs(), false);
+  createSearchProfile(db, 1, 'Family Flat', defaultPrefs(), true);
+  const { bot } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `switchprofile:${first.id}`));
+
+  assert.equal(getActiveSearchProfile(db, 1)!.id, first.id);
+});
+
+test('tapping deleteprofile:<id> on the active profile removes it and clears the active flag entirely', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'Only Search', defaultPrefs());
+  const { bot } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `deleteprofile:${profile.id}`));
+
+  assert.equal(getSearchProfiles(db, 1).length, 0);
+  assert.equal(getActiveSearchProfile(db, 1), null);
+});
+
+test('deleting the active profile while another remains prompts the user to pick a new active one', async () => {
+  const db = openDb(':memory:');
+  const active = createSearchProfile(db, 1, 'Active One', defaultPrefs(), true);
+  createSearchProfile(db, 1, 'Other', defaultPrefs(), false);
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `deleteprofile:${active.id}`));
+
+  assert.equal(getActiveSearchProfile(db, 1), null);
+  const reply = calls.find((c) => c.method === 'sendMessage');
+  assert.ok(reply, 'expected a reply prompting the user to pick a new active profile');
+  const keyboard = (reply!.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  assert.ok(keyboard.flat().some((b) => b.text.includes('Other') && b.callback_data.includes('switchprofile:')));
+});
+
+test('deleting an inactive profile leaves the active one untouched and does not prompt', async () => {
+  const db = openDb(':memory:');
+  const active = createSearchProfile(db, 1, 'Active One', defaultPrefs(), true);
+  const other = createSearchProfile(db, 1, 'Other', defaultPrefs(), false);
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `deleteprofile:${other.id}`));
+
+  assert.equal(getActiveSearchProfile(db, 1)!.id, active.id);
+  assert.equal(calls.some((c) => c.method === 'sendMessage'), false); // just the answerCallbackQuery, no extra prompt
+});
+
+test('/searches refuses to create a 6th profile via "+ Add another search" once the chat is at the cap, with a clear message', async () => {
+  const db = openDb(':memory:');
+  for (let i = 0; i < MAX_SEARCH_PROFILES_PER_CHAT; i++) {
+    createSearchProfile(db, 1, `Search ${i + 1}`, defaultPrefs(), false);
+  }
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/searches'));
+
+  const listReply = calls.find((c) => c.method === 'sendMessage')!;
+  const listKeyboard = (listReply.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  assert.ok(!listKeyboard.flat().some((b) => b.callback_data === 'wizard:new'), 'no "add another" button once at the cap');
+
+  // Even if the button were tapped directly (e.g. a stale keyboard from before the cap was hit),
+  // the underlying action must still refuse — this is the actual cap-enforcement call site.
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:new'));
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, new RegExp(String(MAX_SEARCH_PROFILES_PER_CHAT)));
+  assert.match(texts.at(-1) as string, /\/searches/);
+  assert.equal(getSearchProfiles(db, 1).length, MAX_SEARCH_PROFILES_PER_CHAT); // no 6th profile created
+});
+
+test('/searches offers "+ Add another search" while under the cap', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Only Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/searches'));
+
+  const reply = calls.find((c) => c.method === 'sendMessage')!;
+  const keyboard = (reply.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  assert.ok(keyboard.flat().some((b) => b.callback_data === 'wizard:new'));
+});
+
+test('/settings on the active profile offers per-field edit buttons instead of restarting the whole wizard', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs());
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/settings'));
+
+  const reply = calls.find((c) => c.method === 'sendMessage')!;
+  assert.doesNotMatch(reply.payload.text as string, /name this search/i); // not the wizard's name-step prompt
+  const keyboard = (reply.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard;
+  const flat = keyboard.flat();
+  assert.ok(flat.some((b) => b.callback_data === `editfield:${profile.id}:budget`));
+  assert.ok(flat.some((b) => b.callback_data === `editfield:${profile.id}:districts`));
+  assert.ok(flat.some((b) => b.callback_data === `editfield:${profile.id}:rooms_size`));
+  assert.ok(flat.some((b) => b.callback_data === `editfield:${profile.id}:amenities`));
+  assert.ok(flat.some((b) => b.callback_data === `editfield:${profile.id}:commute`));
+  assert.ok(flat.some((b) => b.callback_data === `editfield:${profile.id}:name`));
+  assert.equal(getWizardState(db, 1), null); // no wizard run started yet
+});
+
+test('/settings with no active search nudges the user to /start instead of erroring', async () => {
+  const db = openDb(':memory:');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/settings'));
+  const reply = calls.find((c) => c.method === 'sendMessage')!;
+  assert.match(reply.payload.text as string, /No active search/);
+});
+
+test('editfield:<id>:budget jumps straight to the budget step, and completing just that step updates only that field', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ districts: [6, 7], priceFrom: null, priceTo: 800 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:budget`));
+
+  const edit = calls.find((c) => c.method === 'editMessageText')!;
+  assert.match(edit.payload.text as string, /budget/i);
+
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:budget:700:900'));
+
+  const updated = getActiveSearchProfile(db, 1)!;
+  assert.equal(updated.prefs.priceFrom, 700);
+  assert.equal(updated.prefs.priceTo, 900);
+  assert.deepEqual(updated.prefs.districts, [6, 7]); // untouched by the budget-only edit
+  assert.equal(getWizardState(db, 1), null); // edit session closed, no lingering wizard state
+
+  const confirmations = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(confirmations.at(-1) as string, /Updated "My Search"/);
+});
+
+test('editing the districts field requires its own Continue tap before saving, just like the main wizard', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ districts: [6] }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:districts`));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:district:9')); // toggle a district on
+
+  // Toggling alone must not finalize the edit yet.
+  assert.ok(getWizardState(db, 1), 'still mid single-field edit after a toggle, not finalized yet');
+  assert.deepEqual(getActiveSearchProfile(db, 1)!.prefs.districts, [6]); // unchanged so far
+
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:districts_continue'));
+
+  assert.equal(getWizardState(db, 1), null);
+  assert.deepEqual(getActiveSearchProfile(db, 1)!.prefs.districts, [6, 9]);
+  const confirmations = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(confirmations.at(-1) as string, /Updated "My Search"/);
+});
+
+test('editing the name field via free text updates only the name, not the rest of the profile', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'Old Name', defaultPrefs({ priceTo: 900 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:name`));
+  await bot.handleUpdate(textUpdate(1, 'New Name'));
+
+  const updated = getActiveSearchProfile(db, 1)!;
+  assert.equal(updated.name, 'New Name');
+  assert.equal(updated.prefs.priceTo, 900); // untouched
+  assert.equal(getWizardState(db, 1), null);
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /Updated "New Name"/);
+});
+
+test('editing the commute field via free text updates only the commute fields, without creating a duplicate profile', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ priceTo: 900 }));
+  const { bot, calls } = createTestBot(db, {
+    geocode: async () => ({ lat: 48.1986, lon: 16.3695 }),
+  });
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:commute`));
+  await bot.handleUpdate(textUpdate(1, 'TU Wien'));
+
+  const profiles = getSearchProfiles(db, 1);
+  assert.equal(profiles.length, 1); // no duplicate profile created
+  const updated = profiles[0];
+  assert.equal(updated.prefs.commuteDestination, 'TU Wien');
+  assert.equal(updated.prefs.priceTo, 900); // untouched
+  assert.equal(getWizardState(db, 1), null);
+  const texts = calls.filter((c) => c.method === 'sendMessage').map((c) => c.payload.text as string);
+  assert.match(texts.at(-1) as string, /Updated "My Search"/);
+});
+
+test('a Back tap during a single-field edit cancels the edit rather than saving a decremented/broken state', async () => {
+  const db = openDb(':memory:');
+  const profile = createSearchProfile(db, 1, 'My Search', defaultPrefs({ priceTo: 800 }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, `editfield:${profile.id}:budget`));
+  await bot.handleUpdate(callbackUpdate(1, 'wizard:back'));
+
+  assert.equal(getWizardState(db, 1), null); // edit session closed
+  assert.equal(getActiveSearchProfile(db, 1)!.prefs.priceTo, 800); // unchanged
+  const edits = calls.filter((c) => c.method === 'editMessageText').map((c) => c.payload.text as string);
+  assert.match(edits.at(-1) as string, /cancel/i);
 });
 
 const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };
