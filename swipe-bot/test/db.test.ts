@@ -516,12 +516,27 @@ test('setCommuteTimes overwrites on re-call (same chat + listing)', () => {
   assert.deepEqual(getCommuteTimes(db, 1, 'willhaben:a'), { walkMinutes: 20, transitMinutes: null, transitSummary: null });
 });
 
-test('commute cache is per (chat, listing) — independent across both users and listings', () => {
+test('commute cache is per (profile, listing) — independent across both profiles and listings', () => {
   const db = openDb(':memory:');
   setCommuteTimes(db, 1, 'willhaben:a', { walkMinutes: 10, transitMinutes: null, transitSummary: null });
   setCommuteTimes(db, 2, 'willhaben:a', { walkMinutes: 30, transitMinutes: null, transitSummary: null });
   assert.equal(getCommuteTimes(db, 1, 'willhaben:a')!.walkMinutes, 10);
   assert.equal(getCommuteTimes(db, 2, 'willhaben:a')!.walkMinutes, 30);
+});
+
+test('commute cache does not leak between two profiles in the same chat with different commute destinations, for the same listing', () => {
+  const db = openDb(':memory:');
+  const chatId = 42;
+  // Two profiles for the same chat — only reachable via direct DB calls today (the wizard is
+  // single-profile-per-chat until the multi-profile UI lands), but the cache must already be safe.
+  const profileA = createSearchProfile(db, chatId, 'Near TU Wien', prefs({ commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 }), true);
+  const profileB = createSearchProfile(db, chatId, 'Near Uni Wien', prefs({ commuteDestination: 'Uni Wien', commuteLat: 48.2131, commuteLon: 16.3593 }), false);
+
+  setCommuteTimes(db, profileA.id, 'willhaben:shared', { walkMinutes: 12, transitMinutes: 8, transitSummary: 'U2' });
+  setCommuteTimes(db, profileB.id, 'willhaben:shared', { walkMinutes: 40, transitMinutes: 25, transitSummary: 'U4 + tram' });
+
+  assert.deepEqual(getCommuteTimes(db, profileA.id, 'willhaben:shared'), { walkMinutes: 12, transitMinutes: 8, transitSummary: 'U2' });
+  assert.deepEqual(getCommuteTimes(db, profileB.id, 'willhaben:shared'), { walkMinutes: 40, transitMinutes: 25, transitSummary: 'U4 + tram' });
 });
 
 test('upsertListing defaults is_delisted to false', () => {
@@ -849,6 +864,55 @@ test('re-opening a database that has already been migrated is a no-op (user_pref
     const profiles = getSearchProfiles(secondOpen, 5);
     assert.equal(profiles.length, 1); // still exactly one — not duplicated by re-running migrate()
     secondOpen.close();
+  } finally {
+    rmSync(path, { force: true });
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+  }
+});
+
+test('openDb migrates a pre-existing (chat_id, listing_id)-keyed commute_cache onto the chat\'s active profile_id, and re-opening is a no-op', () => {
+  const path = `/tmp/swipe-bot-migration-test-commute-cache-${Date.now()}.sqlite`;
+  try {
+    // Build a DB on the OLD commute_cache shape (chat_id-keyed) by hand, plus a search_profiles row
+    // for that chat — openDb() itself always creates the new profile_id-keyed shape, so it can't be
+    // used to seed the old one.
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE search_profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, name TEXT NOT NULL,
+        prefs_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      );
+      CREATE TABLE commute_cache (
+        chat_id INTEGER NOT NULL, listing_id TEXT NOT NULL,
+        walk_minutes INTEGER, transit_minutes INTEGER, transit_summary TEXT, computed_at TEXT NOT NULL,
+        PRIMARY KEY (chat_id, listing_id)
+      );
+    `);
+    const now = new Date().toISOString();
+    seed.prepare('INSERT INTO search_profiles (chat_id, name, prefs_json, active, created_at) VALUES (?, ?, ?, 1, ?)')
+      .run(9, 'My Search', JSON.stringify(prefs()), now);
+    seed.prepare('INSERT INTO commute_cache (chat_id, listing_id, walk_minutes, transit_minutes, transit_summary, computed_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(9, 'willhaben:old', 15, 5, 'U1', now);
+    // A row whose chat has no search_profiles row at all — must be dropped, not crash the migration.
+    seed.prepare('INSERT INTO commute_cache (chat_id, listing_id, walk_minutes, transit_minutes, transit_summary, computed_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(404, 'willhaben:orphan', 99, 99, 'nowhere', now);
+    seed.close();
+
+    const db = openDb(path); // triggers migrate()
+    const profile = getActiveSearchProfile(db, 9)!;
+    assert.deepEqual(getCommuteTimes(db, profile.id, 'willhaben:old'), { walkMinutes: 15, transitMinutes: 5, transitSummary: 'U1' });
+
+    const columns = (db.prepare('PRAGMA table_info(commute_cache)').all() as { name: string }[]).map((c) => c.name);
+    assert.deepEqual(columns.sort(), ['computed_at', 'listing_id', 'profile_id', 'transit_minutes', 'transit_summary', 'walk_minutes'].sort());
+
+    const rowCount = (db.prepare('SELECT COUNT(*) as n FROM commute_cache').get() as { n: number }).n;
+    assert.equal(rowCount, 1); // the orphaned chat_id=404 row was dropped, not carried forward
+
+    db.close();
+    const reopened = openDb(path); // migration must be a no-op the second time
+    const reopenedProfile = getActiveSearchProfile(reopened, 9)!;
+    assert.deepEqual(getCommuteTimes(reopened, reopenedProfile.id, 'willhaben:old'), { walkMinutes: 15, transitMinutes: 5, transitSummary: 'U1' });
   } finally {
     rmSync(path, { force: true });
     rmSync(`${path}-wal`, { force: true });

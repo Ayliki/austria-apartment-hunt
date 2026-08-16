@@ -261,10 +261,13 @@ async function sendShortlistBrowseCard(
 }
 
 /**
- * Cached-or-computed commute line for one (chat, listing) pair — null if the user has no commute
- * destination set, or the listing has no coordinates and no address to geocode as a fallback (or
- * that geocode fails), or the Routes API call failed. Cached in the DB since Routes API calls cost
- * quota and the same listing gets re-shown across /next, pushes, and swipes.
+ * Cached-or-computed commute line for one (search profile, listing) pair — null if the user has no
+ * commute destination set, or the listing has no coordinates and no address to geocode as a
+ * fallback (or that geocode fails), or the Routes API call failed. Cached in the DB since Routes
+ * API calls cost quota and the same listing gets re-shown across /next, pushes, and swipes. Keyed
+ * by profileId (not chatId): commuteDestination lives in SearchProfilePrefs, so once a chat can
+ * hold multiple profiles with different destinations, caching per chat would let one profile's
+ * cached ETA leak into another profile's view of the same listing.
  *
  * Not every advertiser publishes coordinates (verified: willhaben listings from Rustler
  * Immobilientreuhand never do), but most still have a plain address — geocoding it once and
@@ -272,7 +275,7 @@ async function sendShortlistBrowseCard(
  * ever, not once per view.
  */
 export async function getCommuteLineFor(
-  db: DB, chatId: number, listing: ListingRow, prefs: SearchProfilePrefs, computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
+  db: DB, profileId: number, listing: ListingRow, prefs: SearchProfilePrefs, computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
 ): Promise<string | null> {
   if (prefs.commuteDestination == null || prefs.commuteLat == null || prefs.commuteLon == null) return null;
 
@@ -284,10 +287,10 @@ export async function getCommuteLineFor(
     setListingCoords(db, listing.id, origin.lat, origin.lon);
   }
 
-  let times = getCommuteTimes(db, chatId, listing.id);
+  let times = getCommuteTimes(db, profileId, listing.id);
   if (!times) {
     times = await computeCommute(origin, { lat: prefs.commuteLat, lon: prefs.commuteLon });
-    setCommuteTimes(db, chatId, listing.id, times);
+    setCommuteTimes(db, profileId, listing.id, times);
   }
   return formatCommuteLine(times, prefs.commuteDestination);
 }
@@ -303,7 +306,7 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
     await telegram.sendMessage(chatId, 'No new listings right now — check back after the next poll (every ~3h).');
     return;
   }
-  const commuteLine = await getCommuteLineFor(db, chatId, card, profile.prefs, deps.computeCommute, deps.geocode);
+  const commuteLine = await getCommuteLineFor(db, profile.id, card, profile.prefs, deps.computeCommute, deps.geocode);
   await sendCard(telegram, chatId, card, commuteLine);
 }
 

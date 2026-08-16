@@ -33,7 +33,7 @@ export async function notifyNewMatches(
       `${matches.length} new listing${matches.length === 1 ? '' : 's'} just matched your search:`
     );
     for (const listing of toSend) {
-      const commuteLine = await getCommuteLineFor(db, profile.chatId, listing, profile.prefs, computeCommute, geocode);
+      const commuteLine = await getCommuteLineFor(db, profile.id, listing, profile.prefs, computeCommute, geocode);
       await sendCard(telegram, profile.chatId, listing, commuteLine);
     }
     if (matches.length > toSend.length) {

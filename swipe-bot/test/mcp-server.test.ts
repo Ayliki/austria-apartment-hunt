@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatCardPayload, mapPrefsArgs, MCP_CHAT_ID } from '../src/mcp-server.js';
-import type { ListingRow } from '../src/db.js';
+import { formatCardPayload, mapPrefsArgs, handleSetPrefs, MCP_CHAT_ID, type McpDeps } from '../src/mcp-server.js';
+import { openDb, getActiveSearchProfile, type ListingRow } from '../src/db.js';
+
+const NEVER_GEOCODE_DEPS: McpDeps = {
+  geocode: async () => { throw new Error('geocode should not have been called'); },
+  computeCommute: async () => { throw new Error('computeCommute should not have been called'); },
+};
 
 function row(overrides: Partial<ListingRow>): ListingRow {
   return {
@@ -67,4 +72,49 @@ test('mapPrefsArgs passes through all bounds when fully specified', () => {
     priceTo: 800, priceFrom: 400, districts: [1, 2], roomsFrom: 1, roomsTo: 2, areaFrom: 30, areaTo: 60,
     includeWaitlistHousing: false, includeWg: true, requireElevator: true, requireParking: true,
   });
+});
+
+test('handleSetPrefs persists require_elevator (and require_parking, price_to) via upsertActiveProfilePrefs, readable back through getActiveSearchProfile', async () => {
+  const db = openDb(':memory:');
+
+  const result = await handleSetPrefs(db, NEVER_GEOCODE_DEPS, {
+    price_to: 900,
+    require_elevator: true,
+    require_parking: true,
+  });
+
+  assert.equal(result.isError, undefined);
+  const profile = getActiveSearchProfile(db, MCP_CHAT_ID);
+  assert.ok(profile);
+  assert.equal(profile!.prefs.requireElevator, true);
+  assert.equal(profile!.prefs.requireParking, true);
+  assert.equal(profile!.prefs.priceTo, 900);
+});
+
+test('handleSetPrefs defaults require_elevator/require_parking to false when omitted, and geocodes commute_destination', async () => {
+  const db = openDb(':memory:');
+  const deps: McpDeps = {
+    geocode: async (address) => (address === 'TU Wien' ? { lat: 48.1986, lon: 16.3695 } : null),
+    computeCommute: NEVER_GEOCODE_DEPS.computeCommute,
+  };
+
+  const result = await handleSetPrefs(db, deps, { price_to: 700, commute_destination: 'TU Wien' });
+
+  assert.equal(result.isError, undefined);
+  const profile = getActiveSearchProfile(db, MCP_CHAT_ID);
+  assert.equal(profile!.prefs.requireElevator, false);
+  assert.equal(profile!.prefs.requireParking, false);
+  assert.equal(profile!.prefs.commuteDestination, 'TU Wien');
+  assert.equal(profile!.prefs.commuteLat, 48.1986);
+  assert.equal(profile!.prefs.commuteLon, 16.3695);
+});
+
+test('handleSetPrefs returns an error result and persists nothing when the commute destination fails to geocode', async () => {
+  const db = openDb(':memory:');
+  const deps: McpDeps = { geocode: async () => null, computeCommute: NEVER_GEOCODE_DEPS.computeCommute };
+
+  const result = await handleSetPrefs(db, deps, { price_to: 700, commute_destination: 'nonsense place' });
+
+  assert.equal(result.isError, true);
+  assert.equal(getActiveSearchProfile(db, MCP_CHAT_ID), null);
 });

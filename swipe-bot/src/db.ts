@@ -78,13 +78,13 @@ CREATE TABLE IF NOT EXISTS chats (
 );
 
 CREATE TABLE IF NOT EXISTS commute_cache (
-  chat_id INTEGER NOT NULL,
+  profile_id INTEGER NOT NULL,
   listing_id TEXT NOT NULL,
   walk_minutes INTEGER,
   transit_minutes INTEGER,
   transit_summary TEXT,
   computed_at TEXT NOT NULL,
-  PRIMARY KEY (chat_id, listing_id)
+  PRIMARY KEY (profile_id, listing_id)
 );
 
 CREATE TABLE IF NOT EXISTS swipes (
@@ -184,6 +184,7 @@ function migrate(db: DB): void {
   }
 
   migrateUserPrefsToSearchProfiles(db);
+  migrateCommuteCacheToProfileId(db);
 }
 
 /**
@@ -212,6 +213,56 @@ function migrateUserPrefsToSearchProfiles(db: DB): void {
       db.prepare('INSERT OR IGNORE INTO chats (chat_id, language) VALUES (?, ?)').run(chatId, 'en');
     }
     db.exec('DROP TABLE user_prefs');
+  });
+  migrateRows(rows);
+}
+
+/**
+ * commute_cache used to be keyed by (chat_id, listing_id). Commute prefs now live per search
+ * profile (see SearchProfilePrefs.commuteDestination), so a chat with more than one profile could
+ * otherwise have profile B silently reuse profile A's cached ETA for the same listing. This must
+ * run after migrateUserPrefsToSearchProfiles so every chat's active profile already exists.
+ * SQLite can't ALTER a column into a new PRIMARY KEY, so the table is rebuilt: cached rows are
+ * remapped onto each chat's current active profile (today there's exactly one profile per chat, so
+ * this is lossless); a row whose chat has no profile is dropped — it's just a recomputable cache.
+ */
+function migrateCommuteCacheToProfileId(db: DB): void {
+  const hasCommuteCache = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='commute_cache'`).get();
+  if (!hasCommuteCache) return;
+  const columns = (db.prepare('PRAGMA table_info(commute_cache)').all() as { name: string }[]).map((c) => c.name);
+  if (!columns.includes('chat_id')) return; // already migrated (fresh installs get the new shape from SCHEMA directly)
+
+  const rows = db.prepare('SELECT * FROM commute_cache').all() as Record<string, unknown>[];
+  const migrateRows = db.transaction((rows: Record<string, unknown>[]) => {
+    db.exec('ALTER TABLE commute_cache RENAME TO commute_cache_old');
+    db.exec(`
+      CREATE TABLE commute_cache (
+        profile_id INTEGER NOT NULL,
+        listing_id TEXT NOT NULL,
+        walk_minutes INTEGER,
+        transit_minutes INTEGER,
+        transit_summary TEXT,
+        computed_at TEXT NOT NULL,
+        PRIMARY KEY (profile_id, listing_id)
+      )
+    `);
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO commute_cache (profile_id, listing_id, walk_minutes, transit_minutes, transit_summary, computed_at)
+      VALUES (@profileId, @listingId, @walkMinutes, @transitMinutes, @transitSummary, @computedAt)
+    `);
+    for (const row of rows) {
+      const profile = getActiveSearchProfile(db, row.chat_id as number);
+      if (!profile) continue;
+      insert.run({
+        profileId: profile.id,
+        listingId: row.listing_id,
+        walkMinutes: row.walk_minutes,
+        transitMinutes: row.transit_minutes,
+        transitSummary: row.transit_summary,
+        computedAt: row.computed_at,
+      });
+    }
+    db.exec('DROP TABLE commute_cache_old');
   });
   migrateRows(rows);
 }
@@ -678,10 +729,10 @@ export interface CommuteTimes {
   transitSummary: string | null;
 }
 
-/** Cached commute times for a (chat, listing) pair — Routes API calls cost quota, so each pair is computed once and reused across /next, pushes, and repeat views. */
-export function getCommuteTimes(db: DB, chatId: number, listingId: string): CommuteTimes | null {
-  const row = db.prepare('SELECT walk_minutes, transit_minutes, transit_summary FROM commute_cache WHERE chat_id = ? AND listing_id = ?')
-    .get(chatId, listingId) as Record<string, unknown> | undefined;
+/** Cached commute times for a (search profile, listing) pair — Routes API calls cost quota, so each pair is computed once and reused across /next, pushes, and repeat views. Keyed by profile, not chat, since commuteDestination lives in SearchProfilePrefs and a chat can hold multiple profiles with different destinations. */
+export function getCommuteTimes(db: DB, profileId: number, listingId: string): CommuteTimes | null {
+  const row = db.prepare('SELECT walk_minutes, transit_minutes, transit_summary FROM commute_cache WHERE profile_id = ? AND listing_id = ?')
+    .get(profileId, listingId) as Record<string, unknown> | undefined;
   if (!row) return null;
   return {
     walkMinutes: row.walk_minutes as number | null,
@@ -690,15 +741,15 @@ export function getCommuteTimes(db: DB, chatId: number, listingId: string): Comm
   };
 }
 
-export function setCommuteTimes(db: DB, chatId: number, listingId: string, times: CommuteTimes): void {
+export function setCommuteTimes(db: DB, profileId: number, listingId: string, times: CommuteTimes): void {
   db.prepare(`
-    INSERT INTO commute_cache (chat_id, listing_id, walk_minutes, transit_minutes, transit_summary, computed_at)
-    VALUES (@chatId, @listingId, @walkMinutes, @transitMinutes, @transitSummary, @computedAt)
-    ON CONFLICT(chat_id, listing_id) DO UPDATE SET
+    INSERT INTO commute_cache (profile_id, listing_id, walk_minutes, transit_minutes, transit_summary, computed_at)
+    VALUES (@profileId, @listingId, @walkMinutes, @transitMinutes, @transitSummary, @computedAt)
+    ON CONFLICT(profile_id, listing_id) DO UPDATE SET
       walk_minutes = excluded.walk_minutes, transit_minutes = excluded.transit_minutes,
       transit_summary = excluded.transit_summary, computed_at = excluded.computed_at
   `).run({
-    chatId, listingId,
+    profileId, listingId,
     walkMinutes: times.walkMinutes, transitMinutes: times.transitMinutes, transitSummary: times.transitSummary,
     computedAt: new Date().toISOString(),
   });

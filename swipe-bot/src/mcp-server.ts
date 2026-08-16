@@ -67,6 +67,31 @@ export function mapPrefsArgs(args: PrefsArgs): Omit<SearchProfilePrefs, 'commute
   };
 }
 
+interface SetPrefsArgs extends PrefsArgs {
+  commute_destination?: string;
+}
+
+/**
+ * The swipe_set_prefs tool's actual persistence logic, pulled out of buildServer so it can be unit
+ * tested directly (calling it here round-trips through the real DB write, unlike mapPrefsArgs which
+ * only covers the pure non-commute mapping) without spinning up the MCP transport.
+ */
+export async function handleSetPrefs(db: DB, deps: McpDeps, args: SetPrefsArgs) {
+  try {
+    let commute: { commuteDestination: string | null; commuteLat: number | null; commuteLon: number | null } =
+      { commuteDestination: null, commuteLat: null, commuteLon: null };
+    if (args.commute_destination) {
+      const point = await deps.geocode(args.commute_destination);
+      if (!point) return errorResult(new Error(`couldn't find location "${args.commute_destination}"`));
+      commute = { commuteDestination: args.commute_destination, commuteLat: point.lat, commuteLon: point.lon };
+    }
+    upsertActiveProfilePrefs(db, MCP_CHAT_ID, { ...mapPrefsArgs(args), ...commute });
+    return jsonResult({ saved: true });
+  } catch (err) {
+    return errorResult(err);
+  }
+}
+
 function jsonResult(data: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
@@ -77,7 +102,7 @@ function errorResult(err: unknown) {
 
 async function cardWithCommute(db: DB, deps: McpDeps, card: ListingRow) {
   const profile = getActiveSearchProfile(db, MCP_CHAT_ID);
-  const commuteLine = profile ? await getCommuteLineFor(db, MCP_CHAT_ID, card, profile.prefs, deps.computeCommute, deps.geocode) : null;
+  const commuteLine = profile ? await getCommuteLineFor(db, profile.id, card, profile.prefs, deps.computeCommute, deps.geocode) : null;
   return formatCardPayload(card, commuteLine);
 }
 
@@ -174,21 +199,7 @@ function buildServer(db: DB, deps: McpDeps): McpServer {
         ),
       },
     },
-    async (args) => {
-      try {
-        let commute: { commuteDestination: string | null; commuteLat: number | null; commuteLon: number | null } =
-          { commuteDestination: null, commuteLat: null, commuteLon: null };
-        if (args.commute_destination) {
-          const point = await deps.geocode(args.commute_destination);
-          if (!point) return errorResult(new Error(`couldn't find location "${args.commute_destination}"`));
-          commute = { commuteDestination: args.commute_destination, commuteLat: point.lat, commuteLon: point.lon };
-        }
-        upsertActiveProfilePrefs(db, MCP_CHAT_ID, { ...mapPrefsArgs(args), ...commute });
-        return jsonResult({ saved: true });
-      } catch (err) {
-        return errorResult(err);
-      }
-    },
+    (args) => handleSetPrefs(db, deps, args),
   );
 
   return server;
