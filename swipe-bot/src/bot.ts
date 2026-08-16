@@ -144,8 +144,21 @@ function truncate(s: string, maxLen: number): string {
   return s.slice(0, maxLen - 1).trimEnd() + '…';
 }
 
-/** Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, commute line, description, link). Exported for direct testing. */
-export function formatCaption(l: ListingRow, commuteLine?: string | null, prefix?: string): string {
+/** Default English text for the pet-mention badge — used when no localized string is supplied. Kept in sync with locales/en.ts's `pet_badge` key. */
+const DEFAULT_PET_BADGE_TEXT = '🐾 mentions pets — check listing';
+
+/**
+ * Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, amenity
+ * facts, pet-mention badge, commute line, description, link). Exported for direct testing.
+ *
+ * `petBadgeText` defaults to English so pure tests (no `db`/`chatId`) keep working unchanged; the
+ * one call site that needs localization passes `t(db, chatId, 'pet_badge')` explicitly. The badge
+ * only ever means the listing text mentions pets somewhere — never a confirmed pet-friendly amenity
+ * — so its wording must stay hedged ("check listing") in every locale.
+ */
+export function formatCaption(
+  l: ListingRow, commuteLine?: string | null, prefix?: string, petBadgeText: string = DEFAULT_PET_BADGE_TEXT,
+): string {
   const price = l.price != null ? `€${l.price}` : 'price n/a';
   const area = l.area != null ? `${l.area}m²` : '';
   const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
@@ -156,8 +169,19 @@ export function formatCaption(l: ListingRow, commuteLine?: string | null, prefix
     : '';
   const wgFlag = l.isWg ? '\n🚪 WG — shared flat / co-living / student room, not a whole apartment.' : '';
   const delistedFlag = l.isDelisted ? '\n⚠️ No longer listed — likely taken down by the advertiser.' : '';
+  // Info-only facts — only ever shown when known; a null field is omitted, never rendered as "no".
+  const amenityBits = [
+    l.lift === true ? 'Lift' : null,
+    l.parkingSpaces != null && l.parkingSpaces > 0 ? `Parking (${l.parkingSpaces})` : null,
+    l.floor ? `Floor: ${l.floor}` : null,
+    l.energyClass ? `Energy: ${l.energyClass}` : null,
+    l.availableFrom ? `Available: ${l.availableFrom}` : null,
+  ].filter((x): x is string => x != null);
+  const amenities = amenityBits.length > 0 ? `\n${amenityBits.join(' · ')}` : '';
+  // Unverified — the listing text merely mentions pets; never presented as a confirmed amenity.
+  const petBadge = l.mentionsPets ? `\n${petBadgeText}` : '';
   const commute = commuteLine ? `\n${commuteLine}` : '';
-  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${delistedFlag}${commute}\n${l.url}`;
+  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${delistedFlag}${amenities}${petBadge}${commute}\n${l.url}`;
   const full = l.description ? `${base}\n\n${l.description}` : base;
   const withPrefix = prefix ? `${prefix}${full}` : full;
   return truncate(withPrefix, MAX_CAPTION_LENGTH);
@@ -217,9 +241,9 @@ async function sendListingCard(
 
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
 export async function sendCard(
-  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine?: string | null,
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine: string | null | undefined, db: DB,
 ): Promise<void> {
-  const caption = formatCaption(card, commuteLine);
+  const caption = formatCaption(card, commuteLine, undefined, t(db, chatId, 'pet_badge'));
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
@@ -229,9 +253,9 @@ export async function sendCard(
 
 /** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */
 async function sendShortlistBrowseCard(
-  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, position: number, total: number,
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, position: number, total: number, db: DB,
 ): Promise<void> {
-  const caption = formatCaption(card, null, `❤️ ${position} of ${total}\n\n`);
+  const caption = formatCaption(card, null, `❤️ ${position} of ${total}\n\n`, t(db, chatId, 'pet_badge'));
   const buttons = shortlistNavButtons(card.id, position, total);
   if (card.images.length > 0) {
     await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
@@ -287,7 +311,7 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
     return;
   }
   const commuteLine = await getCommuteLineFor(db, profile.id, card, profile.prefs, deps.computeCommute, deps.geocode);
-  await sendCard(telegram, chatId, card, commuteLine);
+  await sendCard(telegram, chatId, card, commuteLine, db);
 }
 
 /**
@@ -363,11 +387,11 @@ async function deleteAndSendShortlistCard(
  * deleting the old message and sending a fresh one instead — so the user always ends up seeing the
  * target card, just via a fresh message rather than a true in-place edit in that edge case.
  */
-async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, position: number, total: number): Promise<void> {
+async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, position: number, total: number, db: DB): Promise<void> {
   const message = ctx.callbackQuery?.message as { photo?: unknown } | undefined;
   if (!message) return;
   const chatId = ctx.chat!.id;
-  const caption = formatCaption(listing, null, `❤️ ${position} of ${total}\n\n`);
+  const caption = formatCaption(listing, null, `❤️ ${position} of ${total}\n\n`, t(db, chatId, 'pet_badge'));
   const buttons = shortlistNavButtons(listing.id, position, total);
   const targetHasPhoto = listing.images.length > 0;
   const currentHasPhoto = Boolean(message.photo);
@@ -411,7 +435,7 @@ async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, d
     await telegram.sendMessage(chatId, 'Your shortlist is empty — 👍 a card to save it here.');
     return;
   }
-  await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length);
+  await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length, db);
 }
 
 /**
@@ -806,7 +830,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       return;
     }
     await ctx.answerCbQuery();
-    await replaceShortlistCard(ctx, items[targetIdx], targetIdx + 1, items.length);
+    await replaceShortlistCard(ctx, items[targetIdx], targetIdx + 1, items.length, db);
   });
 
   bot.action(/^unlike:(.+)$/, async (ctx) => {
@@ -822,7 +846,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       return;
     }
     const nextIndex = Math.min(Math.max(removedIndex, 0), after.length - 1);
-    await replaceShortlistCard(ctx, after[nextIndex], nextIndex + 1, after.length);
+    await replaceShortlistCard(ctx, after[nextIndex], nextIndex + 1, after.length, db);
   });
 
   return bot;

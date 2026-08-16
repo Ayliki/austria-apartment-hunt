@@ -34,7 +34,7 @@ export async function notifyNewMatches(
     );
     for (const listing of toSend) {
       const commuteLine = await getCommuteLineFor(db, profile.id, listing, profile.prefs, computeCommute, geocode);
-      await sendCard(telegram, profile.chatId, listing, commuteLine);
+      await sendCard(telegram, profile.chatId, listing, commuteLine, db);
     }
     if (matches.length > toSend.length) {
       await telegram.sendMessage(profile.chatId, `+${matches.length - toSend.length} more — check /next.`);

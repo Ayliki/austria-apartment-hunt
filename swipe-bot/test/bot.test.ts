@@ -134,6 +134,28 @@ test('formatCaption truncates to 1024 chars even with a prefix present', () => {
   assert.ok(caption.endsWith('…'));
 });
 
+test('formatCaption shows elevator/parking/floor/energy class only when known, never fabricating "no" for a null field', () => {
+  const withAmenities = formatCaption(row({ lift: true, parkingSpaces: 2, floor: '3. Stock', energyClass: 'B' }));
+  assert.match(withAmenities, /Lift/i);
+  assert.match(withAmenities, /Parking/i);
+  assert.match(withAmenities, /3\. Stock/);
+  assert.match(withAmenities, /B/);
+
+  const withoutAmenities = formatCaption(row({ lift: null, parkingSpaces: null, floor: null, energyClass: null }));
+  assert.doesNotMatch(withoutAmenities, /Lift/i);
+  assert.doesNotMatch(withoutAmenities, /Parking/i);
+});
+
+test('formatCaption shows the unverified pet badge only when mentionsPets is true', () => {
+  assert.match(formatCaption(row({ mentionsPets: true })), /🐾 mentions pets — check listing/);
+  assert.doesNotMatch(formatCaption(row({ mentionsPets: false })), /🐾/);
+});
+
+test('formatCaption still truncates to 1024 chars with the new badge lines included', () => {
+  const caption = formatCaption(row({ description: 'x'.repeat(2000), lift: true, parkingSpaces: 1, mentionsPets: true }));
+  assert.ok(caption.length <= 1024);
+});
+
 test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order', () => {
   const markup = shortlistNavButtons('willhaben:a', 2, 3) as unknown as { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } };
   const row = markup.reply_markup.inline_keyboard[0];
