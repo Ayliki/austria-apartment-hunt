@@ -6,7 +6,7 @@ import de from './locales/de.js';
 export type LocaleKey = keyof typeof en;
 type Catalog = Record<LocaleKey, string>;
 
-const CATALOGS: Record<ChatLanguage, Catalog> = { en, ru: ru as Catalog, de: de as Catalog };
+const CATALOGS: Record<ChatLanguage, Catalog> = { en, ru, de };
 
 export const LOCALE_NAMES: Record<ChatLanguage, string> = { en: 'English', ru: 'Русский', de: 'Deutsch' };
 
