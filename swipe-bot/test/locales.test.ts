@@ -51,3 +51,26 @@ test('t() falls back per-chat: two different chats can have different languages 
   assert.equal(t(db, 1, 'btn_skip'), ru.btn_skip);
   assert.equal(t(db, 2, 'btn_skip'), de.btn_skip);
 });
+
+// --- Final-review fix wave: ru/de help text must quote the *actual* (English) button labels, ---
+// --- not a translated version of a button that never actually appears in that wording. ---
+
+// The literal labels as they actually render in the chat — bot.ts's MAIN_KEYBOARD and the
+// "Browse top matches ▸" button are hardcoded English, never localized.
+const LITERAL_UI_LABELS = ['Browse top matches ▸', '⏭ Next', '📋 Shortlist', '⚙️ Settings'];
+
+test('ru help_full quotes the literal English button labels rather than a translated version of them', () => {
+  for (const label of LITERAL_UI_LABELS) {
+    assert.ok(ru.help_full.includes(label), `expected ru help_full to include the literal label "${label}"`);
+  }
+  assert.doesNotMatch(ru.help_full, /Смотреть подборку/); // old, inaccurate translated mention
+  assert.doesNotMatch(ru.help_full, /Далее \/ 📋 Избранное \/ ⚙️ Настройки/); // old, inaccurate translated mention
+});
+
+test('de help_full quotes the literal English button labels rather than a translated version of them', () => {
+  for (const label of LITERAL_UI_LABELS) {
+    assert.ok(de.help_full.includes(label), `expected de help_full to include the literal label "${label}"`);
+  }
+  assert.doesNotMatch(de.help_full, /Top-Treffer ansehen/); // old, inaccurate translated mention
+  assert.doesNotMatch(de.help_full, /Weiter \/ 📋 Merkliste \/ ⚙️ Einstellungen/); // old, inaccurate translated mention
+});

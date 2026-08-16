@@ -10,7 +10,6 @@ export default {
   btn_skip: 'Überspringen',
   btn_back: '‹ Zurück',
   btn_continue: 'Weiter',
-  btn_custom_range: 'Eigener Bereich ▸',
   btn_start_searching: '✅ Suche starten',
   btn_edit: '✏️ Bearbeiten',
   btn_add_another_search: '+ Weitere Suche hinzufügen',
@@ -28,7 +27,7 @@ export default {
     'Wische 👍, um eine Karte in deine Merkliste zu speichern, oder 👎 zum Überspringen — jede Karte behält eine ↩️ Rückgängig-Schaltfläche, ' +
     'bis du die nächste wischst. Je mehr du wischst, desto besser werden die Treffer: ich lerne, welche Preis-/Größen-/Bezirks-Kombinationen dir gefallen.\n\n' +
     'Wenn du eine Suche fertig eingerichtet hast (oder zu einer mit bereits vorhandenen Treffern wechselst), ' +
-    'schicke ich dir eine Zusammenfassung mit einer Schaltfläche „Top-Treffer ansehen ▸", um sofort loszuwischen.\n\n' +
+    'schicke ich dir eine Zusammenfassung mit einer Schaltfläche "Browse top matches ▸" (auf Englisch — so steht sie auch im Chat), um sofort loszuwischen.\n\n' +
     'Befehle:\n' +
     '/next — sofort ein weiteres Inserat anzeigen, ohne auf die nächste Prüfung zu warten\n' +
     '/shortlist — Merkliste durchsehen, eine Karte nach der anderen, mit 🗑️ Entfernen-Schaltfläche an jeder\n' +
@@ -36,7 +35,7 @@ export default {
     '/settings — Budget, Bezirke oder andere Kriterien der aktiven Suche ändern\n' +
     '/start — eine neue Suche einrichten\n' +
     '/language — die Sprache des Bots ändern\n\n' +
-    'Die Schaltflächen ⏭ Weiter / 📋 Merkliste / ⚙️ Einstellungen unter dem Nachrichtenfeld tun dasselbe wie die ' +
+    'Die Schaltflächen "⏭ Next" / "📋 Shortlist" / "⚙️ Settings" unter dem Nachrichtenfeld (ebenfalls auf Englisch) tun dasselbe wie die ' +
     'zugehörigen Befehle — ein Tap statt Tippen.\n\n' +
     '{safetyNotice}',
 } as const;

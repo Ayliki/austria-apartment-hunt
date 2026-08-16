@@ -10,7 +10,6 @@ export default {
   btn_skip: 'Skip',
   btn_back: '‹ Back',
   btn_continue: 'Continue',
-  btn_custom_range: 'Custom range ▸',
   btn_start_searching: '✅ Start searching',
   btn_edit: '✏️ Edit',
   btn_add_another_search: '+ Add another search',
