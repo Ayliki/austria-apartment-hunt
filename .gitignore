@@ -8,3 +8,8 @@ swipe-bot/data/
 # not a build artifact of this repo — must be committed, unlike every other dist/.
 !willhaben-mcp-patched/dist/
 !willhaben-mcp-patched/dist/index.js
+
+# Agent worktrees — scratch, never committed
+.claude/worktrees/
+.worktrees/
+.superpowers/
