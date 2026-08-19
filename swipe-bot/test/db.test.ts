@@ -13,6 +13,8 @@ import {
   updateSearchProfile, renameSearchProfile, deleteSearchProfile, countSearchProfiles, getAllSearchProfiles,
   upsertActiveProfilePrefs, getChatLanguage, setChatLanguage, MAX_SEARCH_PROFILES_PER_CHAT,
   getWizardState, setWizardState, deleteWizardState,
+  getNotifySettings, updateNotifySettings, recordNotified, countInstantSince, getNotifiedListingIds,
+  getCachedFileId, recordFileId, recordPhotoFailure, isKnownBadPhoto,
   type ListingRow, type SearchProfilePrefs,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
@@ -1000,4 +1002,64 @@ test('openDb clears a legacy/malformed onboarding_state row left over from befor
     rmSync(`${path}-wal`, { force: true });
     rmSync(`${path}-shm`, { force: true });
   }
+});
+
+test('getNotifySettings returns spec defaults for an unconfigured profile', () => {
+  const db = openDb(':memory:');
+  const s = getNotifySettings(db, 42);
+  assert.equal(s.paused, false);
+  assert.equal(s.instantEnabled, true);
+  assert.equal(s.instantPercentile, 0.10);
+  assert.deepEqual(s.digestHours, [9, 19]);
+  assert.equal(s.quietStart, 22);
+  assert.equal(s.quietEnd, 8);
+  assert.equal(s.dailyCap, 6);
+  assert.equal(s.lastDigestAt, null);
+});
+
+test('updateNotifySettings upserts and round-trips a partial patch', () => {
+  const db = openDb(':memory:');
+  updateNotifySettings(db, 42, { paused: true, dailyCap: 3, digestHours: [8] });
+  const s = getNotifySettings(db, 42);
+  assert.equal(s.paused, true);
+  assert.equal(s.dailyCap, 3);
+  assert.deepEqual(s.digestHours, [8]);
+  assert.equal(s.quietStart, 22); // untouched field keeps its default
+});
+
+test('countInstantSince counts only instant sends at or after the cutoff', () => {
+  const db = openDb(':memory:');
+  recordNotified(db, 1, 'willhaben:a', 'instant', '2026-08-19T06:00:00Z');
+  recordNotified(db, 1, 'willhaben:b', 'instant', '2026-08-19T10:00:00Z');
+  recordNotified(db, 1, 'willhaben:c', 'digest', '2026-08-19T10:00:00Z');
+  assert.equal(countInstantSince(db, 1, '2026-08-19T08:00:00Z'), 1);
+});
+
+test('getNotifiedListingIds returns every listing already announced by any kind', () => {
+  const db = openDb(':memory:');
+  recordNotified(db, 1, 'willhaben:a', 'instant', '2026-08-19T06:00:00Z');
+  recordNotified(db, 1, 'willhaben:b', 'digest', '2026-08-19T06:00:00Z');
+  recordNotified(db, 2, 'willhaben:c', 'instant', '2026-08-19T06:00:00Z');
+  assert.deepEqual([...getNotifiedListingIds(db, 1)].sort(), ['willhaben:a', 'willhaben:b']);
+});
+
+test('recordNotified is idempotent for the same profile and listing', () => {
+  const db = openDb(':memory:');
+  recordNotified(db, 1, 'willhaben:a', 'instant', '2026-08-19T06:00:00Z');
+  recordNotified(db, 1, 'willhaben:a', 'digest', '2026-08-19T07:00:00Z');
+  assert.equal(getNotifiedListingIds(db, 1).size, 1);
+});
+
+test('photo cache stores and returns a file_id, and flags known-bad urls', () => {
+  const db = openDb(':memory:');
+  assert.equal(getCachedFileId(db, 'https://cdn/x.jpg'), null);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/x.jpg'), false);
+
+  recordFileId(db, 'https://cdn/x.jpg', 'FILEID123', '2026-08-19T06:00:00Z');
+  assert.equal(getCachedFileId(db, 'https://cdn/x.jpg'), 'FILEID123');
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/x.jpg'), false);
+
+  recordPhotoFailure(db, 'https://cdn/dead.jpg', 'wrong file identifier', '2026-08-19T06:00:00Z');
+  assert.equal(getCachedFileId(db, 'https://cdn/dead.jpg'), null);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/dead.jpg'), true);
 });

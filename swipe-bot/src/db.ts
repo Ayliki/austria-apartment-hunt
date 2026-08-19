@@ -108,6 +108,35 @@ CREATE TABLE IF NOT EXISTS onboarding_state (
   answers TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notify_settings (
+  profile_id         INTEGER PRIMARY KEY,
+  paused             INTEGER NOT NULL DEFAULT 0,
+  instant_enabled    INTEGER NOT NULL DEFAULT 1,
+  instant_percentile REAL    NOT NULL DEFAULT 0.10,
+  digest_hours       TEXT    NOT NULL DEFAULT '9,19',
+  quiet_start        INTEGER NOT NULL DEFAULT 22,
+  quiet_end          INTEGER NOT NULL DEFAULT 8,
+  daily_cap          INTEGER NOT NULL DEFAULT 6,
+  last_digest_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notify_log (
+  profile_id INTEGER NOT NULL,
+  listing_id TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,
+  sent_at    TEXT    NOT NULL,
+  PRIMARY KEY (profile_id, listing_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notify_log_profile_sent ON notify_log(profile_id, sent_at);
+
+CREATE TABLE IF NOT EXISTS photo_cache (
+  source_url TEXT PRIMARY KEY,
+  file_id    TEXT,
+  cached_at  TEXT NOT NULL,
+  failed     INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
 `;
 
 export function openDb(path: string): DB {
@@ -833,4 +862,115 @@ export function getSwipedWithDirection(db: DB, chatId: number): { listing: Listi
     WHERE s.chat_id = ?
   `).all(chatId) as Record<string, unknown>[];
   return rows.map((row) => ({ listing: rowToListing(row), direction: row.swipe_direction as 'like' | 'pass' }));
+}
+
+export interface NotifySettings {
+  profileId: number;
+  paused: boolean;
+  instantEnabled: boolean;
+  instantPercentile: number;
+  digestHours: number[];
+  quietStart: number;
+  quietEnd: number;
+  dailyCap: number;
+  lastDigestAt: string | null;
+}
+
+/** Spec defaults — mirrored in the notify_settings DDL so a row inserted by SQL alone matches a row this module synthesizes. */
+export const DEFAULT_NOTIFY_SETTINGS: Omit<NotifySettings, 'profileId'> = {
+  paused: false,
+  instantEnabled: true,
+  instantPercentile: 0.10,
+  digestHours: [9, 19],
+  quietStart: 22,
+  quietEnd: 8,
+  dailyCap: 6,
+  lastDigestAt: null,
+};
+
+const parseDigestHours = (raw: string): number[] =>
+  raw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n >= 0 && n <= 23);
+
+/** Never inserts — an unconfigured profile reads as the defaults, so existing users need no backfill. */
+export function getNotifySettings(db: DB, profileId: number): NotifySettings {
+  const row = db.prepare('SELECT * FROM notify_settings WHERE profile_id = ?').get(profileId) as
+    | { paused: number; instant_enabled: number; instant_percentile: number; digest_hours: string; quiet_start: number; quiet_end: number; daily_cap: number; last_digest_at: string | null }
+    | undefined;
+  if (!row) return { profileId, ...DEFAULT_NOTIFY_SETTINGS };
+  return {
+    profileId,
+    paused: row.paused === 1,
+    instantEnabled: row.instant_enabled === 1,
+    instantPercentile: row.instant_percentile,
+    digestHours: parseDigestHours(row.digest_hours),
+    quietStart: row.quiet_start,
+    quietEnd: row.quiet_end,
+    dailyCap: row.daily_cap,
+    lastDigestAt: row.last_digest_at,
+  };
+}
+
+export function updateNotifySettings(db: DB, profileId: number, patch: Partial<Omit<NotifySettings, 'profileId'>>): void {
+  const current = getNotifySettings(db, profileId);
+  const next = { ...current, ...patch };
+  db.prepare(`
+    INSERT INTO notify_settings (profile_id, paused, instant_enabled, instant_percentile, digest_hours, quiet_start, quiet_end, daily_cap, last_digest_at)
+    VALUES (@profileId, @paused, @instantEnabled, @instantPercentile, @digestHours, @quietStart, @quietEnd, @dailyCap, @lastDigestAt)
+    ON CONFLICT(profile_id) DO UPDATE SET
+      paused = @paused, instant_enabled = @instantEnabled, instant_percentile = @instantPercentile,
+      digest_hours = @digestHours, quiet_start = @quietStart, quiet_end = @quietEnd,
+      daily_cap = @dailyCap, last_digest_at = @lastDigestAt
+  `).run({
+    profileId,
+    paused: next.paused ? 1 : 0,
+    instantEnabled: next.instantEnabled ? 1 : 0,
+    instantPercentile: next.instantPercentile,
+    digestHours: next.digestHours.join(','),
+    quietStart: next.quietStart,
+    quietEnd: next.quietEnd,
+    dailyCap: next.dailyCap,
+    lastDigestAt: next.lastDigestAt,
+  });
+}
+
+/** INSERT OR IGNORE, so a listing announced instantly is never re-announced in a digest. */
+export function recordNotified(db: DB, profileId: number, listingId: string, kind: 'instant' | 'digest', at: string): void {
+  db.prepare('INSERT OR IGNORE INTO notify_log (profile_id, listing_id, kind, sent_at) VALUES (?, ?, ?, ?)')
+    .run(profileId, listingId, kind, at);
+}
+
+export function countInstantSince(db: DB, profileId: number, sinceIso: string): number {
+  const row = db.prepare("SELECT COUNT(*) AS n FROM notify_log WHERE profile_id = ? AND kind = 'instant' AND sent_at >= ?")
+    .get(profileId, sinceIso) as { n: number };
+  return row.n;
+}
+
+export function getNotifiedListingIds(db: DB, profileId: number): Set<string> {
+  const rows = db.prepare('SELECT listing_id FROM notify_log WHERE profile_id = ?').all(profileId) as { listing_id: string }[];
+  return new Set(rows.map((r) => r.listing_id));
+}
+
+export function getCachedFileId(db: DB, sourceUrl: string): string | null {
+  const row = db.prepare('SELECT file_id FROM photo_cache WHERE source_url = ? AND failed = 0').get(sourceUrl) as
+    { file_id: string | null } | undefined;
+  return row?.file_id ?? null;
+}
+
+export function recordFileId(db: DB, sourceUrl: string, fileId: string, at: string): void {
+  db.prepare(`
+    INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error) VALUES (?, ?, ?, 0, NULL)
+    ON CONFLICT(source_url) DO UPDATE SET file_id = excluded.file_id, cached_at = excluded.cached_at, failed = 0, last_error = NULL
+  `).run(sourceUrl, fileId, at);
+}
+
+export function recordPhotoFailure(db: DB, sourceUrl: string, error: string, at: string): void {
+  db.prepare(`
+    INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error) VALUES (?, NULL, ?, 1, ?)
+    ON CONFLICT(source_url) DO UPDATE SET cached_at = excluded.cached_at, failed = 1, last_error = excluded.last_error
+  `).run(sourceUrl, at, error.slice(0, 500));
+}
+
+export function isKnownBadPhoto(db: DB, sourceUrl: string): boolean {
+  const row = db.prepare('SELECT failed FROM photo_cache WHERE source_url = ?').get(sourceUrl) as { failed: number } | undefined;
+  return row?.failed === 1;
 }
