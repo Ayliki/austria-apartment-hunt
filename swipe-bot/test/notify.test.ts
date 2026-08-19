@@ -5,7 +5,7 @@ import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { dispatchInstant, dispatchDigests, formatPushEntry, MAX_DIGEST_LINES } from '../src/notify.js';
 import {
   openDb, createSearchProfile, upsertListing, updateNotifySettings, getNotifySettings,
-  getNotifiedListingIds, recordSwipe, MCP_CHAT_ID, type DB, type ListingRow,
+  getNotifiedListingIds, recordSwipe, setChatLanguage, MCP_CHAT_ID, type DB, type ListingRow,
 } from '../src/db.js';
 
 const NOW_MIDDAY = new Date('2026-08-19T10:00:00Z'); // 12:00 Vienna, outside quiet hours
@@ -117,21 +117,33 @@ function headerDigits(text: unknown): string[] {
 }
 
 test('formatPushEntry formats title, price, size/rooms/district, and link on separate lines', () => {
-  const text = formatPushEntry(row({ title: 'Nice flat', price: 700, area: 50, rooms: 2, district: 6, url: 'https://x/a' }));
+  const db = openDb(':memory:');
+  const text = formatPushEntry(db, 1, row({ title: 'Nice flat', price: 700, area: 50, rooms: 2, district: 6, url: 'https://x/a' }));
   assert.equal(text, 'Nice flat\n€700 · 50m² · 2 rooms · district 6\nhttps://x/a');
 });
 
 test('formatPushEntry falls back gracefully when price/area/rooms/district are missing, without a dangling separator', () => {
-  const text = formatPushEntry(row({ title: 'Mystery flat', price: null, area: null, rooms: null, district: null, url: 'https://x/b' }));
+  const db = openDb(':memory:');
+  const text = formatPushEntry(db, 1, row({ title: 'Mystery flat', price: null, area: null, rooms: null, district: null, url: 'https://x/b' }));
   assert.equal(text, 'Mystery flat\nprice n/a\nhttps://x/b');
 });
 
 test('formatPushEntry appends a commute line when one is supplied', () => {
+  const db = openDb(':memory:');
   const text = formatPushEntry(
+    db, 1,
     row({ title: 'Nice flat', price: 700, area: 50, rooms: 2, district: 6, url: 'https://x/a' }),
     '18 min walk · 7 min by tram D to TU Wien',
   );
   assert.equal(text, 'Nice flat\n€700 · 50m² · 2 rooms · district 6\n18 min walk · 7 min by tram D to TU Wien\nhttps://x/a');
+});
+
+test('formatPushEntry renders the listing title untranslated, however the chat is set', () => {
+  const db = openDb(':memory:');
+  setChatLanguage(db, 1, 'de');
+  // Scraped content is never translated — only our own labels are.
+  const text = formatPushEntry(db, 1, row({ title: 'Helle Wohnung nahe Naschmarkt', price: 700, area: 50, rooms: 2, district: 6, url: 'https://x/a' }));
+  assert.equal(text, 'Helle Wohnung nahe Naschmarkt\n€700 · 50m² · 2 Zimmer · 6. Bezirk\nhttps://x/a');
 });
 
 test('dispatchInstant sends nothing for a paused profile', async () => {
@@ -409,6 +421,61 @@ test('a listing sent instantly is not repeated in the digest', async () => {
 
   const text = second.calls.map((c) => String(c.payload.text ?? '')).join('\n');
   assert.ok(!text.includes('https://x/hot'), 'an instantly-sent listing must not reappear in the digest');
+});
+
+// --- Final fix wave, item 5b: the digest body is our own chrome and must follow the chat's ---
+// --- language, instead of wrapping an English body in a fully translated header and button. ---
+
+test("a Russian chat's digest body carries no English label", async () => {
+  const db = openDb(':memory:');
+  setChatLanguage(db, 1, 'ru');
+  const profileId = createSearchProfile(db, 1, 'Поиск', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' });
+  upsertListing(db, listing({ id: 'ru1', title: 'Квартира', price: 650, area: 43, rooms: 2, district: 6, url: 'https://x/ru1' }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z')); // 09:05 Vienna
+
+  assert.equal(calls.length, 1);
+  const text = String(calls[0].payload.text);
+  for (const englishLabel of [' rooms', 'district ', 'price n/a']) {
+    assert.ok(!text.includes(englishLabel), `the ru digest still renders the English label "${englishLabel}"`);
+  }
+  // The details line, isolated: title and url are scraped content and stay as the source wrote them,
+  // so only this line is ours to translate. m² is a unit symbol, identical in every catalog.
+  const detailsLine = text.split('\n').find((line) => line.startsWith('€'))!;
+  assert.doesNotMatch(detailsLine.replace(/m²/g, ''), /[A-Za-z]/, `Latin-script label left in: ${detailsLine}`);
+  assert.ok(detailsLine.includes('комн.') && detailsLine.includes('район'));
+});
+
+test("a German chat's digest body carries no English label", async () => {
+  const db = openDb(':memory:');
+  setChatLanguage(db, 1, 'de');
+  const profileId = createSearchProfile(db, 1, 'Suche', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' });
+  upsertListing(db, listing({ id: 'de1', price: 650, area: 43, rooms: 2, district: 6, url: 'https://x/de1' }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z'));
+
+  const detailsLine = String(calls[0].payload.text).split('\n').find((line) => line.startsWith('€'))!;
+  assert.ok(detailsLine.includes('Zimmer') && detailsLine.includes('Bezirk'), detailsLine);
+  assert.ok(!detailsLine.includes('rooms') && !detailsLine.includes('district'), detailsLine);
+});
+
+test('a digest entry with no price renders the localized unknown-price label', async () => {
+  const db = openDb(':memory:');
+  setChatLanguage(db, 1, 'ru');
+  const profileId = createSearchProfile(db, 1, 'Поиск', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' });
+  upsertListing(db, listing({ id: 'nop', title: 'Квартира', price: null, pricePerSqm: null, url: 'https://x/nop' }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z'));
+
+  const text = String(calls[0].payload.text);
+  assert.ok(text.includes('цена не указана'), text);
+  assert.ok(!text.includes('price n/a'), text);
 });
 
 // --- Final fix wave, item 3: a digest that fails must retry only when retrying can ever work. ---

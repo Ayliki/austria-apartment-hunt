@@ -18,13 +18,20 @@ export const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 /** Most listings a single digest enumerates before collapsing the rest into a count. */
 export const MAX_DIGEST_LINES = 5;
 
-/** Pure — one compact line per listing for a digest body. Unchanged from the previous push format. */
-export function formatPushEntry(l: ListingRow, commuteLine: string | null = null): string {
+/**
+ * One compact line per listing for a digest body.
+ *
+ * The labels are ours, not the listing's, so they follow the chat's language — a translated header
+ * and button wrapped around an English body was the one place the digest leaked English into a ru/de
+ * chat. The title and the url stay exactly as the source published them: translating scraped content
+ * would misrepresent the ad. `m²` is a unit symbol, identical in all three catalogs.
+ */
+export function formatPushEntry(db: DB, chatId: number, l: ListingRow, commuteLine: string | null = null): string {
   const parts = [
-    l.price != null ? `€${l.price}` : 'price n/a',
+    l.price != null ? `€${l.price}` : t(db, chatId, 'notify_entry_price_unknown'),
     l.area != null ? `${l.area}m²` : null,
-    l.rooms != null ? `${l.rooms} rooms` : null,
-    l.district != null ? `district ${l.district}` : null,
+    l.rooms != null ? t(db, chatId, 'notify_entry_rooms', { rooms: l.rooms }) : null,
+    l.district != null ? t(db, chatId, 'notify_entry_district', { district: l.district }) : null,
   ].filter(Boolean).join(' · ');
   const commuteSuffix = commuteLine ? `\n${commuteLine}` : '';
   return `${l.title}\n${parts}${commuteSuffix}\n${l.url}`;
@@ -164,7 +171,7 @@ export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, no
 
     const header = t(db, profile.chatId, 'notify_digest_header', { name: profile.name, count: pending.length });
     const best = t(db, profile.chatId, 'notify_digest_best');
-    const body = shown.map((s) => formatPushEntry(s.listing)).join('\n\n');
+    const body = shown.map((s) => formatPushEntry(db, profile.chatId, s.listing)).join('\n\n');
     const text = `${header}\n\n${best}\n\n${body}`;
     const buttons = Markup.inlineKeyboard([[Markup.button.url(t(db, profile.chatId, 'btn_open_listing'), shown[0].listing.url)]]);
 

@@ -88,7 +88,11 @@ export default {
   notify_instant_header: '🔥 Strong match · {name}',
   notify_digest_header: '🏠 {name} · {count} new since your last update',
   notify_digest_best: 'Best of these:',
-  notify_digest_line: '{price} · {details}',
+  // Our own chrome inside a digest entry, not scraped listing content — the title and description
+  // stay in whatever language the listing was written in, these labels follow the chat.
+  notify_entry_rooms: '{rooms} rooms',
+  notify_entry_district: 'district {district}',
+  notify_entry_price_unknown: 'price n/a',
   btn_open_listing: 'Open ▸',
   notify_paused: 'Paused. "{name}" keeps collecting matches, but won\'t message you until you resume.',
   notify_resumed: 'Resumed. You\'ll hear about new matches for "{name}" again.',

@@ -39,6 +39,14 @@ test('LOCALE_NAMES has native-language labels for en, ru, de', () => {
   assert.deepEqual(LOCALE_NAMES, { en: 'English', ru: 'Русский', de: 'Deutsch' });
 });
 
+test('the dead notify_digest_line key is gone from every catalog', () => {
+  // Added by an earlier task, never wired up: the digest renders through formatPushEntry. Its
+  // continued presence made the catalogs look like they described the digest format, which they did not.
+  for (const [locale, catalog] of Object.entries({ en, ru, de } as Record<string, Record<string, string>>)) {
+    assert.equal(catalog.notify_digest_line, undefined, `${locale} still carries the unused notify_digest_line`);
+  }
+});
+
 test('every locale file has exactly the same key set as en.ts (no missing/extra translations)', () => {
   assert.deepEqual(Object.keys(ru).sort(), Object.keys(en).sort());
   assert.deepEqual(Object.keys(de).sort(), Object.keys(en).sort());
@@ -83,7 +91,8 @@ test('de help_full quotes the literal English button labels rather than a transl
 const NOTIFY_PLACEHOLDERS: Record<string, string[]> = {
   notify_instant_header: ['name'],
   notify_digest_header: ['name', 'count'],
-  notify_digest_line: ['price', 'details'],
+  notify_entry_rooms: ['rooms'],
+  notify_entry_district: ['district'],
   notify_paused: ['name'],
   notify_resumed: ['name'],
   notify_menu_header: ['name', 'status', 'cap', 'hours', 'quietStart', 'quietEnd'],
@@ -91,7 +100,7 @@ const NOTIFY_PLACEHOLDERS: Record<string, string[]> = {
 
 /** Keys with no placeholders that still must not be blank in any catalog. */
 const NOTIFY_PLAIN_KEYS = [
-  'notify_digest_best', 'btn_open_listing', 'settings_notifications',
+  'notify_digest_best', 'notify_entry_price_unknown', 'btn_open_listing', 'settings_notifications',
   'btn_pause_search', 'btn_resume_search', 'btn_notify_less', 'btn_notify_more',
   'notify_status_active', 'notify_status_paused',
 ];
