@@ -8,7 +8,7 @@ import {
 import type { CommuteTimes } from '../src/db.js';
 import {
   openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
-  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, recordPhotoFailure, getListingById,
+  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, recordPhotoFailure, getListingById, isKnownBadPhoto,
   type ListingRow, type DB, type SearchProfilePrefs,
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
@@ -1585,23 +1585,54 @@ test('a failing album degrades to a single photo instead of losing the card', as
   await sendCard(telegram, 1, getListingById(db, 'willhaben:1')!, null, db);
 
   assert.equal(calls[0].method, 'sendMediaGroup');
-  assert.ok(calls.some((c) => c.method === 'sendPhoto' || c.method === 'sendMessage'),
-    'card must still reach the user after the album fails');
+  assert.ok(calls.some((c) => c.method === 'sendPhoto'),
+    'card must still reach the user as a single photo after the album fails');
 });
 
-test('a card whose images are all known-bad sends as text without attempting an album', async () => {
+test('a card whose images are all known-bad (permanently) sends as text without attempting an album', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', defaultPrefs());
   upsertListing(db, listing({ id: '2', images: ['https://cdn/dead1.jpg', 'https://cdn/dead2.jpg'] }));
-  // A blacklisted url is only suppressed for a cooldown (see PHOTO_TRANSIENT_COOLDOWN_MS), and
-  // sendCard reads the real clock, so the failures have to be recorded as *recent* ones.
-  const justNow = new Date().toISOString();
-  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'dead', justNow);
-  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'dead', justNow);
+  // 'wrong file identifier' matches PERMANENT_PHOTO_ERRORS (src/db.ts), so this blacklisting never
+  // expires (PHOTO_PERMANENT_COOLDOWN_MS = 30 days) regardless of when the suite happens to run —
+  // unlike a transient error, which only suppresses for PHOTO_TRANSIENT_COOLDOWN_MS (1 hour) against
+  // the real clock sendListingCard reads.
+  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'wrong file identifier', '2026-08-19T06:00:00Z');
+  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'wrong file identifier', '2026-08-19T06:00:00Z');
 
   const { telegram, calls } = testTelegram();
   await sendCard(telegram, 1, getListingById(db, 'willhaben:2')!, null, db);
 
   assert.ok(!calls.some((c) => c.method === 'sendMediaGroup'), 'no album attempted');
   assert.equal(calls[0].method, 'sendMessage');
+});
+
+test('a transient photo failure is no longer suppressed once its cooldown has passed', () => {
+  const db = openDb(':memory:');
+  const recordedAt = new Date('2026-08-19T06:00:00Z');
+  recordPhotoFailure(db, 'https://cdn/flaky.jpg', 'network timeout', recordedAt.toISOString());
+
+  const stillWithinCooldown = new Date(recordedAt.getTime() + 30 * 60 * 1000); // +30min, < 1h cooldown
+  const pastCooldown = new Date(recordedAt.getTime() + 61 * 60 * 1000); // +61min, > 1h cooldown
+
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/flaky.jpg', stillWithinCooldown), true);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/flaky.jpg', pastCooldown), false);
+});
+
+test('a successful album whose companion buttons message fails does not resend the card as a single photo', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '3', images: ['https://cdn/c.jpg', 'https://cdn/d.jpg'] }));
+
+  // sendMediaGroup succeeds (default stub behaviour); the standalone buttons sendMessage that
+  // follows it fails independently (e.g. flood control) — this must NOT trigger a single-photo
+  // resend of the whole card, or the user gets it twice. A missing button row is a far smaller
+  // harm than a duplicated card, so the failure is swallowed (logged), not escalated.
+  const { telegram, calls } = testTelegram((method) =>
+    method === 'sendMessage' ? new Error('429: Too Many Requests') : undefined);
+
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:3')!, null, db);
+
+  assert.equal(calls.filter((c) => c.method === 'sendMediaGroup').length, 1);
+  assert.ok(!calls.some((c) => c.method === 'sendPhoto'), 'the card must not be resent as a single photo');
 });

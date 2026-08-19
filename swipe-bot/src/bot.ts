@@ -263,13 +263,23 @@ async function sendListingCard(
   const images = usablePhotoUrls(db, card.images);
 
   if (images.length >= 2) {
+    let albumSent = false;
     try {
       await telegram.sendMediaGroup(chatId, buildMediaGroup(images, caption));
-      await telegram.sendMessage(chatId, groupPromptText, buttons);
-      return;
+      albumSent = true;
     } catch (err) {
       // Can't tell which image Telegram rejected, so don't blacklist any — just fall through to one photo.
       console.error('bot: album send failed, falling back to a single photo:', err);
+    }
+    if (albumSent) {
+      try {
+        await telegram.sendMessage(chatId, groupPromptText, buttons);
+      } catch (err) {
+        // The album itself already reached the user — a missing button row is far less harmful
+        // than resending the whole card, so this failure is logged, not escalated into a resend.
+        console.error('bot: album buttons message failed:', err);
+      }
+      return;
     }
   }
 
