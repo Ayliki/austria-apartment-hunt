@@ -131,11 +131,14 @@ CREATE TABLE IF NOT EXISTS notify_log (
 CREATE INDEX IF NOT EXISTS idx_notify_log_profile_sent ON notify_log(profile_id, sent_at);
 
 CREATE TABLE IF NOT EXISTS photo_cache (
-  source_url TEXT PRIMARY KEY,
-  file_id    TEXT,
-  cached_at  TEXT NOT NULL,
-  failed     INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT
+  source_url  TEXT PRIMARY KEY,
+  file_id     TEXT,
+  cached_at   TEXT NOT NULL,
+  failed      INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT,
+  -- ISO instant a failed url becomes eligible again. NULL means "no longer suppressed", so a row
+  -- written before this column existed self-heals rather than staying blacklisted forever.
+  retry_after TEXT
 );
 `;
 
@@ -186,6 +189,13 @@ function migrate(db: DB): void {
     db.exec('ALTER TABLE listings ADD COLUMN mentions_pets INTEGER NOT NULL DEFAULT 0');
   }
   repairMissedWaitlistFlags(db);
+
+  const photoCacheColumns = (db.prepare('PRAGMA table_info(photo_cache)').all() as { name: string }[]).map((c) => c.name);
+  if (!photoCacheColumns.includes('retry_after')) {
+    // Left NULL on purpose: every url blacklisted by the old permanent-blacklist code gets one more
+    // chance rather than being written off for good.
+    db.exec('ALTER TABLE photo_cache ADD COLUMN retry_after TEXT');
+  }
 
   const shortlistColumns = (db.prepare('PRAGMA table_info(shortlist)').all() as { name: string }[]).map((c) => c.name);
   if (!shortlistColumns.includes('profile_id')) {
@@ -950,27 +960,57 @@ export function getNotifiedListingIds(db: DB, profileId: number): Set<string> {
   return new Set(rows.map((r) => r.listing_id));
 }
 
-export function getCachedFileId(db: DB, sourceUrl: string): string | null {
-  const row = db.prepare('SELECT file_id FROM photo_cache WHERE source_url = ? AND failed = 0').get(sourceUrl) as
-    { file_id: string | null } | undefined;
+/**
+ * A failed url is suppressed for a while, not forever. photo_cache is keyed by url and shared by
+ * every user, so a single Telegram 429 or origin hiccup used to downgrade one image to a text-only
+ * card for everybody, permanently — the exact opposite of what this cache is for.
+ */
+export const PHOTO_TRANSIENT_COOLDOWN_MS = 60 * 60 * 1000;            // 1 hour  — 429s, timeouts, 5xx
+export const PHOTO_PERMANENT_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;  // 30 days — the url itself is bad
+
+/** Telegram wordings that mean the URL is genuinely unusable rather than momentarily unreachable. */
+const PERMANENT_PHOTO_ERRORS = ['wrong file identifier', 'failed to get http url content', 'webpage_curl_failed'];
+
+export function isPermanentPhotoError(error: string): boolean {
+  const message = error.toLowerCase();
+  return PERMANENT_PHOTO_ERRORS.some((pattern) => message.includes(pattern));
+}
+
+/** True while a recorded failure is still within its cooldown. A NULL retry_after has already lapsed. */
+function isSuppressed(row: { failed: number; retry_after: string | null } | undefined, now: Date): boolean {
+  if (row == null || row.failed !== 1) return false;
+  return row.retry_after != null && now.toISOString() < row.retry_after;
+}
+
+export function getCachedFileId(db: DB, sourceUrl: string, now: Date = new Date()): string | null {
+  const row = db.prepare('SELECT file_id, failed, retry_after FROM photo_cache WHERE source_url = ?').get(sourceUrl) as
+    { file_id: string | null; failed: number; retry_after: string | null } | undefined;
+  // A transient failure must not throw away a file_id we already hold — reuse it once the cooldown lapses.
+  if (isSuppressed(row, now)) return null;
   return row?.file_id ?? null;
 }
 
 export function recordFileId(db: DB, sourceUrl: string, fileId: string, at: string): void {
   db.prepare(`
-    INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error) VALUES (?, ?, ?, 0, NULL)
-    ON CONFLICT(source_url) DO UPDATE SET file_id = excluded.file_id, cached_at = excluded.cached_at, failed = 0, last_error = NULL
+    INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error, retry_after) VALUES (?, ?, ?, 0, NULL, NULL)
+    ON CONFLICT(source_url) DO UPDATE SET
+      file_id = excluded.file_id, cached_at = excluded.cached_at, failed = 0, last_error = NULL, retry_after = NULL
   `).run(sourceUrl, fileId, at);
 }
 
+/** Suppresses the url for a cooldown chosen from what Telegram actually said — long only for a genuinely dead URL. */
 export function recordPhotoFailure(db: DB, sourceUrl: string, error: string, at: string): void {
+  const cooldownMs = isPermanentPhotoError(error) ? PHOTO_PERMANENT_COOLDOWN_MS : PHOTO_TRANSIENT_COOLDOWN_MS;
+  const retryAfter = new Date(new Date(at).getTime() + cooldownMs).toISOString();
   db.prepare(`
-    INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error) VALUES (?, NULL, ?, 1, ?)
-    ON CONFLICT(source_url) DO UPDATE SET cached_at = excluded.cached_at, failed = 1, last_error = excluded.last_error
-  `).run(sourceUrl, at, error.slice(0, 500));
+    INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error, retry_after) VALUES (?, NULL, ?, 1, ?, ?)
+    ON CONFLICT(source_url) DO UPDATE SET
+      cached_at = excluded.cached_at, failed = 1, last_error = excluded.last_error, retry_after = excluded.retry_after
+  `).run(sourceUrl, at, error.slice(0, 500), retryAfter);
 }
 
-export function isKnownBadPhoto(db: DB, sourceUrl: string): boolean {
-  const row = db.prepare('SELECT failed FROM photo_cache WHERE source_url = ?').get(sourceUrl) as { failed: number } | undefined;
-  return row?.failed === 1;
+export function isKnownBadPhoto(db: DB, sourceUrl: string, now: Date = new Date()): boolean {
+  const row = db.prepare('SELECT failed, retry_after FROM photo_cache WHERE source_url = ?').get(sourceUrl) as
+    { failed: number; retry_after: string | null } | undefined;
+  return isSuppressed(row, now);
 }

@@ -15,9 +15,9 @@ export async function sendPhotoCached(
   telegram: Telegraf['telegram'], db: DB, chatId: number,
   sourceUrl: string, caption: string, extra: Record<string, unknown>, now: Date,
 ): Promise<boolean> {
-  const cached = getCachedFileId(db, sourceUrl);
+  const cached = getCachedFileId(db, sourceUrl, now);
 
-  if (cached == null && isKnownBadPhoto(db, sourceUrl)) {
+  if (cached == null && isKnownBadPhoto(db, sourceUrl, now)) {
     await sendTextFallback(telegram, chatId, caption, extra);
     return false;
   }
@@ -48,7 +48,11 @@ async function sendTextFallback(
   }
 }
 
-/** Filters out images Telegram has already rejected, so an album never fails wholesale on a URL we know is dead. */
-export function usablePhotoUrls(db: DB, urls: string[]): string[] {
-  return urls.filter((u) => !isKnownBadPhoto(db, u));
+/**
+ * Filters out images Telegram has rejected recently, so an album never fails wholesale on a URL we
+ * currently believe is dead. Suppression expires (see PHOTO_TRANSIENT_COOLDOWN_MS), so a url dropped
+ * after a 429 comes back on its own instead of being lost to every user for good.
+ */
+export function usablePhotoUrls(db: DB, urls: string[], now: Date = new Date()): string[] {
+  return urls.filter((u) => !isKnownBadPhoto(db, u, now));
 }

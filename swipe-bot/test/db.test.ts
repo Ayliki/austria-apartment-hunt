@@ -14,7 +14,8 @@ import {
   upsertActiveProfilePrefs, getChatLanguage, setChatLanguage, MAX_SEARCH_PROFILES_PER_CHAT,
   getWizardState, setWizardState, deleteWizardState,
   getNotifySettings, updateNotifySettings, recordNotified, countInstantSince, getNotifiedListingIds,
-  getCachedFileId, recordFileId, recordPhotoFailure, isKnownBadPhoto,
+  getCachedFileId, recordFileId, recordPhotoFailure, isKnownBadPhoto, isPermanentPhotoError,
+  PHOTO_TRANSIENT_COOLDOWN_MS, PHOTO_PERMANENT_COOLDOWN_MS,
   type ListingRow, type SearchProfilePrefs,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
@@ -1062,4 +1063,51 @@ test('photo cache stores and returns a file_id, and flags known-bad urls', () =>
   recordPhotoFailure(db, 'https://cdn/dead.jpg', 'wrong file identifier', '2026-08-19T06:00:00Z');
   assert.equal(getCachedFileId(db, 'https://cdn/dead.jpg'), null);
   assert.equal(isKnownBadPhoto(db, 'https://cdn/dead.jpg'), true);
+});
+
+test('isPermanentPhotoError only matches wordings that mean the url itself is unusable', () => {
+  assert.equal(isPermanentPhotoError('400: Bad Request: wrong file identifier/HTTP URL specified'), true);
+  assert.equal(isPermanentPhotoError('400: Bad Request: failed to get HTTP URL content'), true);
+  assert.equal(isPermanentPhotoError('400: Bad Request: WEBPAGE_CURL_FAILED'), true);
+  assert.equal(isPermanentPhotoError('429: Too Many Requests: retry after 30'), false);
+  assert.equal(isPermanentPhotoError('socket hang up'), false);
+  assert.equal(isPermanentPhotoError('502 Bad Gateway'), false);
+});
+
+test('a transient photo failure suppresses the url only for the transient cooldown', () => {
+  const db = openDb(':memory:');
+  const at = new Date('2026-08-19T06:00:00Z');
+  recordPhotoFailure(db, 'https://cdn/blip.jpg', 'socket hang up', at.toISOString());
+
+  const before = new Date(at.getTime() + PHOTO_TRANSIENT_COOLDOWN_MS - 1000);
+  const after = new Date(at.getTime() + PHOTO_TRANSIENT_COOLDOWN_MS + 1000);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/blip.jpg', before), true);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/blip.jpg', after), false);
+});
+
+test('a permanent photo failure outlives the transient cooldown by a wide margin', () => {
+  const db = openDb(':memory:');
+  const at = new Date('2026-08-19T06:00:00Z');
+  recordPhotoFailure(db, 'https://cdn/dead.jpg', 'WEBPAGE_CURL_FAILED', at.toISOString());
+
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/dead.jpg', new Date(at.getTime() + PHOTO_TRANSIENT_COOLDOWN_MS * 100)), true);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/dead.jpg', new Date(at.getTime() + PHOTO_PERMANENT_COOLDOWN_MS + 1000)), false);
+});
+
+test('a row blacklisted before retry_after existed self-heals rather than staying suppressed', () => {
+  const db = openDb(':memory:');
+  // Exactly what the pre-migration code wrote: failed = 1 with no expiry at all.
+  db.prepare("INSERT INTO photo_cache (source_url, file_id, cached_at, failed, last_error) VALUES (?, NULL, ?, 1, 'legacy')")
+    .run('https://cdn/legacy.jpg', '2026-08-19T06:00:00Z');
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/legacy.jpg', new Date('2026-08-19T06:00:01Z')), false);
+});
+
+test('a successful send clears a prior failure permanently', () => {
+  const db = openDb(':memory:');
+  recordPhotoFailure(db, 'https://cdn/x.jpg', 'WEBPAGE_CURL_FAILED', '2026-08-19T06:00:00Z');
+  recordFileId(db, 'https://cdn/x.jpg', 'FILEID123', '2026-08-19T07:00:00Z');
+
+  const later = new Date('2026-08-19T08:00:00Z');
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/x.jpg', later), false);
+  assert.equal(getCachedFileId(db, 'https://cdn/x.jpg', later), 'FILEID123');
 });
