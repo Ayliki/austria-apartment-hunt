@@ -1593,8 +1593,11 @@ test('a card whose images are all known-bad sends as text without attempting an 
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', defaultPrefs());
   upsertListing(db, listing({ id: '2', images: ['https://cdn/dead1.jpg', 'https://cdn/dead2.jpg'] }));
-  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'dead', '2026-08-19T06:00:00Z');
-  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'dead', '2026-08-19T06:00:00Z');
+  // A blacklisted url is only suppressed for a cooldown (see PHOTO_TRANSIENT_COOLDOWN_MS), and
+  // sendCard reads the real clock, so the failures have to be recorded as *recent* ones.
+  const justNow = new Date().toISOString();
+  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'dead', justNow);
+  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'dead', justNow);
 
   const { telegram, calls } = testTelegram();
   await sendCard(telegram, 1, getListingById(db, 'willhaben:2')!, null, db);
