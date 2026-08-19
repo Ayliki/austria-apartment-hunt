@@ -1,33 +1,23 @@
-import { type Telegraf } from 'telegraf';
+import { type Telegraf, Markup } from 'telegraf';
 import {
-  type DB, type ListingRow,
+  type DB, type ListingRow, type SearchProfile,
   getAllSearchProfiles, getSwipedWithDirection, matchesPrefs, MCP_CHAT_ID,
+  getCandidateListings, getNotifySettings, updateNotifySettings,
+  recordNotified, countInstantSince, getNotifiedListingIds,
 } from './db.js';
-import { rankListings } from './scoring.js';
-import { sendCard, getCommuteLineFor, type ComputeCommuteFn, type GeocodeFn } from './bot.js';
+import { scoreListings } from './scoring.js';
+import { viennaHour, viennaDayStartIso, isQuietHour, instantThreshold, isDigestDue } from './notify-policy.js';
+import { sendPhotoCached } from './photo.js';
+import { formatCaption } from './bot.js';
 import { t } from './locales.js';
 
-/** Caps a single push burst per user — protects against a preference change (or a big poll) flooding a chat. */
-export const MAX_PUSH_PER_USER = 5;
+/** Trailing window the instant threshold's percentile is computed over. */
+export const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
-/**
- * Milliseconds to wait between one matching profile's push and the next. Telegram applies flood
- * control per chat-pair-of-seconds; staggering multi-profile bursts (Tasks 7-9 let one chat hold
- * several saved searches) keeps a single poll cycle from firing every profile's messages back to
- * back. Exported so tests can assert on it and inject a no-op delay instead of actually sleeping.
- */
-export const PUSH_STAGGER_MS = 1500;
+/** Most listings a single digest enumerates before collapsing the rest into a count. */
+export const MAX_DIGEST_LINES = 5;
 
-/** Injectable so tests don't actually sleep; production callers omit this and get the real timer. */
-export type DelayFn = (ms: number) => Promise<void>;
-const realDelay: DelayFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Pure — one compact line per listing for a push notification's body: title, price, size/rooms/district,
- * an optional appended commute line, and the link. Local to this file: pushes are the only remaining
- * surface needing a compact multi-listing format, so nothing is shared with or imported from bot.ts
- * here — `commuteLine` is a plain string computed by the caller via bot.ts's getCommuteLineFor helper.
- */
+/** Pure — one compact line per listing for a digest body. Unchanged from the previous push format. */
 export function formatPushEntry(l: ListingRow, commuteLine: string | null = null): string {
   const parts = [
     l.price != null ? `€${l.price}` : 'price n/a',
@@ -39,64 +29,130 @@ export function formatPushEntry(l: ListingRow, commuteLine: string | null = null
   return `${l.title}\n${parts}${commuteSuffix}\n${l.url}`;
 }
 
+/** Every profile eligible to receive anything: real chat, not paused. */
+function notifiableProfiles(db: DB): SearchProfile[] {
+  return getAllSearchProfiles(db).filter(
+    (p) => p.chatId !== MCP_CHAT_ID && !getNotifySettings(db, p.id).paused,
+  );
+}
+
 /**
- * Proactively messages every user whose preferences match a freshly-polled listing, so they see it
- * as soon as it's found instead of only on their next /next. Best-ranked matches are sent first;
- * the MCP sentinel chat is skipped since it has no real Telegram chat to push to.
- *
- * Delivery is grouped and paced per profile: each matching profile gets a header (naming the
- * profile, since one chat can hold several saved searches) followed by a full swipe-style card for
- * each shown listing — photo album / single photo / text-with-caption, with the same 👍/👎 buttons
- * as /next. A stagger between profiles avoids Telegram flood-control on chats with multiple active
- * searches.
- *
- * Product decision (flagged by Task 3's review, resolved here): getAllSearchProfiles returns every
- * saved profile for a chat regardless of its `active` flag, and this function deliberately does not
- * filter by `active` — every saved search stays "live" for polling/pushing, not just the one the
- * user currently has selected in /searches. `active` only controls which profile /next, /shortlist,
- * and other single-profile UI act on; it is not a pause switch for a saved search.
+ * Scores of everything this profile matched in the trailing 30 days — the sample the instant
+ * percentile is measured against. Uses the profile's own swipe history, so the threshold tracks
+ * the same learned ranking the deck does.
  */
-export async function notifyNewMatches(
-  telegram: Telegraf['telegram'], db: DB, newListings: ListingRow[], computeCommute: ComputeCommuteFn, geocode: GeocodeFn,
-  delay: DelayFn = realDelay,
+function recentScoresFor(db: DB, profile: SearchProfile, now: Date): number[] {
+  const cutoff = new Date(now.getTime() - THIRTY_DAYS_MS).toISOString();
+  const recent = getCandidateListings(db, profile.chatId, profile.prefs)
+    .filter((l) => l.firstSeen >= cutoff);
+  return scoreListings(recent, getSwipedWithDirection(db, profile.chatId)).map((s) => s.score);
+}
+
+/**
+ * Proactively messages a profile about a genuinely strong new match, at most `dailyCap` times a
+ * Vienna day and never during quiet hours.
+ *
+ * Deliberately different from the pre-2026-08-19 behaviour, which pushed up to 5 full photo-album
+ * cards per profile per 3h poll with no cap, no pause, and no quiet hours. Here a listing must
+ * clear both an absolute bar (valueFlag 'good') and a relative one (top `instantPercentile` of the
+ * profile's trailing 30 days), and each notification is a single message.
+ *
+ * Quiet-hour and over-cap listings are not marked notified, so they roll into the next digest
+ * rather than being lost.
+ */
+export async function dispatchInstant(
+  telegram: Telegraf['telegram'], db: DB, newListings: ListingRow[], now: Date,
 ): Promise<void> {
   if (newListings.length === 0) return;
 
-  let first = true;
-  for (const profile of getAllSearchProfiles(db)) {
-    if (profile.chatId === MCP_CHAT_ID) continue;
+  for (const profile of notifiableProfiles(db)) {
+    const settings = getNotifySettings(db, profile.id);
+    if (!settings.instantEnabled) continue;
+    if (isQuietHour(viennaHour(now), settings.quietStart, settings.quietEnd)) continue;
 
-    const matches = newListings.filter((l) => matchesPrefs(l, profile.prefs));
+    const alreadySent = getNotifiedListingIds(db, profile.id);
+    const matches = newListings.filter((l) => matchesPrefs(l, profile.prefs) && !alreadySent.has(l.id));
     if (matches.length === 0) continue;
 
-    if (!first) await delay(PUSH_STAGGER_MS);
-    first = false;
+    const threshold = instantThreshold(recentScoresFor(db, profile, now), settings.instantPercentile);
+    const scored = scoreListings(matches, getSwipedWithDirection(db, profile.chatId));
 
-    const ranked = rankListings(matches, getSwipedWithDirection(db, profile.chatId));
-    const toShow = ranked.slice(0, MAX_PUSH_PER_USER);
+    let budget = settings.dailyCap - countInstantSince(db, profile.id, viennaDayStartIso(now));
 
-    const headerKey = matches.length === 1 ? 'push_header_one' : 'push_header_many';
-    await telegram.sendMessage(profile.chatId, t(db, profile.chatId, headerKey, { name: profile.name, count: matches.length }));
+    for (const { listing, score } of scored) {
+      if (budget <= 0) break;
+      // Absolute bar first: a listing that isn't good value never pings, however it ranks.
+      if (listing.valueFlag !== 'good') continue;
+      if (threshold != null && score < threshold) continue;
 
-    for (const l of toShow) {
-      // A single Routes API failure must degrade this one listing to no commute line, not abort the
-      // whole profile's push (the old pre-Task-10 caller effectively could, since it awaited commute
-      // inline with no isolation between listings) — genuinely more resilient than prior behavior.
-      let commuteLine: string | null = null;
+      // One profile's failure (blocked bot, deleted chat) must not stop the others.
       try {
-        commuteLine = await getCommuteLineFor(db, profile.id, l, profile.prefs, computeCommute, geocode);
-      } catch {
-        commuteLine = null;
+        await sendInstantCard(telegram, db, profile, listing, now);
+      } catch (err) {
+        console.error(`notify: instant send failed for profile ${profile.id}:`, err);
+        continue;
       }
-      // Send the full swipe card so pushes include every photo, not just a one-image link preview.
-      await sendCard(telegram, profile.chatId, l, commuteLine, db);
+      recordNotified(db, profile.id, listing.id, 'instant', now.toISOString());
+      budget--;
+    }
+  }
+}
+
+/**
+ * One message, never an album: sendMediaGroup cannot carry an inline keyboard, so every extra photo
+ * used to cost a second, contentless message. The hero photo plus a full caption says the same thing
+ * in one notification.
+ */
+async function sendInstantCard(
+  telegram: Telegraf['telegram'], db: DB, profile: SearchProfile, listing: ListingRow, now: Date,
+): Promise<void> {
+  const header = t(db, profile.chatId, 'notify_instant_header', { name: profile.name });
+  const caption = formatCaption(listing, null, `${header}\n\n`, t(db, profile.chatId, 'pet_badge'));
+  const buttons = Markup.inlineKeyboard([[Markup.button.url(t(db, profile.chatId, 'btn_open_listing'), listing.url)]]);
+
+  const hero = listing.images[0];
+  if (hero != null) {
+    await sendPhotoCached(telegram, db, profile.chatId, hero, caption, { ...buttons }, now);
+    return;
+  }
+  await telegram.sendMessage(profile.chatId, caption, buttons);
+}
+
+/**
+ * One text-only summary per profile at each configured digest hour, covering everything matched
+ * since that profile's last digest that wasn't already sent instantly. No photos: the digest exists
+ * to be scannable, not to reproduce the deck.
+ */
+export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, now: Date): Promise<void> {
+  for (const profile of notifiableProfiles(db)) {
+    const settings = getNotifySettings(db, profile.id);
+    if (!isDigestDue(now, settings.digestHours, settings.lastDigestAt)) continue;
+
+    const alreadySent = getNotifiedListingIds(db, profile.id);
+    const pending = getCandidateListings(db, profile.chatId, profile.prefs).filter((l) => !alreadySent.has(l.id));
+    if (pending.length === 0) {
+      // Still stamp the run, so an empty 09:00 doesn't make 09:05 look due all morning.
+      updateNotifySettings(db, profile.id, { lastDigestAt: now.toISOString() });
+      continue;
     }
 
-    if (matches.length > toShow.length) {
-      await telegram.sendMessage(
-        profile.chatId,
-        t(db, profile.chatId, 'push_more', { count: matches.length - toShow.length }),
-      );
+    const scored = scoreListings(pending, getSwipedWithDirection(db, profile.chatId));
+    const shown = scored.slice(0, MAX_DIGEST_LINES);
+
+    const header = t(db, profile.chatId, 'notify_digest_header', { name: profile.name, count: pending.length });
+    const best = t(db, profile.chatId, 'notify_digest_best');
+    const body = shown.map((s) => formatPushEntry(s.listing)).join('\n\n');
+    const text = `${header}\n\n${best}\n\n${body}`;
+    const buttons = Markup.inlineKeyboard([[Markup.button.url(t(db, profile.chatId, 'btn_open_listing'), shown[0].listing.url)]]);
+
+    try {
+      await telegram.sendMessage(profile.chatId, text, buttons);
+    } catch (err) {
+      console.error(`notify: digest send failed for profile ${profile.id}:`, err);
+      continue; // don't stamp lastDigestAt — retry on the next tick
     }
+
+    for (const s of shown) recordNotified(db, profile.id, s.listing.id, 'digest', now.toISOString());
+    updateNotifySettings(db, profile.id, { lastDigestAt: now.toISOString() });
   }
 }

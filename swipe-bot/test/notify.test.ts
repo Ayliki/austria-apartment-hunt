@@ -1,28 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Telegram } from 'telegraf';
-import { notifyNewMatches, MAX_PUSH_PER_USER, PUSH_STAGGER_MS, formatPushEntry, type DelayFn } from '../src/notify.js';
-import { openDb, createSearchProfile, MCP_CHAT_ID, type ListingRow } from '../src/db.js';
-import type { ComputeCommuteFn, GeocodeFn } from '../src/bot.js';
+import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
+import { dispatchInstant, dispatchDigests, formatPushEntry } from '../src/notify.js';
+import {
+  openDb, createSearchProfile, upsertListing, updateNotifySettings, MCP_CHAT_ID, type ListingRow,
+} from '../src/db.js';
 
-const FAKE_COMPUTE_COMMUTE: ComputeCommuteFn = async () => ({ walkMinutes: null, transitMinutes: null, transitSummary: null });
-const WORKING_COMPUTE_COMMUTE: ComputeCommuteFn = async () => ({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' });
-const NEVER_GEOCODE: GeocodeFn = async () => { throw new Error('geocode should not have been called'); };
+const NOW_MIDDAY = new Date('2026-08-19T10:00:00Z'); // 12:00 Vienna, outside quiet hours
+const NOW_NIGHT = new Date('2026-08-19T23:30:00Z'); // 01:30 Vienna, inside quiet hours
 
-function commuteProfilePrefs(overrides: Partial<Parameters<typeof createSearchProfile>[2]> = {}) {
+function commuteProfilePrefs(overrides: Partial<Parameters<typeof createSearchProfile>[3]> = {}) {
   return {
     priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null,
     includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false,
     commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695,
     ...overrides,
   };
-}
-
-/** Injectable no-op delay so tests don't actually sleep PUSH_STAGGER_MS per assertion. */
-function noSleepDelay(): { delay: DelayFn; calls: number[] } {
-  const calls: number[] = [];
-  const delay: DelayFn = async (ms) => { calls.push(ms); };
-  return { delay, calls };
 }
 
 function row(overrides: Partial<ListingRow>): ListingRow {
@@ -36,23 +30,53 @@ function row(overrides: Partial<ListingRow>): ListingRow {
   };
 }
 
+/** Storable twin of `row` — upsertListing takes apt-hunter's NormalizedListing, not a ListingRow. */
+function listing(overrides: Partial<NormalizedListing & { firstSeen: string }> = {}): NormalizedListing {
+  return {
+    source: 'willhaben', id: '1', url: 'https://x/1', title: 'Flat',
+    price: 650, pricePerSqm: 15, area: 43, rooms: 2, district: 6, zip: '1060',
+    addressLine: null, lat: null, lon: null, isPrivate: true,
+    requiresWaitlistTicket: false, isShortTerm: false, isWg: false, images: [], description: null,
+    dateCreated: '2026-08-01T00:00:00Z', valueFlag: 'fair',
+    lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null, mentionsPets: false,
+    ...overrides,
+  };
+}
+
 interface Call { method: string; payload: Record<string, unknown> }
 
 // Same interception point as bot.test.ts: every Telegram instance shares this prototype method.
 let activeCalls: Call[] | null = null;
+let nextResult: ((method: string, payload: Record<string, unknown>) => unknown) | null = null;
 (Telegram.prototype as unknown as { callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown> }).callApi =
   async function callApi(method, payload) {
     if (!activeCalls) throw new Error('callApi invoked outside a test context');
     activeCalls.push({ method, payload });
+    const result = nextResult?.(method, payload);
+    if (result instanceof Error) throw result;
+    if (result !== undefined) return result;
     if (method === 'sendMediaGroup') return [];
     return { message_id: activeCalls.length, date: 0, chat: { id: (payload.chat_id as number) ?? 0, type: 'private' } };
   };
 
-function testTelegram(): { telegram: Telegram; calls: Call[] } {
+function testTelegram(
+  result?: (method: string, payload: Record<string, unknown>) => unknown,
+): { telegram: Telegram; calls: Call[] } {
   const telegram = new Telegram('test-token');
   const calls: Call[] = [];
   activeCalls = calls;
+  nextResult = result ?? null;
   return { telegram, calls };
+}
+
+/** Seeds `count` scored listings into the profile's trailing window so instantThreshold has a sample. */
+function seedHistory(db: ReturnType<typeof openDb>, count: number): void {
+  for (let i = 0; i < count; i++) {
+    upsertListing(db, listing({
+      id: `willhaben:hist${i}`, price: 600, valueFlag: 'fair',
+      firstSeen: '2026-08-15T00:00:00Z', url: `https://x/hist${i}`,
+    }));
+  }
 }
 
 test('formatPushEntry formats title, price, size/rooms/district, and link on separate lines', () => {
@@ -73,172 +97,171 @@ test('formatPushEntry appends a commute line when one is supplied', () => {
   assert.equal(text, 'Nice flat\n€700 · 50m² · 2 rooms · district 6\n18 min walk · 7 min by tram D to TU Wien\nhttps://x/a');
 });
 
-test('notifyNewMatches does nothing when there are no new listings', async () => {
+test('dispatchInstant sends nothing for a paused profile', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { paused: true });
+  seedHistory(db, 30);
+
   const { telegram, calls } = testTelegram();
-  await notifyNewMatches(telegram, db, [], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
-  assert.equal(calls.length, 0);
-});
-
-test('notifyNewMatches sends one header plus a full swipe card per shown listing', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
-
-  const matches = Array.from({ length: 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700, images: ['https://img/1.jpg'] }));
-  const { delay } = noSleepDelay();
-  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
-
-  const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  const sendPhotoCalls = calls.filter((c) => c.method === 'sendPhoto');
-  assert.equal(sendMessageCalls.length, 1); // header only
-  assert.equal(sendPhotoCalls.length, 3); // one full card per listing
-  assert.match(sendMessageCalls[0].payload.text as string, /🏠 Test — 3 new matches:/);
-  for (const c of sendPhotoCalls) {
-    assert.match(c.payload.caption as string, /€700/);
-    const keyboard = (c.payload.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] });
-    assert.ok(keyboard.inline_keyboard.some((r) => r.some((b) => b.callback_data.startsWith('like:') || b.callback_data.startsWith('pass:'))), 'each card has 👍/👎 buttons');
-  }
-});
-
-test('notifyNewMatches caps each profile at MAX_PUSH_PER_USER matches shown, with a "+N more" note', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
-
-  const matches = Array.from({ length: MAX_PUSH_PER_USER + 3 }, (_, i) => row({ id: `willhaben:${i}`, price: 700, images: ['https://img/1.jpg'] }));
-  const { delay } = noSleepDelay();
-  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
-
-  const sendMessageCalls = calls.filter((c) => c.method === 'sendMessage');
-  const sendPhotoCalls = calls.filter((c) => c.method === 'sendPhoto');
-  assert.equal(sendPhotoCalls.length, MAX_PUSH_PER_USER); // capped number of full cards
-  assert.equal(sendMessageCalls.length, 2); // header + "+N more"
-  assert.match(sendMessageCalls[0].payload.text as string, new RegExp(`${matches.length} new matches`));
-  assert.match(sendMessageCalls.at(-1)!.payload.text as string, /\+3 more — check \/next\./);
-});
-
-test('notifyNewMatches header includes the profile name so multi-profile users know which search matched', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Cheap flats', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
-  createSearchProfile(db, 1, 'District 6 only', { priceFrom: null, priceTo: 2000, districts: [6], roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
-  const { telegram, calls } = testTelegram();
-
-  const matches = [row({ id: 'willhaben:a', price: 700, district: 6 })];
-  const { delay } = noSleepDelay();
-  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
-
-  const headers = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).startsWith('🏠')).map((c) => c.payload.text as string);
-  assert.equal(headers.length, 2);
-  assert.ok(headers.some((h) => h.includes('Cheap flats')));
-  assert.ok(headers.some((h) => h.includes('District 6 only')));
-});
-
-test('notifyNewMatches staggers sends across profiles by PUSH_STAGGER_MS to avoid Telegram flood-control', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'First', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
-  createSearchProfile(db, 1, 'Second', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
-  createSearchProfile(db, 1, 'Third', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null }, false);
-  const { telegram } = testTelegram();
-
-  const matches = [row({ id: 'willhaben:a', price: 700 })];
-  const { delay, calls: delayCalls } = noSleepDelay();
-  await notifyNewMatches(telegram, db, matches, FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
-
-  // 3 matching profiles -> delay called once per profile after the first (2 times), each PUSH_STAGGER_MS
-  assert.deepEqual(delayCalls, [PUSH_STAGGER_MS, PUSH_STAGGER_MS]);
-});
-
-test('notifyNewMatches skips a user whose prefs the listing does not satisfy', async () => {
-  const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
-
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 900 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good' })], NOW_MIDDAY);
 
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches never pushes to the MCP sentinel chat', async () => {
+test('dispatchInstant sends nothing during quiet hours', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, MCP_CHAT_ID, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good' })], NOW_NIGHT);
 
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches never pushes municipal/waitlist housing to a user who opted out', async () => {
+test('dispatchInstant sends exactly one photo message for a top match', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: false, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700, requiresWaitlistTicket: true })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good', images: ['https://cdn/a.jpg'] })], NOW_MIDDAY);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'sendPhoto');
+});
+
+test('dispatchInstant never sends an album, however many photos a listing has', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({
+    id: 'willhaben:new', valueFlag: 'good',
+    images: ['https://cdn/a.jpg', 'https://cdn/b.jpg', 'https://cdn/c.jpg'],
+  })], NOW_MIDDAY);
+
+  assert.ok(!calls.some((c) => c.method === 'sendMediaGroup'));
+});
+
+test('dispatchInstant skips listings that are not flagged good value', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'premium' })], NOW_MIDDAY);
 
   assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches sends separate, independent pushes to different matching users', async () => {
+test('dispatchInstant stops at the daily cap', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', { priceFrom: null, priceTo: 800, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  createSearchProfile(db, 2, 'Test', { priceFrom: null, priceTo: 500, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { dailyCap: 2 });
+  seedHistory(db, 30);
+
   const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [
+    row({ id: 'willhaben:n1', valueFlag: 'good', url: 'https://x/1' }),
+    row({ id: 'willhaben:n2', valueFlag: 'good', url: 'https://x/2' }),
+    row({ id: 'willhaben:n3', valueFlag: 'good', url: 'https://x/3' }),
+  ], NOW_MIDDAY);
 
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE);
-
-  const chatIds = new Set(calls.map((c) => c.payload.chat_id));
-  assert.deepEqual(chatIds, new Set([1])); // only chat 1's budget covers 700
+  assert.equal(calls.length, 2);
 });
 
-test('notifyNewMatches keeps polling and pushing for inactive (non-current) saved searches, not just the active one', async () => {
+test('dispatchInstant never sends the same listing twice', async () => {
   const db = openDb(':memory:');
-  // Two profiles for the same chat; the second one deactivates the first (only one profile can be
-  // active at a time per createSearchProfile's default makeActive=true), mirroring a user who has
-  // switched their "current" search in /searches without deleting the old one.
-  createSearchProfile(db, 1, 'Old search', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  createSearchProfile(db, 1, 'New search', { priceFrom: null, priceTo: 2000, districts: null, roomsFrom: null, roomsTo: null, areaFrom: null, areaTo: null, includeWaitlistHousing: true, includeWg: true, requireElevator: false, requireParking: false, commuteDestination: null, commuteLat: null, commuteLon: null });
-  const { telegram, calls } = testTelegram();
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+  const hot = row({ id: 'willhaben:new', valueFlag: 'good' });
 
-  const { delay } = noSleepDelay();
-  await notifyNewMatches(telegram, db, [row({ id: 'willhaben:a', price: 700 })], FAKE_COMPUTE_COMMUTE, NEVER_GEOCODE, delay);
+  const first = testTelegram();
+  await dispatchInstant(first.telegram, db, [hot], NOW_MIDDAY);
+  const second = testTelegram();
+  await dispatchInstant(second.telegram, db, [hot], NOW_MIDDAY);
 
-  const headers = calls.filter((c) => c.method === 'sendMessage' && (c.payload.text as string).startsWith('🏠')).map((c) => c.payload.text as string);
-  assert.ok(headers.some((h) => h.includes('Old search')), 'inactive/non-current profile should still be pushed to');
-  assert.ok(headers.some((h) => h.includes('New search')));
+  assert.equal(second.calls.length, 0);
 });
 
-test('notifyNewMatches includes each listing\'s commute line when the profile has a commute destination configured', async () => {
+test('dispatchInstant never touches the MCP sentinel chat', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Commuter', commuteProfilePrefs());
+  createSearchProfile(db, MCP_CHAT_ID, 'MCP', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+
   const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good' })], NOW_MIDDAY);
 
-  const matches = [row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37, images: ['https://img/1.jpg'] })];
-  await notifyNewMatches(telegram, db, matches, WORKING_COMPUTE_COMMUTE, NEVER_GEOCODE);
-
-  const listingMessages = calls.filter((c) => c.method === 'sendPhoto');
-  assert.equal(listingMessages.length, 1);
-  assert.match(listingMessages[0].payload.caption as string, /📍 18 min walk · 7 min by tram D to TU Wien/);
+  assert.equal(calls.length, 0);
 });
 
-test('notifyNewMatches degrades a single listing to no commute line on a Routes failure, without aborting the rest of the push', async () => {
+test('a failing send for one profile does not stop the next profile', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Commuter', commuteProfilePrefs());
+  createSearchProfile(db, 1, 'A', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  createSearchProfile(db, 2, 'B', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+
+  const { telegram, calls } = testTelegram((method, payload) =>
+    method === 'sendPhoto' && payload.chat_id === 1 ? new Error('blocked by user') : undefined);
+
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good', images: ['https://cdn/a.jpg'] })], NOW_MIDDAY);
+
+  assert.ok(calls.some((c) => c.payload.chat_id === 2), 'profile B must still be notified');
+});
+
+test('dispatchDigests sends one text message summarising unsent matches', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  upsertListing(db, listing({ id: 'd1', price: 700, url: 'https://x/d1' }));
+  upsertListing(db, listing({ id: 'd2', price: 750, url: 'https://x/d2' }));
+
   const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z')); // 09:05 Vienna
 
-  const failingComputeCommute: ComputeCommuteFn = async () => { throw new Error('Routes API down'); };
-  const matches = [
-    row({ id: 'willhaben:a', price: 700, lat: 48.2, lon: 16.37, images: ['https://img/1.jpg'] }),
-    row({ id: 'willhaben:b', price: 750, lat: 48.21, lon: 16.38, images: ['https://img/2.jpg'] }),
-  ];
-  await notifyNewMatches(telegram, db, matches, failingComputeCommute, NEVER_GEOCODE);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'sendMessage');
+  assert.match(String(calls[0].payload.text), /2/);
+});
 
-  const sendPhotoCalls = calls.filter((c) => c.method === 'sendPhoto');
-  assert.equal(sendPhotoCalls.length, 2, 'the push loop must complete despite the Routes failure');
-  for (const c of sendPhotoCalls) {
-    const caption = c.payload.caption as string;
-    assert.ok(/€700|€750/.test(caption));
-    assert.doesNotMatch(caption, /📍/, 'no commute line should appear when the Routes call fails');
-  }
+test('dispatchDigests sends nothing when no digest hour is due', async () => {
+  const db = openDb(':memory:');
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-19T07:01:00Z' });
+  upsertListing(db, listing({ id: 'd1' }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T12:05:00Z')); // 14:05 Vienna
+
+  assert.equal(calls.length, 0);
+});
+
+test('dispatchDigests sends nothing when there is nothing new', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z'));
+
+  assert.equal(calls.length, 0);
+});
+
+test('a listing sent instantly is not repeated in the digest', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+  // Stored id is `${source}:${id}`, so this row is the same listing the instant ping records.
+  upsertListing(db, listing({ id: 'hot', valueFlag: 'good', url: 'https://x/hot' }));
+  const hot = row({ id: 'willhaben:hot', valueFlag: 'good', url: 'https://x/hot' });
+
+  const first = testTelegram();
+  await dispatchInstant(first.telegram, db, [hot], NOW_MIDDAY);
+
+  const second = testTelegram();
+  await dispatchDigests(second.telegram, db, new Date('2026-08-19T17:05:00Z')); // 19:05 Vienna
+
+  const text = second.calls.map((c) => String(c.payload.text ?? '')).join('\n');
+  assert.ok(!text.includes('https://x/hot'), 'an instantly-sent listing must not reappear in the digest');
 });

@@ -6,11 +6,18 @@ import { openDb } from './db.js';
 import { createBot, BOT_COMMANDS, type BotDeps } from './bot.js';
 import { runPoll } from './poller.js';
 import { refreshAllListings } from './refresh.js';
-import { notifyNewMatches } from './notify.js';
+import { dispatchInstant, dispatchDigests } from './notify.js';
 import { geocode, computeCommute } from './commute.js';
 
 const POLL_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3h, matches apt-hunter's LaunchAgent cadence
 const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6h so listings taken down between polls get flagged faster than the previous daily sweep
+
+/**
+ * Digests fire at wall-clock hours (09:00/19:00 by default), but polling runs every 3h from an
+ * arbitrary process-start offset — so digests need their own short tick. isDigestDue() is idempotent
+ * within a configured hour, so ticking often is cheap and only the first tick past the hour sends.
+ */
+const DIGEST_TICK_MS = 5 * 60 * 1000;
 
 async function main(): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -33,7 +40,9 @@ async function main(): Promise<void> {
       const { inserted, warnings } = await runPoll(db);
       for (const w of warnings) console.error('WARNING:', w);
       console.log(`poll: ${inserted.length} new listings`);
-      await notifyNewMatches(bot.telegram, db, inserted, deps.computeCommute, deps.geocode);
+      // Instant cards carry no commute line: computing one per ping costs Routes quota for a
+      // message the user may never open, so deps.computeCommute/geocode stay with createBot.
+      await dispatchInstant(bot.telegram, db, inserted, new Date());
     } catch (err) {
       console.error('poll failed:', err);
     }
@@ -64,6 +73,15 @@ async function main(): Promise<void> {
   await poll(); // seed the DB immediately on startup, then on the interval
   const pollTimer = setInterval(poll, POLL_INTERVAL_MS);
 
+  const digest = async () => {
+    try {
+      await dispatchDigests(bot.telegram, db, new Date());
+    } catch (err) {
+      console.error('digest failed:', err);
+    }
+  };
+  const digestTimer = setInterval(digest, DIGEST_TICK_MS);
+
   refresh(); // fire-and-forget: backfill on first start, but must never block bot.launch() — a full-DB sweep can take minutes and refresh() already has its own internal try/catch, never throws
   const refreshTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
 
@@ -79,6 +97,7 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     clearInterval(pollTimer);
     clearInterval(refreshTimer);
+    clearInterval(digestTimer);
     try {
       bot.stop(signal);
     } catch (err) {
