@@ -13,7 +13,7 @@ import {
   updateSearchProfile, renameSearchProfile, deleteSearchProfile, countSearchProfiles, getAllSearchProfiles,
   upsertActiveProfilePrefs, getChatLanguage, setChatLanguage, MAX_SEARCH_PROFILES_PER_CHAT,
   getWizardState, setWizardState, deleteWizardState,
-  getNotifySettings, updateNotifySettings, recordNotified, countInstantSince, getNotifiedListingIds,
+  getNotifySettings, updateNotifySettings, recordNotified, countInstantSince, getNotifiedListingIds, DEFAULT_NOTIFY_SETTINGS,
   getCachedFileId, recordFileId, recordPhotoFailure, isKnownBadPhoto, isPermanentPhotoError,
   PHOTO_TRANSIENT_COOLDOWN_MS, PHOTO_PERMANENT_COOLDOWN_MS,
   type ListingRow, type SearchProfilePrefs,
@@ -1049,6 +1049,29 @@ test('recordNotified is idempotent for the same profile and listing', () => {
   recordNotified(db, 1, 'willhaben:a', 'instant', '2026-08-19T06:00:00Z');
   recordNotified(db, 1, 'willhaben:a', 'digest', '2026-08-19T07:00:00Z');
   assert.equal(getNotifiedListingIds(db, 1).size, 1);
+});
+
+test('getNotifySettings reads defaults without inserting a row for an unconfigured profile', () => {
+  const db = openDb(':memory:');
+  const settings = getNotifySettings(db, 1);
+
+  assert.deepEqual(settings, { profileId: 1, ...DEFAULT_NOTIFY_SETTINGS });
+  // Reading must never write — a backfill on read would make "unconfigured" indistinguishable from
+  // "explicitly set to the defaults", and would strand rows for profiles that never opted in.
+  const { n } = db.prepare('SELECT COUNT(*) AS n FROM notify_settings').get() as { n: number };
+  assert.equal(n, 0);
+
+  // Still zero after several reads, including for a profile that does not exist at all.
+  getNotifySettings(db, 1);
+  getNotifySettings(db, 999);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM notify_settings').get() as { n: number }).n, 0);
+});
+
+test('the notify_settings DDL defaults match DEFAULT_NOTIFY_SETTINGS exactly', () => {
+  const db = openDb(':memory:');
+  // A row inserted by SQL alone must read back as the same defaults this module synthesizes.
+  db.prepare('INSERT INTO notify_settings (profile_id) VALUES (?)').run(7);
+  assert.deepEqual(getNotifySettings(db, 7), { profileId: 7, ...DEFAULT_NOTIFY_SETTINGS });
 });
 
 test('photo cache stores and returns a file_id, and flags known-bad urls', () => {

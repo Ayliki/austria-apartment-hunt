@@ -74,8 +74,11 @@ export const MIN_THRESHOLD_SAMPLE = 20;
  */
 export function instantThreshold(recentScores: number[], percentile: number): number | null {
   if (recentScores.length < MIN_THRESHOLD_SAMPLE) return null;
+  // A percentile outside [0, 1] would index past either end and return undefined, breaking the
+  // `number | null` contract for every caller — settings come from user input, so clamp rather than trust.
+  const clamped = Math.min(1, Math.max(0, percentile));
   const sorted = [...recentScores].sort((a, b) => a - b);
-  const index = Math.min(sorted.length - 1, Math.floor(sorted.length * (1 - percentile)));
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * (1 - clamped))));
   return sorted[index];
 }
 

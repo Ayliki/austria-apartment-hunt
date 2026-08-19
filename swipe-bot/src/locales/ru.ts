@@ -82,7 +82,7 @@ export default {
     '{safetyNotice}',
 
   notify_instant_header: '🔥 Отличный вариант · {name}',
-  notify_digest_header: '🏠 {name} — {count} новых с прошлого раза',
+  notify_digest_header: '🏠 {name} · {count} новых с прошлого раза',
   notify_digest_best: 'Лучшее из них:',
   notify_digest_line: '{price} · {details}',
   btn_open_listing: 'Открыть ▸',

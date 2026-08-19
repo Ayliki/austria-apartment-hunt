@@ -103,10 +103,50 @@ test('scoreListings returns scores alongside listings, sorted descending', () =>
   assert.deepEqual(scored.map((s) => s.score), [1, 0.5, 0]);
 });
 
-test('rankListings returns the same order scoreListings does', () => {
-  const listings = [row({ id: 'a', valueFlag: 'premium' }), row({ id: 'b', valueFlag: 'good' })];
+// rankListings is a projection of scoreListings, so comparing the two proves nothing. What the
+// scoreListings extraction had to preserve is the RANKING BEHAVIOUR itself — assert that instead.
+test('rankListings orders good > fair > premium at cold start', () => {
+  const listings = [
+    row({ id: 'premium', valueFlag: 'premium' }),
+    row({ id: 'fair', valueFlag: 'fair' }),
+    row({ id: 'good', valueFlag: 'good' }),
+  ];
+  assert.deepEqual(rankListings(listings, []).map((l) => l.id), ['good', 'fair', 'premium']);
+});
+
+test('rankListings applies a warm profile\'s learned preference over the raw value flag', () => {
+  // Enough swipes to leave cold start, all teaching the same thing: district 6 good, district 1 bad.
+  const swiped = Array.from({ length: COLD_START_THRESHOLD }, (_, i) => (
+    i % 2 === 0
+      ? { listing: row({ id: `l${i}`, district: 6 }), direction: 'like' as const }
+      : { listing: row({ id: `l${i}`, district: 1 }), direction: 'pass' as const }
+  ));
+  assert.ok(swiped.length >= COLD_START_THRESHOLD, 'fixture must clear the cold-start threshold');
+
+  // Same value flag on both, so the ONLY thing that can separate them is what the profile learned.
+  // Ordered disliked-first on input, so a no-op ranker would leave them in the wrong order.
+  const listings = [
+    row({ id: 'disliked-district', valueFlag: 'fair', district: 1 }),
+    row({ id: 'liked-district', valueFlag: 'fair', district: 6 }),
+  ];
+  assert.deepEqual(
+    rankListings(listings, swiped).map((l) => l.id),
+    ['liked-district', 'disliked-district'],
+  );
+
+  // At cold start the learned term is not consulted at all, so the input order survives —
+  // which is what proves the reordering above came from the profile.
   assert.deepEqual(
     rankListings(listings, []).map((l) => l.id),
-    scoreListings(listings, []).map((s) => s.listing.id),
+    ['disliked-district', 'liked-district'],
   );
+});
+
+test('scoreListings exposes the score that produced the ranking, descending', () => {
+  const listings = [row({ id: 'premium', valueFlag: 'premium' }), row({ id: 'good', valueFlag: 'good' })];
+  const scored = scoreListings(listings, []);
+  assert.deepEqual(scored.map((s) => s.listing.id), ['good', 'premium']);
+  assert.equal(scored[0].score, 1);
+  assert.equal(scored[1].score, 0);
+  assert.ok(scored[0].score > scored[1].score);
 });

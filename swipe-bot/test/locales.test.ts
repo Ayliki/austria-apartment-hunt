@@ -75,13 +75,72 @@ test('de help_full quotes the literal English button labels rather than a transl
   assert.doesNotMatch(de.help_full, /Weiter \/ 📋 Merkliste \/ ⚙️ Einstellungen/); // old, inaccurate translated mention
 });
 
-test('notification keys exist and carry their placeholders in every catalog', () => {
-  for (const catalog of [en, ru, de]) {
-    assert.match(catalog.notify_instant_header, /\{name\}/);
-    assert.match(catalog.notify_digest_header, /\{count\}/);
-    assert.match(catalog.notify_digest_header, /\{name\}/);
-    assert.match(catalog.notify_digest_line, /\{price\}/);
-    assert.ok(catalog.btn_open_listing.length > 0);
-    assert.ok(catalog.notify_paused.length > 0);
+/**
+ * Every notification key added for the quiet notifier, with the exact placeholders bot.ts feeds it.
+ * A placeholder missing from one catalog renders as a literal `{cap}` to that user, and the
+ * key-parity test above cannot catch it — only the placeholder set can.
+ */
+const NOTIFY_PLACEHOLDERS: Record<string, string[]> = {
+  notify_instant_header: ['name'],
+  notify_digest_header: ['name', 'count'],
+  notify_digest_line: ['price', 'details'],
+  notify_paused: ['name'],
+  notify_resumed: ['name'],
+  notify_menu_header: ['name', 'status', 'cap', 'hours', 'quietStart', 'quietEnd'],
+};
+
+/** Keys with no placeholders that still must not be blank in any catalog. */
+const NOTIFY_PLAIN_KEYS = [
+  'notify_digest_best', 'btn_open_listing', 'settings_notifications',
+  'btn_pause_search', 'btn_resume_search', 'btn_notify_less', 'btn_notify_more',
+];
+
+const CATALOGS = { en, ru, de } as Record<string, Record<string, string>>;
+
+test('every notification key carries all of its placeholders in every catalog', () => {
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    for (const [key, placeholders] of Object.entries(NOTIFY_PLACEHOLDERS)) {
+      const value = catalog[key];
+      assert.ok(typeof value === 'string' && value.length > 0, `${locale}.${key} is missing or empty`);
+      for (const placeholder of placeholders) {
+        assert.ok(value.includes(`{${placeholder}}`), `${locale}.${key} is missing {${placeholder}}`);
+      }
+    }
+  }
+});
+
+test('no notification string carries a placeholder the caller never supplies', () => {
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    for (const [key, placeholders] of Object.entries(NOTIFY_PLACEHOLDERS)) {
+      const used = [...catalog[key].matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
+      for (const name of used) {
+        assert.ok(placeholders.includes(name), `${locale}.${key} uses an unsupplied placeholder {${name}}`);
+      }
+    }
+  }
+});
+
+test('placeholder-free notification keys are present and non-empty in every catalog', () => {
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    for (const key of NOTIFY_PLAIN_KEYS) {
+      assert.ok(typeof catalog[key] === 'string' && catalog[key].length > 0, `${locale}.${key} is missing or empty`);
+    }
+  }
+});
+
+test('German copy closes every „ with a matching “ rather than a straight quote', () => {
+  for (const [key, value] of Object.entries(de as Record<string, string>)) {
+    const opens = (value.match(/„/g) ?? []).length;
+    const closes = (value.match(/“/g) ?? []).length;
+    assert.equal(closes, opens, `de.${key} opens ${opens} German quote(s) but closes ${closes}`);
+    assert.ok(!/„[^“]*"/.test(value), `de.${key} closes a „ with a straight double quote`);
+  }
+});
+
+test('user-facing notification copy carries no decorative em dash', () => {
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    for (const key of [...Object.keys(NOTIFY_PLACEHOLDERS), ...NOTIFY_PLAIN_KEYS]) {
+      assert.ok(!catalog[key].includes('—'), `${locale}.${key} contains an em dash`);
+    }
   }
 });

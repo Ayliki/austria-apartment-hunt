@@ -85,7 +85,7 @@ export default {
     '{safetyNotice}',
 
   notify_instant_header: '🔥 Strong match · {name}',
-  notify_digest_header: '🏠 {name} — {count} new since your last update',
+  notify_digest_header: '🏠 {name} · {count} new since your last update',
   notify_digest_best: 'Best of these:',
   notify_digest_line: '{price} · {details}',
   btn_open_listing: 'Open ▸',

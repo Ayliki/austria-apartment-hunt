@@ -87,6 +87,17 @@ test('instantThreshold returns null below the minimum sample size', () => {
   assert.equal(instantThreshold(scores, 0.10), null);
 });
 
+test('instantThreshold clamps an out-of-range percentile instead of returning undefined', () => {
+  const scores = Array.from({ length: 100 }, (_, i) => i / 100); // 0.00 … 0.99
+  // Above 1: "top 500%" is everything, so the bar is the lowest score — never undefined.
+  assert.equal(instantThreshold(scores, 5), 0);
+  // Below 0: the bar is the highest score, still a real number.
+  assert.equal(instantThreshold(scores, -1), 0.99);
+  for (const p of [-1, 0, 0.5, 1, 5, Number.POSITIVE_INFINITY]) {
+    assert.equal(typeof instantThreshold(scores, p), 'number', `percentile ${p} must yield a number`);
+  }
+});
+
 test('instantThreshold never returns a threshold no listing can reach', () => {
   const scores = Array.from({ length: 50 }, () => 0.5); // every listing identical
   assert.equal(instantThreshold(scores, 0.10), 0.5);
