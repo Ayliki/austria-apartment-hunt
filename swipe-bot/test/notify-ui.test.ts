@@ -24,8 +24,10 @@ test('nextDailyCap steps up the ladder and stops at the ceiling', () => {
 });
 
 test('nextDailyCap snaps an off-ladder value onto the ladder', () => {
-  assert.ok(CAP_LADDER.includes(nextDailyCap(7, 'less')));
-  assert.ok(CAP_LADDER.includes(nextDailyCap(7, 'more')));
+  // 7 is off-ladder; its nearest rung is 6 (|7-6|=1 vs |7-12|=5), so stepping from there must
+  // land on the ladder's actual neighbours of 6, not just any ladder member.
+  assert.equal(nextDailyCap(7, 'less'), 3);
+  assert.equal(nextDailyCap(7, 'more'), 12);
 });
 
 test('renderNotifyMenu offers Pause for an active profile and Resume for a paused one', () => {

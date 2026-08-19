@@ -704,7 +704,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       t(db, chatId, 'settings_menu_title', { name: profile.name }),
       Markup.inlineKeyboard([
         ...SETTINGS_FIELD_BUTTONS.map(([label, field]) => [Markup.button.callback(label, `editfield:${profile.id}:${field}`)]),
-        [Markup.button.callback(t(db, chatId, 'settings_notifications'), 'notify:menu')],
+        [Markup.button.callback(t(db, chatId, 'settings_notifications'), `notify:menu:${profile.id}`)],
       ]),
     );
   }
@@ -766,13 +766,27 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     );
   });
 
-  bot.action(/^notify:menu$/, async (ctx) => {
-    const chatId = ctx.chat!.id;
-    const profile = getActiveSearchProfile(db, chatId);
-    if (!profile) { await ctx.answerCbQuery(t(db, chatId, 'no_active_search')); return; }
+  /**
+   * Re-renders the notify menu into the message the user tapped, instead of posting a new one —
+   * the house pattern at bot.ts:659/editfield: above. Telegram rejects an edit whose text+markup
+   * are byte-identical to what's already there (e.g. tapping "More alerts" again at the ceiling
+   * rung), so that failure is swallowed as best-effort rather than surfaced to the user.
+   */
+  async function rerenderNotifyMenu(ctx: { editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown> }, db: DB, chatId: number, profile: SearchProfile): Promise<void> {
     const { text, keyboard } = renderNotifyMenu(db, chatId, profile);
+    try {
+      await ctx.editMessageText(text, keyboard);
+    } catch {
+      // best-effort — see doc comment above
+    }
+  }
+
+  bot.action(/^notify:menu:(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const profile = getSearchProfile(db, Number(ctx.match[1]));
+    if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
     await ctx.answerCbQuery();
-    await ctx.reply(text, keyboard);
+    await rerenderNotifyMenu(ctx, db, chatId, profile);
   });
 
   bot.action(/^notify:(pause|resume):(\d+)$/, async (ctx) => {
@@ -782,8 +796,8 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
 
     updateNotifySettings(db, profile.id, { paused });
-    await ctx.answerCbQuery();
-    await ctx.reply(t(db, chatId, paused ? 'notify_paused' : 'notify_resumed', { name: profile.name }));
+    await ctx.answerCbQuery(t(db, chatId, paused ? 'notify_paused' : 'notify_resumed', { name: profile.name }));
+    await rerenderNotifyMenu(ctx, db, chatId, profile);
   });
 
   bot.action(/^notify:cap:(less|more):(\d+)$/, async (ctx) => {
@@ -793,9 +807,8 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
 
     updateNotifySettings(db, profile.id, { dailyCap: nextDailyCap(getNotifySettings(db, profile.id).dailyCap, direction) });
-    const { text, keyboard } = renderNotifyMenu(db, chatId, profile);
     await ctx.answerCbQuery();
-    await ctx.reply(text, keyboard);
+    await rerenderNotifyMenu(ctx, db, chatId, profile);
   });
 
   bot.action('wizard:new', async (ctx) => {

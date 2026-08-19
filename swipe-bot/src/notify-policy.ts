@@ -1,7 +1,7 @@
 /**
  * Every scheduling and threshold decision for notifications, as pure functions over an explicit
- * `now`. Kept free of DB and Telegram imports so the whole policy is testable without fakes, in the
- * same spirit as notify.ts's own dependency-free design.
+ * `now`. This module itself is free of DB and Telegram imports (unlike notify.ts, which wires
+ * these policy functions up to telegraf, db, and photo), so the policy is testable without fakes.
  */
 
 const VIENNA = 'Europe/Vienna';

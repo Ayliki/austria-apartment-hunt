@@ -93,6 +93,7 @@ const NOTIFY_PLACEHOLDERS: Record<string, string[]> = {
 const NOTIFY_PLAIN_KEYS = [
   'notify_digest_best', 'btn_open_listing', 'settings_notifications',
   'btn_pause_search', 'btn_resume_search', 'btn_notify_less', 'btn_notify_more',
+  'notify_status_active', 'notify_status_paused',
 ];
 
 const CATALOGS = { en, ru, de } as Record<string, Record<string, string>>;
@@ -155,10 +156,20 @@ test('help_full mentions pausing a search, in each catalog\'s own language', () 
   assert.match(de.help_full, /pausier/i);
 });
 
+// These check wording specific to the NEW quiet-hours behaviour, not just "digest" in general —
+// "digest/summary" alone already matched the old "I send a summary of what's already out there"
+// sentence describing profile-activation summaries, so it couldn't fail against the pre-rewrite
+// copy. "quiet hours" (and its ru/de equivalents) only exists in the new copy.
 test('help_full mentions the digest/summary concept, in each catalog\'s own language', () => {
   assert.match(en.help_full, /digest|summary/i);
   assert.match(ru.help_full, /сводк/i);
   assert.match(de.help_full, /übersicht|zusammenfassung/i);
+});
+
+test('help_full describes quiet hours, in each catalog\'s own language', () => {
+  assert.match(en.help_full, /quiet hours/i);
+  assert.match(ru.help_full, /тихие часы/i);
+  assert.match(de.help_full, /ruhezeiten/i);
 });
 
 test('help_full still carries the {maxProfiles} and {safetyNotice} placeholders after the notifications rewrite', () => {

@@ -20,7 +20,7 @@ export function renderNotifyMenu(
   db: DB, chatId: number, profile: SearchProfile,
 ): { text: string; keyboard: ReturnType<typeof Markup.inlineKeyboard> } {
   const s = getNotifySettings(db, profile.id);
-  const status = t(db, chatId, s.paused ? 'btn_resume_search' : 'btn_pause_search');
+  const status = t(db, chatId, s.paused ? 'notify_status_paused' : 'notify_status_active');
 
   const text = t(db, chatId, 'notify_menu_header', {
     name: profile.name,

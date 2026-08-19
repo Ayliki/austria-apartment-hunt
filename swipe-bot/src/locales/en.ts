@@ -68,7 +68,7 @@ export default {
     'Everything else goes into a digest at set times each day (mornings and evenings by default), so you ' +
     'still see it without getting pinged for every listing. Overnight I stay quiet: anything found during ' +
     'quiet hours waits for the next digest instead of buzzing your phone. Swipe 👍 on a card to save it to ' +
-    'your shortlist, or 👎 to pass, each card keeps an ↩️ Undo button until you swipe the next one. The ' +
+    'your shortlist, or 👎 to pass; each card keeps an ↩️ Undo button until you swipe the next one. The ' +
     'more you swipe, the better matches get: I learn which price/size/district combos you tend to like. ' +
     'You can pause any search from /settings without losing it: it keeps collecting matches quietly and ' +
     'picks up right where it left off when you resume.\n\n' +
@@ -94,6 +94,8 @@ export default {
   notify_resumed: 'Resumed. You\'ll hear about new matches for "{name}" again.',
   settings_notifications: '🔔 Notifications',
   notify_menu_header: 'Notifications for "{name}": {status}\nUp to {cap} instant alerts a day, plus a summary at {hours}. Quiet {quietStart}:00–{quietEnd}:00.',
+  notify_status_active: 'Active',
+  notify_status_paused: 'Paused',
   btn_pause_search: '⏸ Pause this search',
   btn_resume_search: '▶️ Resume this search',
   btn_notify_less: '🔉 Fewer alerts',

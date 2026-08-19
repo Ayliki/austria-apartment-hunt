@@ -146,9 +146,10 @@ commute address) instead of typing free text. Finishing it shows a summary of
 what already matches, with a "Browse top matches ▸" button to jump straight
 into swiping. 👍 saves a card to `/shortlist`; 👍/👎 both advance to the next
 card. `/searches` lists, switches between, or deletes your saved searches (up
-to 5 per chat) — each one polls and pushes independently. `/settings` edits a
-single field (budget, districts, etc.) of the active search without re-running
-the whole wizard. `/next` re-checks the queue on demand (useful right after a
+to 5 per chat) — each one polls and notifies independently. `/settings` edits
+a single field (budget, districts, etc.) of the active search, or its 🔔
+Notifications entry (pause/resume, fewer/more instant alerts), without
+re-running the whole wizard. `/next` re-checks the queue on demand (useful right after a
 poll lands new listings). `/language` switches the bot's UI between English,
 Russian, and German (listing content itself is never translated).
 

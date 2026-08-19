@@ -66,7 +66,7 @@ export default {
     'im letzten Monat gesehen hat), schicke ich sie dir sofort, bis zu ein paar Mal am Tag. Alles andere sammle ich in einer ' +
     'Übersicht zu festen Zeiten am Tag (standardmäßig morgens und abends), damit du nichts verpasst, auch ohne Sofortmeldung. ' +
     'Nachts bin ich still: Was in den Ruhezeiten gefunden wird, wartet auf die nächste Übersicht, statt dein Handy zu wecken. ' +
-    'Wische 👍, um eine Karte in deine Merkliste zu speichern, oder 👎 zum Überspringen, jede Karte behält eine ↩️ Rückgängig-Schaltfläche, ' +
+    'Wische 👍, um eine Karte in deine Merkliste zu speichern, oder 👎 zum Überspringen; jede Karte behält eine ↩️ Rückgängig-Schaltfläche, ' +
     'bis du die nächste wischst. Je mehr du wischst, desto besser werden die Treffer: ich lerne, welche Preis-/Größen-/Bezirks-Kombinationen ' +
     'dir gefallen. Du kannst jede Suche über /settings pausieren, ohne sie zu verlieren: sie sammelt im Hintergrund weiter Treffer ' +
     'und macht dort weiter, wo sie war, sobald du sie fortsetzt.\n\n' +
@@ -92,6 +92,8 @@ export default {
   notify_resumed: 'Fortgesetzt. Du hörst wieder von neuen Treffern für „{name}“.',
   settings_notifications: '🔔 Benachrichtigungen',
   notify_menu_header: 'Benachrichtigungen für „{name}“: {status}\nBis zu {cap} Sofortmeldungen pro Tag, dazu eine Übersicht um {hours}. Ruhe von {quietStart}:00 bis {quietEnd}:00.',
+  notify_status_active: 'Aktiv',
+  notify_status_paused: 'Pausiert',
   btn_pause_search: '⏸ Suche pausieren',
   btn_resume_search: '▶️ Suche fortsetzen',
   btn_notify_less: '🔉 Weniger',
