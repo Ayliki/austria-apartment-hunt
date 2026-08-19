@@ -10,6 +10,7 @@ import {
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
 import { t, LOCALE_NAMES } from './locales.js';
+import { sendPhotoCached, usablePhotoUrls } from './photo.js';
 import {
   WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs, parseCustomBudget,
   type WizardState, type WizardChoice, type WizardStepId,
@@ -248,20 +249,36 @@ export function appendSwipeStatus(originalText: string, status: string): string 
   return GROUP_PLACEHOLDER_TEXTS.includes(originalText) ? status : `${originalText}\n\n${status}`;
 }
 
-/** Low-level: sends a listing as photo album / single photo / text, with the given inline buttons. Used by sendCard (swipe deck: 👍👎) — shortlist browsing (bot.ts) has its own single-photo-only sender, since a message it will later edit in place can never be a multi-photo album. */
+/**
+ * Low-level: sends a listing as photo album / single photo / text, with the given inline buttons.
+ *
+ * sendMediaGroup is atomic — one dead URL fails the whole album with "group send failed" — so
+ * images Telegram has already rejected are filtered out first, and an album that still fails falls
+ * back to a single photo (itself fail-soft) rather than losing the card entirely.
+ */
 async function sendListingCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, caption: string,
-  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string, db: DB,
 ): Promise<void> {
-  if (card.images.length >= 2) {
-    // sendMediaGroup can't carry an inline keyboard on any item — send the album, then the buttons separately.
-    await telegram.sendMediaGroup(chatId, buildMediaGroup(card.images, caption));
-    await telegram.sendMessage(chatId, groupPromptText, buttons);
-  } else if (card.images.length === 1) {
-    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
-  } else {
-    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+  const images = usablePhotoUrls(db, card.images);
+
+  if (images.length >= 2) {
+    try {
+      await telegram.sendMediaGroup(chatId, buildMediaGroup(images, caption));
+      await telegram.sendMessage(chatId, groupPromptText, buttons);
+      return;
+    } catch (err) {
+      // Can't tell which image Telegram rejected, so don't blacklist any — just fall through to one photo.
+      console.error('bot: album send failed, falling back to a single photo:', err);
+    }
   }
+
+  if (images.length >= 1) {
+    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons }, new Date());
+    return;
+  }
+
+  await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
 }
 
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
@@ -273,7 +290,7 @@ export async function sendCard(
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
-  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT);
+  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT, db);
 }
 
 /** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */

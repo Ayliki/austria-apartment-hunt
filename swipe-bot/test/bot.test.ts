@@ -1,14 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createBot, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor,
+  createBot, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor, sendCard,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
   summarizeMatches, formatAggregateSummary, sendProfileActivationSummary,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
   openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
-  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, type ListingRow, type DB, type SearchProfilePrefs,
+  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, recordPhotoFailure, getListingById,
+  type ListingRow, type DB, type SearchProfilePrefs,
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
@@ -272,6 +273,10 @@ let activeCalls: Call[] | null = null;
 // used to simulate a Telegram API failure (e.g. editMessageMedia rejecting an expired CDN URL)
 // without needing a full mock-framework dependency.
 let forceFailureOnce: string | null = null;
+// Optional per-method result override (mirrors test/photo.test.ts's testTelegram), used by
+// testTelegram() below. Left null by default (and reset by createTestBot) so the handler-level
+// tests above keep today's canned responses.
+let resultFn: ((method: string, payload: Record<string, unknown>) => unknown) | null = null;
 (Telegram.prototype as unknown as { callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown> }).callApi =
   async function callApi(method, payload) {
     if (!activeCalls) throw new Error('callApi invoked outside a test bot context');
@@ -280,10 +285,23 @@ let forceFailureOnce: string | null = null;
       throw new Error(`simulated ${method} failure`);
     }
     activeCalls.push({ method, payload });
+    const result = resultFn?.(method, payload);
+    if (result instanceof Error) throw result;
+    if (result !== undefined) return result;
     if (method === 'sendMediaGroup') return [];
     if (method === 'answerCallbackQuery') return true;
     return { message_id: activeCalls.length, date: 0, chat: { id: (payload.chat_id as number) ?? 0, type: 'private' } };
   };
+
+/** Direct-invocation counterpart to createTestBot(), for tests that call a bot.ts function (e.g. sendCard) straight
+ * rather than driving it through Telegraf's update dispatch. Defaults to today's canned responses. */
+function testTelegram(result?: (method: string, payload: Record<string, unknown>) => unknown): { telegram: Telegram; calls: Call[] } {
+  const telegram = new Telegram('test-token');
+  const calls: Call[] = [];
+  activeCalls = calls;
+  resultFn = result ?? null;
+  return { telegram, calls };
+}
 
 const DEFAULT_TEST_DEPS: BotDeps = {
   geocode: async (address) => (address.trim().toLowerCase() === 'nowhere' ? null : { lat: 48.1986, lon: 16.3695 }),
@@ -295,6 +313,7 @@ function createTestBot(db: DB, deps: Partial<BotDeps> = {}): { bot: Telegraf; ca
   (bot as unknown as { botInfo: unknown }).botInfo = { id: 1, is_bot: true, first_name: 'Test', username: 'testbot' };
   const calls: Call[] = [];
   activeCalls = calls;
+  resultFn = null;
   return { bot, calls };
 }
 
@@ -1553,4 +1572,33 @@ test('completing the wizard via buttons still attaches MAIN_KEYBOARD, even thoug
   const navMessage = calls.find((c) => c.method === 'sendMessage' && (c.payload.reply_markup as { keyboard?: unknown } | undefined)?.keyboard);
   assert.ok(navMessage, 'expected MAIN_KEYBOARD to be attached to some message after button-driven wizard completion');
   assert.deepEqual((navMessage!.payload.reply_markup as { keyboard: string[][] }).keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('a failing album degrades to a single photo instead of losing the card', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '1', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram((method) =>
+    method === 'sendMediaGroup' ? new Error('400: Bad Request: group send failed') : undefined);
+
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:1')!, null, db);
+
+  assert.equal(calls[0].method, 'sendMediaGroup');
+  assert.ok(calls.some((c) => c.method === 'sendPhoto' || c.method === 'sendMessage'),
+    'card must still reach the user after the album fails');
+});
+
+test('a card whose images are all known-bad sends as text without attempting an album', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '2', images: ['https://cdn/dead1.jpg', 'https://cdn/dead2.jpg'] }));
+  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'dead', '2026-08-19T06:00:00Z');
+  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'dead', '2026-08-19T06:00:00Z');
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:2')!, null, db);
+
+  assert.ok(!calls.some((c) => c.method === 'sendMediaGroup'), 'no album attempted');
+  assert.equal(calls[0].method, 'sendMessage');
 });
