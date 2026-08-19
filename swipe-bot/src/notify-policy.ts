@@ -12,15 +12,43 @@ export function viennaHour(now: Date): number {
   return Number(formatted);
 }
 
-/** UTC instant of the most recent Vienna local midnight — the cutoff a per-day cap counts from. */
-export function viennaDayStartIso(now: Date): string {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: VIENNA, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-  }).formatToParts(now);
+const VIENNA_FIELDS = new Intl.DateTimeFormat('en-CA', {
+  timeZone: VIENNA, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+});
+
+function viennaFields(instant: Date): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
+  const parts = VIENNA_FIELDS.formatToParts(instant);
   const get = (type: string) => Number(parts.find((p) => p.type === type)!.value);
-  const elapsedMs = (get('hour') * 3600 + get('minute') * 60 + get('second')) * 1000;
-  return new Date(now.getTime() - elapsedMs - now.getMilliseconds()).toISOString();
+  return {
+    year: get('year'), month: get('month'), day: get('day'),
+    hour: get('hour') % 24, // some ICU builds render midnight as hour 24
+    minute: get('minute'), second: get('second'),
+  };
+}
+
+/** Vienna's UTC offset in effect at `instant`, in ms (+1h in CET, +2h in CEST). */
+function viennaOffsetMs(instant: Date): number {
+  const f = viennaFields(instant);
+  const wallAsUtc = Date.UTC(f.year, f.month - 1, f.day, f.hour, f.minute, f.second);
+  return wallAsUtc - Math.floor(instant.getTime() / 1000) * 1000;
+}
+
+/**
+ * UTC instant of the most recent Vienna local midnight — the cutoff a per-day cap counts from.
+ *
+ * Subtracting the local elapsed time from `now` would be wrong on the two DST transition days,
+ * because that identity only holds when the UTC offset is the same at midnight as it is at `now`.
+ * Instead we take Vienna's calendar date for `now` and solve for the instant whose Vienna wall clock
+ * reads 00:00 on that date: guess with the offset at `now`, then correct once with the offset that
+ * actually applies at the guess. Only two offsets exist, so one correction always converges.
+ */
+export function viennaDayStartIso(now: Date): string {
+  const { year, month, day } = viennaFields(now);
+  const midnightAsUtc = Date.UTC(year, month - 1, day);
+  const guess = midnightAsUtc - viennaOffsetMs(now);
+  const corrected = midnightAsUtc - viennaOffsetMs(new Date(guess));
+  return new Date(corrected).toISOString();
 }
 
 /**

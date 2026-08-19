@@ -10,8 +10,54 @@ test('viennaHour converts UTC to Vienna local hour across DST', () => {
   assert.equal(viennaHour(new Date('2026-01-19T07:30:00Z')), 8);
 });
 
+/** Reads the Vienna wall-clock fields of an instant, independently of the implementation under test. */
+function viennaWallClock(iso: string): { date: string; hour: number; minute: number; second: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Vienna', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(new Date(iso));
+  const get = (type: string) => parts.find((p) => p.type === type)!.value;
+  return {
+    date: `${get('year')}-${get('month')}-${get('day')}`,
+    hour: Number(get('hour')) % 24,
+    minute: Number(get('minute')),
+    second: Number(get('second')),
+  };
+}
+
 test('viennaDayStartIso returns the UTC instant of Vienna local midnight', () => {
   assert.equal(viennaDayStartIso(new Date('2026-08-19T07:30:00Z')), '2026-08-18T22:00:00.000Z');
+});
+
+// The returned instant must BE Vienna midnight, whatever offset happens to apply that day. Asserting
+// the property rather than a literal is what makes these meaningful on the transition days.
+for (const [label, probe, expectedDay] of [
+  ['spring-forward day', '2026-03-29T08:00:00Z', '2026-03-29'],
+  ['fall-back day', '2026-10-25T09:00:00Z', '2026-10-25'],
+  ['a normal summer day', '2026-08-19T07:30:00Z', '2026-08-19'],
+  ['a normal winter day', '2026-01-19T07:30:00Z', '2026-01-19'],
+] as const) {
+  test(`viennaDayStartIso lands on Vienna 00:00 on ${label}`, () => {
+    const wall = viennaWallClock(viennaDayStartIso(new Date(probe)));
+    assert.equal(wall.hour, 0, `expected Vienna hour 0, got ${wall.hour}`);
+    assert.equal(wall.minute, 0);
+    assert.equal(wall.second, 0);
+    assert.equal(wall.date, expectedDay);
+  });
+}
+
+test('viennaDayStartIso is idempotent on an instant that already is Vienna midnight', () => {
+  for (const probe of ['2026-03-29T08:00:00Z', '2026-10-25T09:00:00Z', '2026-08-19T07:30:00Z', '2026-01-19T07:30:00Z']) {
+    const once = viennaDayStartIso(new Date(probe));
+    assert.equal(viennaDayStartIso(new Date(once)), once);
+  }
+});
+
+test('isDigestDue does not re-fire on the fall-back day for an hour-0 digest', () => {
+  // 2026-10-25 01:30 Vienna (CEST, still the first pass through 02:00) — the day's 00:00 digest
+  // already went out at 00:10 Vienna. A day-start that is off by an hour makes this fire twice.
+  const now = new Date('2026-10-24T23:30:00Z');
+  assert.equal(isDigestDue(now, [0], '2026-10-24T22:10:00Z'), false);
 });
 
 test('isQuietHour handles a window that wraps past midnight', () => {
