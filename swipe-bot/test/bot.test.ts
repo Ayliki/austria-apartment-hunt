@@ -1589,21 +1589,56 @@ test('a failing album degrades to a single photo instead of losing the card', as
     'card must still reach the user as a single photo after the album fails');
 });
 
+// A deliberately long-past anchor. sendCard takes an injected clock, so the suppression window this
+// test lives inside is fixed forever; against the real clock these cooldowns lapsed years ago, which
+// is what makes the assertions below able to fail if the injection is ever dropped.
+const PHOTO_ANCHOR = new Date('2020-01-01T06:00:00Z');
+const withinCooldown = (ms: number) => new Date(PHOTO_ANCHOR.getTime() + ms);
+
 test('a card whose images are all known-bad (permanently) sends as text without attempting an album', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', defaultPrefs());
   upsertListing(db, listing({ id: '2', images: ['https://cdn/dead1.jpg', 'https://cdn/dead2.jpg'] }));
-  // 'wrong file identifier' matches PERMANENT_PHOTO_ERRORS (src/db.ts), so this blacklisting never
-  // expires (PHOTO_PERMANENT_COOLDOWN_MS = 30 days) regardless of when the suite happens to run —
-  // unlike a transient error, which only suppresses for PHOTO_TRANSIENT_COOLDOWN_MS (1 hour) against
-  // the real clock sendListingCard reads.
-  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'wrong file identifier', '2026-08-19T06:00:00Z');
-  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'wrong file identifier', '2026-08-19T06:00:00Z');
+  // 'wrong file identifier' matches PERMANENT_PHOTO_ERRORS (src/db.ts): a 30-day suppression, which
+  // is 30 days and not "forever". The injected `now` puts this assertion an hour after the failure
+  // was recorded no matter what day the suite runs on.
+  recordPhotoFailure(db, 'https://cdn/dead1.jpg', 'wrong file identifier', PHOTO_ANCHOR.toISOString());
+  recordPhotoFailure(db, 'https://cdn/dead2.jpg', 'wrong file identifier', PHOTO_ANCHOR.toISOString());
 
   const { telegram, calls } = testTelegram();
-  await sendCard(telegram, 1, getListingById(db, 'willhaben:2')!, null, db);
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:2')!, null, db, withinCooldown(60 * 60 * 1000));
 
   assert.ok(!calls.some((c) => c.method === 'sendMediaGroup'), 'no album attempted');
+  assert.equal(calls[0].method, 'sendMessage');
+});
+
+test('sendCard reads the injected clock, not the wall clock, when filtering album images', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '20', images: ['https://cdn/lapsed1.jpg', 'https://cdn/lapsed2.jpg'] }));
+  recordPhotoFailure(db, 'https://cdn/lapsed1.jpg', 'wrong file identifier', PHOTO_ANCHOR.toISOString());
+  recordPhotoFailure(db, 'https://cdn/lapsed2.jpg', 'wrong file identifier', PHOTO_ANCHOR.toISOString());
+
+  // Past the 30-day permanent cooldown at the injected instant, so both urls are usable again and
+  // the album is attempted. The same seed suppresses them in the test above; only `now` differs.
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:20')!, null, db, withinCooldown(31 * 24 * 60 * 60 * 1000));
+
+  assert.equal(calls[0].method, 'sendMediaGroup', 'a lapsed suppression must let the album through');
+});
+
+test('the single-photo path passes the injected clock down to sendPhotoCached', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '21', images: ['https://cdn/flaky-solo.jpg'] }));
+  // Transient: a 1-hour suppression. usablePhotoUrls is not the only clock reader — with one image
+  // it lets the url through and sendPhotoCached decides, so this pins the SECOND clock read.
+  recordPhotoFailure(db, 'https://cdn/flaky-solo.jpg', 'network timeout', PHOTO_ANCHOR.toISOString());
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:21')!, null, db, withinCooldown(30 * 60 * 1000));
+
+  assert.ok(!calls.some((c) => c.method === 'sendPhoto'), 'a url still within its cooldown must not be re-sent');
   assert.equal(calls[0].method, 'sendMessage');
 });
 

@@ -256,12 +256,16 @@ export function appendSwipeStatus(originalText: string, status: string): string 
  * sendMediaGroup is atomic — one dead URL fails the whole album with "group send failed" — so
  * images Telegram has already rejected are filtered out first, and an album that still fails falls
  * back to a single photo (itself fail-soft) rather than losing the card entirely.
+ *
+ * `now` is injected rather than read from the wall clock because two separate decisions here depend
+ * on it — which urls are still suppressed, and (inside sendPhotoCached) whether a cached file_id is
+ * still good — and a test cannot pin either against a moving clock.
  */
 async function sendListingCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, caption: string,
-  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string, db: DB,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string, db: DB, now: Date,
 ): Promise<void> {
-  const images = usablePhotoUrls(db, card.images);
+  const images = usablePhotoUrls(db, card.images, now);
 
   if (images.length >= 2) {
     let albumSent = false;
@@ -285,7 +289,7 @@ async function sendListingCard(
   }
 
   if (images.length >= 1) {
-    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons }, new Date());
+    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons }, now);
     return;
   }
 
@@ -295,13 +299,14 @@ async function sendListingCard(
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
 export async function sendCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine: string | null | undefined, db: DB,
+  now: Date = new Date(),
 ): Promise<void> {
   const caption = formatCaption(card, commuteLine, undefined, t(db, chatId, 'pet_badge'));
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
-  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT, db);
+  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT, db, now);
 }
 
 /** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */
