@@ -128,10 +128,13 @@ async function sendInstantCard(
  *
  * Two things make the header's count honest. Every pending listing is recorded as notified, not just
  * the `MAX_DIGEST_LINES` that are rendered — the digest is a pointer into the deck, not an
- * exhaustive list, so anything it counted has been announced. And the first-ever digest for a
- * profile (`lastDigestAt` null) silently adopts whatever backlog already exists rather than calling
+ * exhaustive list, so anything it counted has been announced. And a profile that pre-dates this
+ * feature (`lastDigestAt` null) silently adopts whatever backlog already exists rather than calling
  * it "new": those listings have been sitting in the deck all along, so announcing 200 of them as
  * news would be false on the first run and, draining five at a time, false on every run after.
+ *
+ * Null means ONLY that: createSearchProfile stamps `lastDigestAt` at creation, so a profile made
+ * today never takes the adopt path and its first day of matches reaches the user.
  */
 export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, now: Date): Promise<void> {
   for (const profile of notifiableProfiles(db)) {
@@ -141,8 +144,9 @@ export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, no
     const alreadySent = getNotifiedListingIds(db, profile.id);
     const pending = getCandidateListings(db, profile.chatId, profile.prefs).filter((l) => !alreadySent.has(l.id));
 
-    // No digest has ever run for this profile, so nothing in the deck can honestly be called new.
-    // Adopt the backlog and stay silent; from the next digest on, every count is true.
+    // This profile pre-dates the quiet notifier (nothing stamped it at creation), so nothing in its
+    // deck can honestly be called new. Adopt the backlog and stay silent; from the next digest on,
+    // every count is true.
     if (settings.lastDigestAt == null) {
       markDigested(db, profile.id, pending, now);
       continue;

@@ -864,6 +864,10 @@ test('a pre-existing user_prefs row is migrated into one active "My Search" sear
     assert.equal(profiles[0].prefs.requireElevator, false);
     assert.equal(profiles[0].prefs.requireParking, false);
     assert.equal(getChatLanguage(db, 5), 'en'); // a chats row is created alongside the migrated profile
+    // A migrated user has been swiping this deck since before the quiet notifier existed, so their
+    // backlog must stay old news: null lastDigestAt is the signal dispatchDigests adopts silently on.
+    // createSearchProfile stamps every other new profile, so the migration has to clear it back.
+    assert.equal(getNotifySettings(db, profiles[0].id).lastDigestAt, null);
 
     const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_prefs'`).get();
     assert.equal(tableExists, undefined); // dropped after migration

@@ -289,13 +289,17 @@ function migrateUserPrefsToSearchProfiles(db: DB): void {
       const chatId = row.chat_id as number;
       if (getActiveSearchProfile(db, chatId)) continue; // already migrated in a prior partial run
       const prefsForChat = rowToPrefs(row);
-      createSearchProfile(db, chatId, 'My Search', {
+      const migrated = createSearchProfile(db, chatId, 'My Search', {
         priceFrom: prefsForChat.priceFrom, priceTo: prefsForChat.priceTo, districts: prefsForChat.districts,
         roomsFrom: prefsForChat.roomsFrom, roomsTo: prefsForChat.roomsTo, areaFrom: prefsForChat.areaFrom, areaTo: prefsForChat.areaTo,
         includeWaitlistHousing: prefsForChat.includeWaitlistHousing, includeWg: prefsForChat.includeWg,
         requireElevator: false, requireParking: false,
         commuteDestination: prefsForChat.commuteDestination, commuteLat: prefsForChat.commuteLat, commuteLon: prefsForChat.commuteLon,
       });
+      // A migrated profile is NOT new: its user has been swiping this deck since before the quiet
+      // notifier existed, so the backlog must stay old news. Null is exactly that signal, so undo
+      // the creation stamp here and let the first digest run adopt the backlog silently.
+      updateNotifySettings(db, migrated.id, { lastDigestAt: null });
       db.prepare('INSERT OR IGNORE INTO chats (chat_id, language) VALUES (?, ?)').run(chatId, 'en');
     }
     db.exec('DROP TABLE user_prefs');
@@ -588,14 +592,30 @@ function rowToSearchProfile(row: Record<string, unknown>): SearchProfile {
   };
 }
 
-/** Inserts a new search profile. By default it becomes the chat's one active profile (every other profile for that chat is deactivated first) — pass makeActive=false to add an inactive profile instead. */
-export function createSearchProfile(db: DB, chatId: number, name: string, prefs: SearchProfilePrefs, makeActive = true): SearchProfile {
+/**
+ * Inserts a new search profile. By default it becomes the chat's one active profile (every other
+ * profile for that chat is deactivated first) — pass makeActive=false to add an inactive profile instead.
+ *
+ * The profile's notify_settings row is written straight away with `last_digest_at = created_at`.
+ * The notifier reads a null `lastDigestAt` as "this profile pre-dates the quiet-notifier deploy, so
+ * its whole deck is old news" and adopts that backlog silently; without this stamp a brand-new
+ * profile would look identical, and everything matched on its first day would be swallowed by that
+ * adopt run instead of appearing in the user's first digest. Stamping the creation time also makes
+ * the first digest's "{count} new since your last update" true: it counts from when the search
+ * actually existed. The one caller that deliberately wants the null (the pre-deploy migration)
+ * clears it back afterwards.
+ */
+export function createSearchProfile(
+  db: DB, chatId: number, name: string, prefs: SearchProfilePrefs, makeActive = true, at: Date = new Date(),
+): SearchProfile {
   if (makeActive) db.prepare('UPDATE search_profiles SET active = 0 WHERE chat_id = ?').run(chatId);
-  const now = new Date().toISOString();
+  const now = at.toISOString();
   const result = db.prepare(
     'INSERT INTO search_profiles (chat_id, name, prefs_json, active, created_at) VALUES (?, ?, ?, ?, ?)'
   ).run(chatId, name, JSON.stringify(prefs), makeActive ? 1 : 0, now);
-  return { id: result.lastInsertRowid as number, chatId, name, active: makeActive, createdAt: now, prefs };
+  const id = result.lastInsertRowid as number;
+  updateNotifySettings(db, id, { lastDigestAt: now });
+  return { id, chatId, name, active: makeActive, createdAt: now, prefs };
 }
 
 export function getSearchProfiles(db: DB, chatId: number): SearchProfile[] {

@@ -315,7 +315,10 @@ test('dispatchDigests sends one text message summarising unsent matches', async 
 
 test('the first-ever digest adopts the existing backlog silently instead of calling it new', async () => {
   const db = openDb(':memory:');
-  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  // Pre-deploy: only a profile that predates the quiet notifier reads as never-digested. A profile
+  // created today is stamped at creation, and takes the ordinary path (see the item-1 tests below).
+  const profileId = preDeployProfile(db, 1);
+  assert.equal(getNotifySettings(db, profileId).lastDigestAt, null, 'a pre-deploy profile reads as never-digested');
   for (let i = 0; i < 3; i++) upsertListing(db, listing({ id: `b${i}`, url: `https://x/b${i}` }));
 
   const { telegram, calls } = testTelegram();
@@ -331,7 +334,7 @@ test('the first-ever digest adopts the existing backlog silently instead of call
 
 test('the digest after the first reports only genuinely new listings', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  preDeployProfile(db, 1); // silent-adopt first, real digest second — the pre-deploy profile's two runs
   for (let i = 0; i < 3; i++) upsertListing(db, listing({ id: `b${i}`, url: `https://x/b${i}` }));
 
   const first = testTelegram();
@@ -406,4 +409,61 @@ test('a listing sent instantly is not repeated in the digest', async () => {
 
   const text = second.calls.map((c) => String(c.payload.text ?? '')).join('\n');
   assert.ok(!text.includes('https://x/hot'), 'an instantly-sent listing must not reappear in the digest');
+});
+
+// --- Final fix wave, item 1: `lastDigestAt == null` must mean ONLY "this profile pre-dates the ---
+// --- deploy". A brand-new profile is stamped at creation, so its first day is never adopted ---
+// --- silently. ---
+
+/** A profile as it looks to the notifier if it was created before this branch shipped: no notify_settings row at all. */
+function preDeployProfile(db: DB, chatId: number, name = 'Test'): number {
+  const id = createSearchProfile(db, chatId, name, commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  db.prepare('DELETE FROM notify_settings WHERE profile_id = ?').run(id);
+  return id;
+}
+
+test('creating a search profile stamps lastDigestAt with its creation time', () => {
+  const db = openDb(':memory:');
+  const created = new Date('2026-08-19T07:30:00Z'); // 09:30 Vienna
+  const profile = createSearchProfile(db, 1, 'Test', commuteProfilePrefs(), true, created);
+
+  assert.equal(profile.createdAt, created.toISOString());
+  assert.equal(getNotifySettings(db, profile.id).lastDigestAt, created.toISOString());
+});
+
+test('a newly created profile does not take the silent-adopt path at its first digest hour', async () => {
+  const db = openDb(':memory:');
+  const created = new Date('2026-08-19T07:30:00Z'); // 09:30 Vienna, just after the 09:00 digest hour
+  const profileId = createSearchProfile(
+    db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }), true, created,
+  ).id;
+  upsertListing(db, listing({ id: 'new1', url: 'https://x/new1' }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T17:05:00Z')); // 19:05 Vienna, same day
+
+  assert.equal(calls.length, 1, "a new user's first day must not be swallowed by the silent adopt");
+  const text = String(calls[0].payload.text);
+  assert.deepEqual(headerDigits(text), ['1']);
+  assert.ok(text.includes('https://x/new1'), 'the listing matched after creation must appear in that first digest');
+  assert.equal(getNotifiedListingIds(db, profileId).size, 1);
+});
+
+test("the second digest hour after a new profile's first digest still works", async () => {
+  const db = openDb(':memory:');
+  const created = new Date('2026-08-19T07:30:00Z'); // 09:30 Vienna
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }), true, created);
+  upsertListing(db, listing({ id: 'new1', url: 'https://x/new1' }));
+
+  const first = testTelegram();
+  await dispatchDigests(first.telegram, db, new Date('2026-08-19T17:05:00Z')); // 19:05 Vienna
+  assert.equal(first.calls.length, 1);
+
+  upsertListing(db, listing({ id: 'new2', url: 'https://x/new2' }));
+  const second = testTelegram();
+  await dispatchDigests(second.telegram, db, new Date('2026-08-20T07:05:00Z')); // 09:05 Vienna, next day
+
+  assert.equal(second.calls.length, 1);
+  assert.deepEqual(headerDigits(second.calls[0].payload.text), ['1'], 'only the listing added since the first digest');
+  assert.ok(String(second.calls[0].payload.text).includes('https://x/new2'));
 });
