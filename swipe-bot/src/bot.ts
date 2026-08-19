@@ -5,12 +5,13 @@ import {
   getWizardState, setWizardState, deleteWizardState, getCommuteTimes, setCommuteTimes, setListingCoords,
   setChatLanguage, createSearchProfile, countSearchProfiles, MAX_SEARCH_PROFILES_PER_CHAT,
   getSearchProfiles, getSearchProfile, setActiveSearchProfile, deleteSearchProfile, updateSearchProfile, renameSearchProfile,
-  getListingById,
+  getListingById, getNotifySettings, updateNotifySettings,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
 import { t, LOCALE_NAMES } from './locales.js';
 import { sendPhotoCached, usablePhotoUrls } from './photo.js';
+import { renderNotifyMenu, nextDailyCap } from './notify-ui.js';
 import {
   WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs, parseCustomBudget,
   type WizardState, type WizardChoice, type WizardStepId,
@@ -701,7 +702,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     await bot.telegram.sendMessage(
       chatId,
       t(db, chatId, 'settings_menu_title', { name: profile.name }),
-      Markup.inlineKeyboard(SETTINGS_FIELD_BUTTONS.map(([label, field]) => [Markup.button.callback(label, `editfield:${profile.id}:${field}`)])),
+      Markup.inlineKeyboard([
+        ...SETTINGS_FIELD_BUTTONS.map(([label, field]) => [Markup.button.callback(label, `editfield:${profile.id}:${field}`)]),
+        [Markup.button.callback(t(db, chatId, 'settings_notifications'), 'notify:menu')],
+      ]),
     );
   }
 
@@ -760,6 +764,38 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       t(db, chatId, 'no_active_search_after_delete'),
       Markup.inlineKeyboard(remaining.map((p) => [Markup.button.callback(`Switch to "${p.name}"`, `switchprofile:${p.id}`)])),
     );
+  });
+
+  bot.action(/^notify:menu$/, async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const profile = getActiveSearchProfile(db, chatId);
+    if (!profile) { await ctx.answerCbQuery(t(db, chatId, 'no_active_search')); return; }
+    const { text, keyboard } = renderNotifyMenu(db, chatId, profile);
+    await ctx.answerCbQuery();
+    await ctx.reply(text, keyboard);
+  });
+
+  bot.action(/^notify:(pause|resume):(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const paused = ctx.match[1] === 'pause';
+    const profile = getSearchProfile(db, Number(ctx.match[2]));
+    if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
+
+    updateNotifySettings(db, profile.id, { paused });
+    await ctx.answerCbQuery();
+    await ctx.reply(t(db, chatId, paused ? 'notify_paused' : 'notify_resumed', { name: profile.name }));
+  });
+
+  bot.action(/^notify:cap:(less|more):(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const direction = ctx.match[1] as 'less' | 'more';
+    const profile = getSearchProfile(db, Number(ctx.match[2]));
+    if (!profile || profile.chatId !== chatId) { await ctx.answerCbQuery(t(db, chatId, 'search_no_longer_exists')); return; }
+
+    updateNotifySettings(db, profile.id, { dailyCap: nextDailyCap(getNotifySettings(db, profile.id).dailyCap, direction) });
+    const { text, keyboard } = renderNotifyMenu(db, chatId, profile);
+    await ctx.answerCbQuery();
+    await ctx.reply(text, keyboard);
   });
 
   bot.action('wizard:new', async (ctx) => {
