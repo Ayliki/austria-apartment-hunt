@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  bucketsFor, bucketScore, computeBucketStats, valueScoreOf, learnedScoreOf, rankListings, COLD_START_THRESHOLD,
+  bucketsFor, bucketScore, computeBucketStats, valueScoreOf, learnedScoreOf, rankListings, scoreListings, COLD_START_THRESHOLD,
 } from '../src/scoring.js';
 import type { ListingRow } from '../src/db.js';
 
@@ -90,4 +90,23 @@ test('rankListings blends learned + value score once past cold-start threshold',
   ];
   const ranked = rankListings([dislikedDistrict, likedDistrict], manySwipes);
   assert.deepEqual(ranked.map((l) => l.id), ['liked', 'disliked']);
+});
+
+test('scoreListings returns scores alongside listings, sorted descending', () => {
+  const good = row({ id: 'willhaben:good', valueFlag: 'good' });
+  const premium = row({ id: 'willhaben:premium', valueFlag: 'premium' });
+  const fair = row({ id: 'willhaben:fair', valueFlag: 'fair' });
+
+  const scored = scoreListings([premium, fair, good], []);
+
+  assert.deepEqual(scored.map((s) => s.listing.id), ['willhaben:good', 'willhaben:fair', 'willhaben:premium']);
+  assert.deepEqual(scored.map((s) => s.score), [1, 0.5, 0]);
+});
+
+test('rankListings returns the same order scoreListings does', () => {
+  const listings = [row({ id: 'a', valueFlag: 'premium' }), row({ id: 'b', valueFlag: 'good' })];
+  assert.deepEqual(
+    rankListings(listings, []).map((l) => l.id),
+    scoreListings(listings, []).map((s) => s.listing.id),
+  );
 });

@@ -55,10 +55,10 @@ export function learnedScoreOf(l: ListingRow, stats: BucketStats): number {
   return scores.reduce((a, b) => a + b, 0) / scores.length;
 }
 
-export function rankListings(
+export function scoreListings(
   listings: ListingRow[],
   swiped: { listing: ListingRow; direction: 'like' | 'pass' }[],
-): ListingRow[] {
+): { listing: ListingRow; score: number }[] {
   const coldStart = swiped.length < COLD_START_THRESHOLD;
   const stats = coldStart ? null : computeBucketStats(swiped);
   const scored = listings.map((l) => {
@@ -66,5 +66,13 @@ export function rankListings(
     return { listing: l, score };
   });
   scored.sort((a, b) => b.score - a.score);
-  return scored.map((s) => s.listing);
+  return scored;
+}
+
+/** Order-only view of scoreListings — the scores themselves are only needed by the notification threshold. */
+export function rankListings(
+  listings: ListingRow[],
+  swiped: { listing: ListingRow; direction: 'like' | 'pass' }[],
+): ListingRow[] {
+  return scoreListings(listings, swiped).map((s) => s.listing);
 }
