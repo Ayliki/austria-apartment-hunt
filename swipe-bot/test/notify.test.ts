@@ -2,9 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Telegram } from 'telegraf';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
-import { dispatchInstant, dispatchDigests, formatPushEntry } from '../src/notify.js';
+import { dispatchInstant, dispatchDigests, formatPushEntry, MAX_DIGEST_LINES } from '../src/notify.js';
 import {
-  openDb, createSearchProfile, upsertListing, updateNotifySettings, MCP_CHAT_ID, type ListingRow,
+  openDb, createSearchProfile, upsertListing, updateNotifySettings, getNotifySettings,
+  getNotifiedListingIds, recordSwipe, MCP_CHAT_ID, type DB, type ListingRow,
 } from '../src/db.js';
 
 const NOW_MIDDAY = new Date('2026-08-19T10:00:00Z'); // 12:00 Vienna, outside quiet hours
@@ -69,14 +70,50 @@ function testTelegram(
   return { telegram, calls };
 }
 
+/**
+ * The only way a test can control `first_seen`: upsertListing hardcodes wall-clock now, and
+ * NormalizedListing has no such field, so any fixture value is silently discarded. Without this the
+ * trailing-30-day window in recentScoresFor is untestable.
+ */
+function setFirstSeen(db: DB, listingId: string, iso: string): void {
+  const result = db.prepare('UPDATE listings SET first_seen = ? WHERE id = ?').run(iso, listingId);
+  assert.equal(result.changes, 1, `setFirstSeen matched no row for ${listingId}`);
+}
+
 /** Seeds `count` scored listings into the profile's trailing window so instantThreshold has a sample. */
-function seedHistory(db: ReturnType<typeof openDb>, count: number): void {
+function seedHistory(db: DB, count: number): void {
   for (let i = 0; i < count; i++) {
+    // Bare id: upsertListing stores `${source}:${id}`, so a `willhaben:` prefix here would double up.
     upsertListing(db, listing({
-      id: `willhaben:hist${i}`, price: 600, valueFlag: 'fair',
-      firstSeen: '2026-08-15T00:00:00Z', url: `https://x/hist${i}`,
+      id: `hist${i}`, price: 600, valueFlag: 'fair', url: `https://x/hist${i}`,
     }));
+    setFirstSeen(db, `willhaben:hist${i}`, '2026-08-15T00:00:00Z');
   }
+}
+
+/**
+ * 15 swipes (the cold-start threshold) that split every bucket cleanly: `HISTORY_SHAPE` is liked
+ * 10x, `CANDIDATE_SHAPE` passed 5x. Scoring therefore ranks a HISTORY_SHAPE 'fair' listing at 0.75
+ * and a CANDIDATE_SHAPE 'good' one at ~0.486 — the only arrangement in which the relative threshold,
+ * rather than the absolute valueFlag bar, decides the outcome.
+ */
+const HISTORY_SHAPE = { district: 1, price: 500, rooms: 1, area: 30, isPrivate: true, images: ['https://cdn/h.jpg'] };
+const CANDIDATE_SHAPE = { district: 6, price: 900, rooms: 3, area: 70, isPrivate: false, images: [] };
+
+function seedLearnedSwipes(db: DB, chatId: number): void {
+  for (let i = 0; i < 10; i++) {
+    upsertListing(db, listing({ ...HISTORY_SHAPE, id: `like${i}`, url: `https://x/like${i}` }));
+    recordSwipe(db, chatId, `willhaben:like${i}`, 'like');
+  }
+  for (let i = 0; i < 5; i++) {
+    upsertListing(db, listing({ ...CANDIDATE_SHAPE, id: `pass${i}`, url: `https://x/pass${i}` }));
+    recordSwipe(db, chatId, `willhaben:pass${i}`, 'pass');
+  }
+}
+
+/** Digits in the digest's first line — the header's count, isolated from listing details below it. */
+function headerDigits(text: unknown): string[] {
+  return String(text).split('\n')[0].match(/\d+/g) ?? [];
 }
 
 test('formatPushEntry formats title, price, size/rooms/district, and link on separate lines', () => {
@@ -204,17 +241,66 @@ test('a failing send for one profile does not stop the next profile', async () =
   createSearchProfile(db, 2, 'B', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
   seedHistory(db, 30);
 
+  // No images on purpose: sendPhotoCached swallows Telegram errors and degrades to text, so an error
+  // injected there never reaches dispatchInstant's try/catch and this test could not fail. The
+  // image-less path calls telegram.sendMessage directly, where a rejection really does propagate.
   const { telegram, calls } = testTelegram((method, payload) =>
-    method === 'sendPhoto' && payload.chat_id === 1 ? new Error('blocked by user') : undefined);
+    method === 'sendMessage' && payload.chat_id === 1 ? new Error('blocked by user') : undefined);
 
-  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good', images: ['https://cdn/a.jpg'] })], NOW_MIDDAY);
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good', images: [] })], NOW_MIDDAY);
 
+  assert.ok(calls.some((c) => c.payload.chat_id === 1), 'profile A must have been attempted');
   assert.ok(calls.some((c) => c.payload.chat_id === 2), 'profile B must still be notified');
+});
+
+test('dispatchInstant still applies the absolute value bar when history is too thin for a threshold', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  // Below MIN_THRESHOLD_SAMPLE (20), so instantThreshold returns null and only the valueFlag bar is
+  // left standing. Without that bar a 'premium' listing would ping.
+  seedHistory(db, 5);
+
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'premium' })], NOW_MIDDAY);
+
+  assert.equal(calls.length, 0);
+});
+
+test('the instant threshold sample ignores listings first seen more than 30 days ago', async () => {
+  const candidate = row({ ...CANDIDATE_SHAPE, id: 'willhaben:new', url: 'https://x/new', valueFlag: 'good' });
+
+  // Control: the same 25 rows inside the window do form a sample, and it blocks the candidate.
+  const inWindow = openDb(':memory:');
+  createSearchProfile(inWindow, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedLearnedSwipes(inWindow, 1);
+  for (let i = 0; i < 25; i++) {
+    upsertListing(inWindow, listing({ ...HISTORY_SHAPE, id: `w${i}`, url: `https://x/w${i}` }));
+    setFirstSeen(inWindow, `willhaben:w${i}`, '2026-08-15T00:00:00Z'); // 4 days before NOW_MIDDAY
+  }
+
+  const blocked = testTelegram();
+  await dispatchInstant(blocked.telegram, inWindow, [candidate], NOW_MIDDAY);
+  assert.equal(blocked.calls.length, 0, 'a recent sample must produce a threshold the candidate fails');
+
+  // Same rows, first seen 60 days ago: they must fall outside the window, leaving fewer than
+  // MIN_THRESHOLD_SAMPLE scores, so instantThreshold returns null and the candidate goes through.
+  const outOfWindow = openDb(':memory:');
+  createSearchProfile(outOfWindow, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedLearnedSwipes(outOfWindow, 1);
+  for (let i = 0; i < 25; i++) {
+    upsertListing(outOfWindow, listing({ ...HISTORY_SHAPE, id: `w${i}`, url: `https://x/w${i}` }));
+    setFirstSeen(outOfWindow, `willhaben:w${i}`, '2026-06-20T00:00:00Z'); // 60 days before NOW_MIDDAY
+  }
+
+  const sent = testTelegram();
+  await dispatchInstant(sent.telegram, outOfWindow, [candidate], NOW_MIDDAY);
+  assert.equal(sent.calls.length, 1, 'stale rows must not count toward the threshold sample');
 });
 
 test('dispatchDigests sends one text message summarising unsent matches', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' }); // not the first-ever run
   upsertListing(db, listing({ id: 'd1', price: 700, url: 'https://x/d1' }));
   upsertListing(db, listing({ id: 'd2', price: 750, url: 'https://x/d2' }));
 
@@ -223,7 +309,62 @@ test('dispatchDigests sends one text message summarising unsent matches', async 
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, 'sendMessage');
-  assert.match(String(calls[0].payload.text), /2/);
+  // Header line only: a bare /2/ over the whole message also matches the rendered "2 rooms".
+  assert.deepEqual(headerDigits(calls[0].payload.text), ['2']);
+});
+
+test('the first-ever digest adopts the existing backlog silently instead of calling it new', async () => {
+  const db = openDb(':memory:');
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  for (let i = 0; i < 3; i++) upsertListing(db, listing({ id: `b${i}`, url: `https://x/b${i}` }));
+
+  const { telegram, calls } = testTelegram();
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z')); // 09:05 Vienna
+
+  assert.equal(calls.length, 0, 'a pre-existing backlog is not news');
+  assert.equal(getNotifySettings(db, profileId).lastDigestAt, '2026-08-19T07:05:00.000Z');
+  assert.deepEqual(
+    [...getNotifiedListingIds(db, profileId)].sort(),
+    ['willhaben:b0', 'willhaben:b1', 'willhaben:b2'],
+  );
+});
+
+test('the digest after the first reports only genuinely new listings', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  for (let i = 0; i < 3; i++) upsertListing(db, listing({ id: `b${i}`, url: `https://x/b${i}` }));
+
+  const first = testTelegram();
+  await dispatchDigests(first.telegram, db, new Date('2026-08-19T07:05:00Z')); // 09:05 Vienna
+  assert.equal(first.calls.length, 0);
+
+  upsertListing(db, listing({ id: 'fresh', url: 'https://x/fresh' }));
+  const second = testTelegram();
+  await dispatchDigests(second.telegram, db, new Date('2026-08-19T17:05:00Z')); // 19:05 Vienna
+
+  assert.equal(second.calls.length, 1);
+  assert.deepEqual(headerDigits(second.calls[0].payload.text), ['1']);
+  assert.ok(String(second.calls[0].payload.text).includes('https://x/fresh'));
+});
+
+test('a digest lists five listings but records every pending one, so the next digest is silent', async () => {
+  const db = openDb(':memory:');
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' }); // not the first-ever run
+  for (let i = 0; i < 7; i++) upsertListing(db, listing({ id: `p${i}`, url: `https://x/p${i}` }));
+
+  const first = testTelegram();
+  await dispatchDigests(first.telegram, db, new Date('2026-08-19T07:05:00Z')); // 09:05 Vienna
+
+  assert.equal(first.calls.length, 1);
+  const text = String(first.calls[0].payload.text);
+  assert.deepEqual(headerDigits(text), ['7'], 'the header must count everything pending');
+  assert.equal((text.match(/https:\/\/x\/p\d/g) ?? []).length, MAX_DIGEST_LINES, 'only five lines are rendered');
+  assert.equal(getNotifiedListingIds(db, profileId).size, 7, 'all seven must be recorded, not just the shown five');
+
+  const second = testTelegram();
+  await dispatchDigests(second.telegram, db, new Date('2026-08-19T17:05:00Z')); // 19:05 Vienna
+  assert.equal(second.calls.length, 0, 'nothing new means nothing sent');
 });
 
 test('dispatchDigests sends nothing when no digest hour is due', async () => {
@@ -250,7 +391,8 @@ test('dispatchDigests sends nothing when there is nothing new', async () => {
 
 test('a listing sent instantly is not repeated in the digest', async () => {
   const db = openDb(':memory:');
-  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  const profileId = createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' }); // not the first-ever run
   seedHistory(db, 30);
   // Stored id is `${source}:${id}`, so this row is the same listing the instant ping records.
   upsertListing(db, listing({ id: 'hot', valueFlag: 'good', url: 'https://x/hot' }));

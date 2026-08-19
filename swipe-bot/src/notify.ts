@@ -70,14 +70,17 @@ export async function dispatchInstant(
     if (!settings.instantEnabled) continue;
     if (isQuietHour(viennaHour(now), settings.quietStart, settings.quietEnd)) continue;
 
+    // Checked before recentScoresFor: a capped-out profile would otherwise pay for a full candidate
+    // scan and scoring pass on every poll only to send nothing.
+    let budget = settings.dailyCap - countInstantSince(db, profile.id, viennaDayStartIso(now));
+    if (budget <= 0) continue;
+
     const alreadySent = getNotifiedListingIds(db, profile.id);
     const matches = newListings.filter((l) => matchesPrefs(l, profile.prefs) && !alreadySent.has(l.id));
     if (matches.length === 0) continue;
 
     const threshold = instantThreshold(recentScoresFor(db, profile, now), settings.instantPercentile);
     const scored = scoreListings(matches, getSwipedWithDirection(db, profile.chatId));
-
-    let budget = settings.dailyCap - countInstantSince(db, profile.id, viennaDayStartIso(now));
 
     for (const { listing, score } of scored) {
       if (budget <= 0) break;
@@ -122,6 +125,13 @@ async function sendInstantCard(
  * One text-only summary per profile at each configured digest hour, covering everything matched
  * since that profile's last digest that wasn't already sent instantly. No photos: the digest exists
  * to be scannable, not to reproduce the deck.
+ *
+ * Two things make the header's count honest. Every pending listing is recorded as notified, not just
+ * the `MAX_DIGEST_LINES` that are rendered — the digest is a pointer into the deck, not an
+ * exhaustive list, so anything it counted has been announced. And the first-ever digest for a
+ * profile (`lastDigestAt` null) silently adopts whatever backlog already exists rather than calling
+ * it "new": those listings have been sitting in the deck all along, so announcing 200 of them as
+ * news would be false on the first run and, draining five at a time, false on every run after.
  */
 export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, now: Date): Promise<void> {
   for (const profile of notifiableProfiles(db)) {
@@ -130,6 +140,14 @@ export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, no
 
     const alreadySent = getNotifiedListingIds(db, profile.id);
     const pending = getCandidateListings(db, profile.chatId, profile.prefs).filter((l) => !alreadySent.has(l.id));
+
+    // No digest has ever run for this profile, so nothing in the deck can honestly be called new.
+    // Adopt the backlog and stay silent; from the next digest on, every count is true.
+    if (settings.lastDigestAt == null) {
+      markDigested(db, profile.id, pending, now);
+      continue;
+    }
+
     if (pending.length === 0) {
       // Still stamp the run, so an empty 09:00 doesn't make 09:05 look due all morning.
       updateNotifySettings(db, profile.id, { lastDigestAt: now.toISOString() });
@@ -152,7 +170,17 @@ export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, no
       continue; // don't stamp lastDigestAt — retry on the next tick
     }
 
-    for (const s of shown) recordNotified(db, profile.id, s.listing.id, 'digest', now.toISOString());
-    updateNotifySettings(db, profile.id, { lastDigestAt: now.toISOString() });
+    markDigested(db, profile.id, pending, now);
   }
+}
+
+/**
+ * Closes out one digest run: every listing the run accounted for is recorded, and the run is
+ * stamped. `pending` rather than the shown lines, so the next digest's "{count} new" counts only
+ * what has genuinely appeared since. recordNotified is INSERT OR IGNORE, so re-recording a listing
+ * an instant ping already claimed is a no-op.
+ */
+function markDigested(db: DB, profileId: number, pending: ListingRow[], now: Date): void {
+  for (const l of pending) recordNotified(db, profileId, l.id, 'digest', now.toISOString());
+  updateNotifySettings(db, profileId, { lastDigestAt: now.toISOString() });
 }
