@@ -74,3 +74,14 @@ test('de help_full quotes the literal English button labels rather than a transl
   assert.doesNotMatch(de.help_full, /Top-Treffer ansehen/); // old, inaccurate translated mention
   assert.doesNotMatch(de.help_full, /Weiter \/ 📋 Merkliste \/ ⚙️ Einstellungen/); // old, inaccurate translated mention
 });
+
+test('notification keys exist and carry their placeholders in every catalog', () => {
+  for (const catalog of [en, ru, de]) {
+    assert.match(catalog.notify_instant_header, /\{name\}/);
+    assert.match(catalog.notify_digest_header, /\{count\}/);
+    assert.match(catalog.notify_digest_header, /\{name\}/);
+    assert.match(catalog.notify_digest_line, /\{price\}/);
+    assert.ok(catalog.btn_open_listing.length > 0);
+    assert.ok(catalog.notify_paused.length > 0);
+  }
+});

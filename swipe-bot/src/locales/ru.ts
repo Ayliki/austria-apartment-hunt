@@ -80,4 +80,18 @@ export default {
     '/language — сменить язык бота\n\n' +
     'Кнопки "⏭ Next" / "📋 Shortlist" / "⚙️ Settings" под полем ввода (тоже на английском) делают то же самое, что и команды — просто один тап вместо набора.\n\n' +
     '{safetyNotice}',
+
+  notify_instant_header: '🔥 Отличный вариант · {name}',
+  notify_digest_header: '🏠 {name} — {count} новых с прошлого раза',
+  notify_digest_best: 'Лучшее из них:',
+  notify_digest_line: '{price} · {details}',
+  btn_open_listing: 'Открыть ▸',
+  notify_paused: 'Пауза. «{name}» продолжает собирать варианты, но писать не будет, пока не возобновите.',
+  notify_resumed: 'Возобновлено. Снова буду сообщать о новых вариантах по «{name}».',
+  settings_notifications: '🔔 Уведомления',
+  notify_menu_header: 'Уведомления для «{name}»: {status}\nДо {cap} срочных в день плюс сводка в {hours}. Тишина с {quietStart}:00 до {quietEnd}:00.',
+  btn_pause_search: '⏸ Поставить на паузу',
+  btn_resume_search: '▶️ Возобновить',
+  btn_notify_less: '🔉 Реже',
+  btn_notify_more: '🔊 Чаще',
 } as const;

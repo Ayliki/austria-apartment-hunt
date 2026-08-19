@@ -83,4 +83,18 @@ export default {
     'The ⏭ Next / 📋 Shortlist / ⚙️ Settings buttons below the message box do the same as the ' +
     'matching commands, one tap instead of typing.\n\n' +
     '{safetyNotice}',
+
+  notify_instant_header: '🔥 Strong match · {name}',
+  notify_digest_header: '🏠 {name} — {count} new since your last update',
+  notify_digest_best: 'Best of these:',
+  notify_digest_line: '{price} · {details}',
+  btn_open_listing: 'Open ▸',
+  notify_paused: 'Paused. "{name}" keeps collecting matches, but won\'t message you until you resume.',
+  notify_resumed: 'Resumed. You\'ll hear about new matches for "{name}" again.',
+  settings_notifications: '🔔 Notifications',
+  notify_menu_header: 'Notifications for "{name}": {status}\nUp to {cap} instant alerts a day, plus a summary at {hours}. Quiet {quietStart}:00–{quietEnd}:00.',
+  btn_pause_search: '⏸ Pause this search',
+  btn_resume_search: '▶️ Resume this search',
+  btn_notify_less: '🔉 Fewer alerts',
+  btn_notify_more: '🔊 More alerts',
 } as const;

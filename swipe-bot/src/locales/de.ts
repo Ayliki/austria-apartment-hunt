@@ -81,4 +81,18 @@ export default {
     'Die Schaltflächen "⏭ Next" / "📋 Shortlist" / "⚙️ Settings" unter dem Nachrichtenfeld (ebenfalls auf Englisch) tun dasselbe wie die ' +
     'zugehörigen Befehle — ein Tap statt Tippen.\n\n' +
     '{safetyNotice}',
+
+  notify_instant_header: '🔥 Starker Treffer · {name}',
+  notify_digest_header: '🏠 {name} — {count} neue seit deinem letzten Update',
+  notify_digest_best: 'Die besten davon:',
+  notify_digest_line: '{price} · {details}',
+  btn_open_listing: 'Öffnen ▸',
+  notify_paused: 'Pausiert. „{name}" sammelt weiter Treffer, meldet sich aber erst wieder, wenn du fortsetzt.',
+  notify_resumed: 'Fortgesetzt. Du hörst wieder von neuen Treffern für „{name}".',
+  settings_notifications: '🔔 Benachrichtigungen',
+  notify_menu_header: 'Benachrichtigungen für „{name}": {status}\nBis zu {cap} Sofortmeldungen pro Tag, dazu eine Übersicht um {hours}. Ruhe von {quietStart}:00 bis {quietEnd}:00.',
+  btn_pause_search: '⏸ Suche pausieren',
+  btn_resume_search: '▶️ Suche fortsetzen',
+  btn_notify_less: '🔉 Weniger',
+  btn_notify_more: '🔊 Mehr',
 } as const;
