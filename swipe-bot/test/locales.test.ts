@@ -144,3 +144,26 @@ test('user-facing notification copy carries no decorative em dash', () => {
     }
   }
 });
+
+// --- help_full must describe the quiet notifier (instant alerts + digest + quiet hours + pause), ---
+// --- not the old "every poll pushes every new listing" behaviour. Per-language substrings, since ---
+// --- a translated catalog earns nothing by matching English words. ---
+
+test('help_full mentions pausing a search, in each catalog\'s own language', () => {
+  assert.match(en.help_full, /pause/i);
+  assert.match(ru.help_full, /паузу|паузе|паузы/i);
+  assert.match(de.help_full, /pausier/i);
+});
+
+test('help_full mentions the digest/summary concept, in each catalog\'s own language', () => {
+  assert.match(en.help_full, /digest|summary/i);
+  assert.match(ru.help_full, /сводк/i);
+  assert.match(de.help_full, /übersicht|zusammenfassung/i);
+});
+
+test('help_full still carries the {maxProfiles} and {safetyNotice} placeholders after the notifications rewrite', () => {
+  for (const catalog of [en, ru, de]) {
+    assert.ok(catalog.help_full.includes('{maxProfiles}'), 'help_full is missing {maxProfiles}');
+    assert.ok(catalog.help_full.includes('{safetyNotice}'), 'help_full is missing {safetyNotice}');
+  }
+});

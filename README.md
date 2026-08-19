@@ -110,11 +110,21 @@ node ./apt-hunter/dist/cli.js --price-to 700 --area-from 30 --districts 1-9 --no
 
 `swipe-bot/` turns the same willhaben + immoscout sources into a Telegram
 swipe-card experience: a background poller keeps a shared listing pool fresh
-(one poll every ~3h regardless of how many people use the bot — never scales
+(one poll every ~3h regardless of how many people use the bot, never scaling
 requests with user count), and each person swipes 👍/👎 on cards with photos.
 The bot learns per-person preferences from swipe history using a deterministic
 Laplace-smoothed bucket score (district, price band, room count, size band,
-private/agency, has-photos) — no LLM calls, so it's cheap to share with friends.
+private/agency, has-photos), no LLM calls, so it's cheap to share with friends.
+
+Notifications are quiet by design instead of pushing every new match as it's
+found. Each saved search gets, by default, up to 6 instant alerts per Vienna
+day, sent only for a listing that's both flagged good value and ranks in the
+top 10% of that search's matches over the trailing 30 days; everything else
+rolls into a text-only digest sent twice a day, at 09:00 and 19:00 Europe/Vienna
+time. Quiet hours run 22:00-08:00 Europe/Vienna: anything found during that
+window waits for the next digest instead of landing overnight. Any search can
+be paused from `/settings` without deleting it, it keeps collecting matches in
+the background and picks back up where it left off once resumed.
 
 ### Setup
 

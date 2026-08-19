@@ -55,10 +55,6 @@ export default {
   no_matches_yet: '🏠 {name}: noch keine Treffer — ich schreibe, sobald etwas passt.',
   elevator_parking_note: ' Hinweis: Aufzug-/Parkplatz-Daten liegen nur für manche Inserate vor, daher kann dieser Filter strenger wirken als erwartet.',
   aggregate_summary_lead: 'Das ist schon da:',
-  push_header_one: '🏠 {name} — {count} neuer Treffer:',
-  push_header_many: '🏠 {name} — {count} neue Treffer:',
-  push_more: '+{count} weitere — sieh in /next nach.',
-  push_view: 'Ansehen ▸',
   status_no_longer_available: '⚠️ Nicht mehr verfügbar',
   status_added_to_shortlist: '✅ Zur Merkliste hinzugefügt',
   status_passed: '👎 Übersprungen',
@@ -66,9 +62,14 @@ export default {
   help_full:
     'Ich finde Mietwohnungen in Wien nach deinen Kriterien und zeige sie als Karten zum Durchwischen, wie bei einer Dating-App.\n\n' +
     'So funktioniert\'s: Alle ~3 Stunden prüfe ich willhaben und immobilienscout24 auf neue Treffer für jede deiner Suchen. ' +
-    'Gibt es mehrere, fasse ich sie zu einer gebündelten Push-Nachricht pro Suche zusammen, statt dich mit einzelnen Karten zu fluten. ' +
-    'Wische 👍, um eine Karte in deine Merkliste zu speichern, oder 👎 zum Überspringen — jede Karte behält eine ↩️ Rückgängig-Schaltfläche, ' +
-    'bis du die nächste wischst. Je mehr du wischst, desto besser werden die Treffer: ich lerne, welche Preis-/Größen-/Bezirks-Kombinationen dir gefallen.\n\n' +
+    'Wenn eine Anzeige wirklich heraussticht (als gutes Preis-Leistungs-Verhältnis markiert und unter den besten, die diese Suche ' +
+    'im letzten Monat gesehen hat), schicke ich sie dir sofort, bis zu ein paar Mal am Tag. Alles andere sammle ich in einer ' +
+    'Übersicht zu festen Zeiten am Tag (standardmäßig morgens und abends), damit du nichts verpasst, auch ohne Sofortmeldung. ' +
+    'Nachts bin ich still: Was in den Ruhezeiten gefunden wird, wartet auf die nächste Übersicht, statt dein Handy zu wecken. ' +
+    'Wische 👍, um eine Karte in deine Merkliste zu speichern, oder 👎 zum Überspringen, jede Karte behält eine ↩️ Rückgängig-Schaltfläche, ' +
+    'bis du die nächste wischst. Je mehr du wischst, desto besser werden die Treffer: ich lerne, welche Preis-/Größen-/Bezirks-Kombinationen ' +
+    'dir gefallen. Du kannst jede Suche über /settings pausieren, ohne sie zu verlieren: sie sammelt im Hintergrund weiter Treffer ' +
+    'und macht dort weiter, wo sie war, sobald du sie fortsetzt.\n\n' +
     'Wenn du eine Suche fertig eingerichtet hast (oder zu einer mit bereits vorhandenen Treffern wechselst), ' +
     'schicke ich dir eine Zusammenfassung mit einer Schaltfläche "Browse top matches ▸" (auf Englisch — so steht sie auch im Chat), um sofort loszuwischen.\n\n' +
     'Befehle:\n' +

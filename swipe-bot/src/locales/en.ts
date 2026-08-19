@@ -55,10 +55,6 @@ export default {
   no_matches_yet: '🏠 {name}: no matches yet — I\'ll message you here as soon as something matches.',
   elevator_parking_note: ' Note: elevator/parking data is only available for some listings, so this filter may be more restrictive than it looks.',
   aggregate_summary_lead: 'Here\'s what\'s already out there for it:',
-  push_header_one: '🏠 {name} — {count} new match:',
-  push_header_many: '🏠 {name} — {count} new matches:',
-  push_more: '+{count} more — check /next.',
-  push_view: 'View ▸',
   status_no_longer_available: '⚠️ No longer available',
   status_added_to_shortlist: '✅ Added to shortlist',
   status_passed: '👎 Passed',
@@ -67,10 +63,15 @@ export default {
     'I find Vienna rental apartments matching your preferences and let you swipe through them, ' +
     'like a dating app.\n\n' +
     'How it works: every ~3h I check willhaben and immobilienscout24 for new matches for each of your ' +
-    'searches. If there are several, I group them into one paced push per search instead of flooding you ' +
-    'card by card. Swipe 👍 on a card to save it to your shortlist, or 👎 to pass — each card keeps an ' +
-    '↩️ Undo button until you swipe the next one. The more you swipe, the better matches get: I learn ' +
-    'which price/size/district combos you tend to like.\n\n' +
+    'searches. When one is a genuine standout, flagged good value and ranking among the best that search ' +
+    'has seen in the last month, I message you about it right away, up to a handful of times a day. ' +
+    'Everything else goes into a digest at set times each day (mornings and evenings by default), so you ' +
+    'still see it without getting pinged for every listing. Overnight I stay quiet: anything found during ' +
+    'quiet hours waits for the next digest instead of buzzing your phone. Swipe 👍 on a card to save it to ' +
+    'your shortlist, or 👎 to pass, each card keeps an ↩️ Undo button until you swipe the next one. The ' +
+    'more you swipe, the better matches get: I learn which price/size/district combos you tend to like. ' +
+    'You can pause any search from /settings without losing it: it keeps collecting matches quietly and ' +
+    'picks up right where it left off when you resume.\n\n' +
     'When you finish setting up a search (or switch to one with matches waiting), I send a summary of ' +
     'what\'s already out there with a "Browse top matches ▸" button to start swiping right away.\n\n' +
     'Commands:\n' +

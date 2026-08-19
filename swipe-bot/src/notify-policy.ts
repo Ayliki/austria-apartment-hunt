@@ -1,7 +1,7 @@
 /**
  * Every scheduling and threshold decision for notifications, as pure functions over an explicit
  * `now`. Kept free of DB and Telegram imports so the whole policy is testable without fakes, in the
- * same spirit as notify.ts's injectable DelayFn.
+ * same spirit as notify.ts's own dependency-free design.
  */
 
 const VIENNA = 'Europe/Vienna';
