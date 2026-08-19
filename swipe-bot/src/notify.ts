@@ -9,6 +9,7 @@ import { scoreListings } from './scoring.js';
 import { viennaHour, viennaDayStartIso, isQuietHour, instantThreshold, isDigestDue } from './notify-policy.js';
 import { sendPhotoCached } from './photo.js';
 import { formatCaption } from './bot.js';
+import { isPermanentChatError } from './telegram-errors.js';
 import { t } from './locales.js';
 
 /** Trailing window the instant threshold's percentile is computed over. */
@@ -170,8 +171,18 @@ export async function dispatchDigests(telegram: Telegraf['telegram'], db: DB, no
     try {
       await telegram.sendMessage(profile.chatId, text, buttons);
     } catch (err) {
+      if (isPermanentChatError(err)) {
+        // The chat is gone (blocked, deleted, deactivated). Retrying can't work, and the caller ticks
+        // every 5 minutes, so leaving lastDigestAt unstamped would mean 288 failed API calls a day for
+        // as long as this profile exists. Stamp it: the profile keeps its schedule and tries again at
+        // the next digest hour, which is enough to notice an unblock without hammering Telegram.
+        // Nothing is marked notified, so an unblocked user still gets these listings.
+        console.error(`notify: chat ${profile.chatId} is unreachable, skipping this digest for profile ${profile.id}:`, err);
+        updateNotifySettings(db, profile.id, { lastDigestAt: now.toISOString() });
+        continue;
+      }
       console.error(`notify: digest send failed for profile ${profile.id}:`, err);
-      continue; // don't stamp lastDigestAt — retry on the next tick
+      continue; // transient — don't stamp lastDigestAt, retry on the next tick
     }
 
     markDigested(db, profile.id, pending, now);

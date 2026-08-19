@@ -76,6 +76,41 @@ test('sendPhotoCached falls back to a text message and records the failure', asy
   assert.equal(isKnownBadPhoto(db, 'https://cdn/dead.jpg', NOW), true);
 });
 
+test('a blocked chat does not blacklist the photo for everyone else', async () => {
+  const db = openDb(':memory:');
+  const { telegram, calls } = testTelegram((method) =>
+    method === 'sendPhoto' ? new Error('403: Forbidden: bot was blocked by the user') : undefined);
+
+  // photo_cache is keyed by url and shared by every user, so recording a chat-level rejection here
+  // would suppress a perfectly good image for every other user for an hour.
+  const sent = await sendPhotoCached(telegram, db, 1, 'https://cdn/fine.jpg', 'caption', {}, NOW);
+
+  assert.equal(sent, false);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/fine.jpg', NOW), false, 'the photo is fine, the chat is not');
+  assert.equal(calls[0].method, 'sendPhoto');
+  assert.equal(calls[1].method, 'sendMessage', 'the text fallback still runs');
+});
+
+test('a chat-not-found rejection also leaves the url usable', async () => {
+  const db = openDb(':memory:');
+  const { telegram } = testTelegram((method) =>
+    method === 'sendPhoto' ? new Error('400: Bad Request: chat not found') : undefined);
+
+  await sendPhotoCached(telegram, db, 1, 'https://cdn/fine2.jpg', 'caption', {}, NOW);
+
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/fine2.jpg', NOW), false);
+});
+
+test('a transient network rejection still suppresses the url, so the split is not a blanket opt-out', async () => {
+  const db = openDb(':memory:');
+  const { telegram } = testTelegram((method) =>
+    method === 'sendPhoto' ? new Error('429: Too Many Requests: retry after 5') : undefined);
+
+  await sendPhotoCached(telegram, db, 1, 'https://cdn/flaky2.jpg', 'caption', {}, NOW);
+
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/flaky2.jpg', NOW), true);
+});
+
 test('sendPhotoCached never throws even when the text fallback also fails', async () => {
   const db = openDb(':memory:');
   const { telegram } = testTelegram(() => new Error('network down'));

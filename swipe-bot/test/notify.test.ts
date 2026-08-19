@@ -411,6 +411,75 @@ test('a listing sent instantly is not repeated in the digest', async () => {
   assert.ok(!text.includes('https://x/hot'), 'an instantly-sent listing must not reappear in the digest');
 });
 
+// --- Final fix wave, item 3: a digest that fails must retry only when retrying can ever work. ---
+
+/** A profile with one pending listing, already past its first digest, so every digest hour has something to send. */
+function digestReadyProfile(db: DB, chatId: number): number {
+  const profileId = createSearchProfile(db, chatId, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null })).id;
+  updateNotifySettings(db, profileId, { lastDigestAt: '2026-08-18T17:05:00Z' });
+  upsertListing(db, listing({ id: `pend${chatId}`, url: `https://x/pend${chatId}` }));
+  return profileId;
+}
+
+test('a digest send blocked by the user stamps lastDigestAt instead of retrying every tick', async () => {
+  const db = openDb(':memory:');
+  const profileId = digestReadyProfile(db, 1);
+
+  const blocked = testTelegram(() => new Error('403: Forbidden: bot was blocked by the user'));
+  await dispatchDigests(blocked.telegram, db, new Date('2026-08-19T07:05:00Z')); // 09:05 Vienna
+  assert.equal(blocked.calls.length, 1);
+  assert.equal(getNotifySettings(db, profileId).lastDigestAt, '2026-08-19T07:05:00.000Z',
+    'a permanently dead chat must be stamped, or the 5-minute tick retries it 288 times a day forever');
+
+  // The very next tick, five minutes later: the 09:00 digest is now covered, so nothing is attempted.
+  const nextTick = testTelegram(() => new Error('403: Forbidden: bot was blocked by the user'));
+  await dispatchDigests(nextTick.telegram, db, new Date('2026-08-19T07:10:00Z'));
+  assert.equal(nextTick.calls.length, 0, 'no retry on the next tick');
+});
+
+test('a transient digest failure still retries on the next tick', async () => {
+  const db = openDb(':memory:');
+  const profileId = digestReadyProfile(db, 2);
+
+  const throttled = testTelegram(() => new Error('429: Too Many Requests: retry after 30'));
+  await dispatchDigests(throttled.telegram, db, new Date('2026-08-19T07:05:00Z'));
+  assert.equal(throttled.calls.length, 1);
+  assert.equal(getNotifySettings(db, profileId).lastDigestAt, '2026-08-18T17:05:00Z', 'unchanged: this can still succeed');
+
+  const nextTick = testTelegram();
+  await dispatchDigests(nextTick.telegram, db, new Date('2026-08-19T07:10:00Z'));
+  assert.equal(nextTick.calls.length, 1, 'a throttled digest must be retried');
+  assert.ok(String(nextTick.calls[0].payload.text).includes('https://x/pend2'));
+});
+
+test('a permanently failed digest records nothing as notified, so the listings survive an unblock', async () => {
+  const db = openDb(':memory:');
+  const profileId = digestReadyProfile(db, 3);
+
+  const blocked = testTelegram(() => new Error('403: Forbidden: bot was blocked by the user'));
+  await dispatchDigests(blocked.telegram, db, new Date('2026-08-19T07:05:00Z'));
+
+  assert.equal(getNotifiedListingIds(db, profileId).size, 0, 'nothing reached the user, so nothing is announced');
+
+  // Next digest hour, user has unblocked: the same listing is still pending and now gets through.
+  const later = testTelegram();
+  await dispatchDigests(later.telegram, db, new Date('2026-08-19T17:05:00Z')); // 19:05 Vienna
+  assert.equal(later.calls.length, 1);
+  assert.ok(String(later.calls[0].payload.text).includes('https://x/pend3'));
+});
+
+test('one profile blocking the bot does not stop the next profile from getting its digest', async () => {
+  const db = openDb(':memory:');
+  digestReadyProfile(db, 4);
+  digestReadyProfile(db, 5);
+
+  const { telegram, calls } = testTelegram((_method, payload) =>
+    payload.chat_id === 4 ? new Error('403: Forbidden: bot was blocked by the user') : undefined);
+  await dispatchDigests(telegram, db, new Date('2026-08-19T07:05:00Z'));
+
+  assert.deepEqual(calls.map((c) => c.payload.chat_id), [4, 5]);
+});
+
 // --- Final fix wave, item 1: `lastDigestAt == null` must mean ONLY "this profile pre-dates the ---
 // --- deploy". A brand-new profile is stamped at creation, so its first day is never adopted ---
 // --- silently. ---
