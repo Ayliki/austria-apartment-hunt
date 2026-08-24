@@ -779,6 +779,26 @@ export function getShortlist(db: DB, chatId: number): ListingRow[] {
   return rows.map(rowToListing);
 }
 
+/** One shortlist entry plus the moment it was saved — the extra column the CSV export needs and the browse UI does not. */
+export interface ShortlistExportRow {
+  listing: ListingRow;
+  savedAt: string;
+}
+
+/**
+ * Shortlist rows carrying saved_at, for CSV export. A sibling of getShortlist rather than a change
+ * to it: every browse call site wants a bare ListingRow, and widening that return type would ripple
+ * through all of them for one consumer's benefit. Ordering matches getShortlist exactly, including
+ * the rowid tiebreak, so an export and the browse deck never disagree about what "first" means.
+ */
+export function getShortlistForExport(db: DB, chatId: number): ShortlistExportRow[] {
+  const rows = db.prepare(`
+    SELECT l.*, s.saved_at AS saved_at FROM shortlist s JOIN listings l ON l.id = s.listing_id
+    WHERE s.chat_id = ? ORDER BY s.saved_at DESC, s.rowid DESC
+  `).all(chatId) as Record<string, unknown>[];
+  return rows.map((r) => ({ listing: rowToListing(r), savedAt: String(r.saved_at) }));
+}
+
 /** Un-saves a listing from the shortlist only — the underlying swipe (direction 'like') is left intact, so the listing stays excluded from future /next candidates, matching how a pass already behaves. */
 export function removeFromShortlist(db: DB, chatId: number, listingId: string): void {
   db.prepare('DELETE FROM shortlist WHERE chat_id = ? AND listing_id = ?').run(chatId, listingId);
