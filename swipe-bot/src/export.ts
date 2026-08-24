@@ -17,10 +17,19 @@ export const CSV_COLUMNS: readonly string[] = [
   'first_seen', 'saved_at', 'url',
 ];
 
-/** RFC 4180: quote when the field contains the delimiter, a quote, or a line break; double internal quotes. */
+/** RFC 4180: quote when the field contains the delimiter, a quote, or a line break; double internal quotes.
+ *  Also defends against CSV formula injection (CWE-1236) by prefixing dangerous leading chars with apostrophe.
+ */
 function csvField(value: string | number | boolean | null): string {
   if (value == null) return '';
-  const s = String(value);
+  let s = String(value);
+
+  // Prefix with apostrophe if the string starts with a formula trigger to prevent injection in Excel/Sheets/Calc.
+  // Dangerous chars: =, +, -, @, tab, CR. The apostrophe suppresses formula parsing without changing the displayed value.
+  if (/^[=+\-@\t\r]/.test(s)) {
+    s = `'${s}`;
+  }
+
   if (s.includes(CSV_DELIMITER) || s.includes('"') || s.includes('\n') || s.includes('\r')) {
     return `"${s.replace(/"/g, '""')}"`;
   }
