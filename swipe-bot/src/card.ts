@@ -4,15 +4,16 @@
  */
 
 /**
- * Escapes the three characters Telegram's HTML parse_mode treats as markup. Listing titles and
- * addresses come from willhaben/ImmoScout verbatim and do contain `&` and `<`; an unescaped one
- * makes Telegram reject the whole message with "can't parse entities", which loses the card
- * silently rather than visibly.
+ * Escapes the four characters Telegram's HTML parse_mode treats as markup, including the quote —
+ * required once escaped output can land inside an attribute value (`href="..."`), not just in text
+ * content. Listing titles and addresses come from willhaben/ImmoScout verbatim and do contain `&`
+ * and `<`; an unescaped one makes Telegram reject the whole message with "can't parse entities",
+ * which loses the card silently rather than visibly.
  *
- * Ampersand is replaced first — reversing the order would double-escape the `&` in `&lt;`.
+ * Ampersand is replaced first — reversing the order would double-escape the `&` in `&lt;`/`&quot;`.
  */
 export function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 /**
@@ -119,6 +120,37 @@ function valueBadge(flag: ListingRow['valueFlag'], labels: CardLabels): string |
 }
 
 /**
+ * Per-field ceilings on the four scraped strings that title/description's shrink cascade doesn't
+ * cover: addressLine, floor, energyClass, availableFrom. Nothing upstream bounds these — willhaben
+ * and ImmoScout hand them back verbatim — so without a cap here a single oversized field can blow
+ * the card past its budget on its own. Generous enough that real Vienna listing data never gets
+ * truncated (see the length numbers below); only pathological/scraper-garbage input hits the cap.
+ */
+const ADDRESS_LINE_MAX = 150;
+const FLOOR_MAX = 60;
+const ENERGY_CLASS_MAX = 60;
+const AVAILABLE_FROM_MAX = 60;
+
+/**
+ * Escapes `raw` and truncates the *escaped* result to at most `maxLen` characters, appending an
+ * ellipsis when it truncates. Capping the escaped length rather than the raw length is what makes
+ * the bound exact: `&`, `<`, `>` and `"` each expand by up to 6x under escapeHtml, so a raw-length
+ * cap alone doesn't bound the string this actually inserts into the card. Building character by
+ * character (rather than escaping-then-slicing) guarantees the cut always falls between escaped
+ * units, never mid-entity.
+ */
+function capEscapedField(raw: string | null, maxLen: number): string | null {
+  if (raw == null) return null;
+  let result = '';
+  for (const ch of raw) {
+    const esc = escapeHtml(ch);
+    if (result.length + esc.length > maxLen - 1) return `${result}…`;
+    result += esc;
+  }
+  return result;
+}
+
+/**
  * Builds the whole card as HTML.
  *
  * Length is enforced by shrinking the description *before* markup is assembled, never by slicing
@@ -131,12 +163,21 @@ export function formatCard(l: ListingRow, opts: CardOptions = {}): string {
   const maxLength = opts.maxLength ?? CARD_MESSAGE_LIMIT;
   const prefix = opts.prefix ?? '';
 
+  // Escaped-and-capped once per call, ahead of assembly: these four fields are unbounded coming out
+  // of the scraper, and each is already in its final (escaped, budget-safe) form by the time it's
+  // spliced into a line below — no further escapeHtml call on them.
+  const addressLine = capEscapedField(l.addressLine, ADDRESS_LINE_MAX);
+  const floor = capEscapedField(l.floor, FLOOR_MAX);
+  const energyClass = capEscapedField(l.energyClass, ENERGY_CLASS_MAX);
+  const availableFrom = capEscapedField(l.availableFrom, AVAILABLE_FROM_MAX);
+
   const build = (title: string, description: string | null): string => {
     const lines: string[] = [];
     lines.push(`<b>${escapeHtml(title)}</b>`);
 
-    const location = [districtLabel(l.district), l.addressLine].filter((x): x is string => x != null && x !== '');
-    if (location.length > 0) lines.push(`📍 ${escapeHtml(location.join(' · '))}`);
+    const district = districtLabel(l.district);
+    const location = [district != null ? escapeHtml(district) : null, addressLine].filter((x): x is string => x != null && x !== '');
+    if (location.length > 0) lines.push(`📍 ${location.join(' · ')}`);
 
     const priceBits = [
       l.price != null ? `€${l.price}` : null,
@@ -148,15 +189,15 @@ export function formatCard(l: ListingRow, opts: CardOptions = {}): string {
     const sizeBits = [
       l.area != null ? `${l.area} m²` : null,
       l.rooms != null ? `${l.rooms} ${labels.rooms}` : null,
-      l.floor ? `${labels.floor} ${escapeHtml(l.floor)}` : null,
+      floor ? `${labels.floor} ${floor}` : null,
     ].filter((x): x is string => x != null);
     if (sizeBits.length > 0) lines.push(`📐 ${sizeBits.join(' · ')}`);
 
     const amenityBits = [
       l.lift === true ? labels.lift : null,
       l.parkingSpaces != null && l.parkingSpaces > 0 ? `${labels.parking} (${l.parkingSpaces})` : null,
-      l.energyClass ? `${labels.energy} ${escapeHtml(l.energyClass)}` : null,
-      l.availableFrom ? `${labels.availableFrom} ${escapeHtml(l.availableFrom)}` : null,
+      energyClass ? `${labels.energy} ${energyClass}` : null,
+      availableFrom ? `${labels.availableFrom} ${availableFrom}` : null,
     ].filter((x): x is string => x != null);
     if (amenityBits.length > 0) lines.push(amenityBits.join(' · '));
 

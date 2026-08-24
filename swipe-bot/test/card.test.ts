@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { escapeHtml, viennaPostalCode, districtLabel, VIENNA_DISTRICT_NAMES } from '../src/card.js';
 
-test('escapeHtml escapes the three HTML-significant characters', () => {
-  assert.equal(escapeHtml('Wohnung & Co <Neu>'), 'Wohnung &amp; Co &lt;Neu&gt;');
+test('escapeHtml escapes the four HTML-significant characters', () => {
+  assert.equal(escapeHtml('Wohnung & Co <Neu> "toll"'), 'Wohnung &amp; Co &lt;Neu&gt; &quot;toll&quot;');
 });
 
 test('escapeHtml escapes ampersands before angle brackets, never double-escaping', () => {
@@ -169,4 +169,35 @@ test('formatCard never truncates inside a tag or an entity', () => {
 test('formatCard prepends the prefix when supplied', () => {
   const out = formatCard(row(), { prefix: '❤️ 1 of 3\n\n' });
   assert.ok(out.startsWith('❤️ 1 of 3'));
+});
+
+test('formatCard bounds every scraped field independently, so no single oversized field can blow the budget', () => {
+  const overflowValue = 'x'.repeat(3000);
+  const overrides: Partial<ListingRow>[] = [
+    { title: overflowValue },
+    { description: overflowValue },
+    { addressLine: overflowValue },
+    { floor: overflowValue },
+    { energyClass: overflowValue },
+    { availableFrom: overflowValue },
+  ];
+  for (const override of overrides) {
+    const field = Object.keys(override)[0];
+    for (const maxLength of [CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT]) {
+      const out = formatCard(row(override), { maxLength });
+      assert.ok(out.length <= maxLength, `${field} at maxLength ${maxLength}: got ${out.length}`);
+    }
+  }
+});
+
+test('formatCard stays within the caption budget even when every capped field is adversarially escape-heavy at once', () => {
+  // Worst-case stress: all four field-level caps filled with '"', the character escapeHtml expands
+  // the most (6x, "->&quot;), plus every warning/badge line enabled — exercises the caps working
+  // together, not just one field at a time.
+  const quoteBomb = '"'.repeat(3000);
+  const out = formatCard(row({
+    addressLine: quoteBomb, floor: quoteBomb, energyClass: quoteBomb, availableFrom: quoteBomb,
+    isWg: true, requiresWaitlistTicket: true, isDelisted: true, mentionsPets: true,
+  }), { maxLength: CARD_CAPTION_LIMIT });
+  assert.ok(out.length <= CARD_CAPTION_LIMIT, `got ${out.length}`);
 });
