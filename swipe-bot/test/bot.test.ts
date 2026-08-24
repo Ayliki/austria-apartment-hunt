@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createBot, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor, sendCard,
+  createBot, nextCardFor, cardLabels, buildMediaGroup, getCommuteLineFor, sendCard,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
   summarizeMatches, formatAggregateSummary, sendProfileActivationSummary,
 } from '../src/bot.js';
@@ -62,100 +62,18 @@ test('nextCardFor returns the top-ranked candidate, excluding already-swiped', (
   assert.equal(card!.id, 'willhaben:b');
 });
 
-test('formatCaption includes title, price, size/rooms/district, and the link', () => {
-  const caption = formatCaption(row({}));
-  assert.match(caption, /Sunny two-room flat/);
-  assert.match(caption, /€650/);
-  assert.match(caption, /43m²/);
-  assert.match(caption, /2 rooms/);
-  assert.match(caption, /district 6/);
-  assert.match(caption, /https:\/\/x\/1/);
-});
+// formatCaption's own unit tests were replaced by formatCard's equivalent coverage in
+// test/card.test.ts when Task 4 retired the plain-text renderer — see that file for
+// title/price/warning-flag/pet-badge/commute-line/prefix/truncation coverage.
 
-test('formatCaption appends the description when present, omits the block when null', () => {
-  const withDesc = formatCaption(row({ description: 'Bright and quiet, close to the U-Bahn.' }));
-  assert.match(withDesc, /Bright and quiet, close to the U-Bahn\./);
-
-  const withoutDesc = formatCaption(row({ description: null }));
-  assert.doesNotMatch(withoutDesc, /\n\n/); // no description block appended at all
-});
-
-test('formatCaption truncates to Telegram\'s 1024-char caption limit instead of overflowing', () => {
-  const longDescription = 'x'.repeat(2000);
-  const caption = formatCaption(row({ description: longDescription }));
-  assert.ok(caption.length <= 1024, `caption was ${caption.length} chars`);
-  assert.ok(caption.endsWith('…'));
-});
-
-test('formatCaption flags municipal/waitlist housing, and only when it actually requires one', () => {
-  const flagged = formatCaption(row({ requiresWaitlistTicket: true }));
-  assert.match(flagged, /⚠️ Municipal\/waitlist housing/);
-
-  const unflagged = formatCaption(row({ requiresWaitlistTicket: false }));
-  assert.doesNotMatch(unflagged, /⚠️/);
-});
-
-test('formatCaption tags WG/shared-flat listings, and only those', () => {
-  const flagged = formatCaption(row({ isWg: true }));
-  assert.match(flagged, /🚪 WG/);
-
-  const unflagged = formatCaption(row({ isWg: false }));
-  assert.doesNotMatch(unflagged, /🚪/);
-});
-
-test('formatCaption flags a delisted listing, and only when it actually is', () => {
-  const flagged = formatCaption(row({ isDelisted: true }));
-  assert.match(flagged, /⚠️ No longer listed/);
-
-  const unflagged = formatCaption(row({ isDelisted: false }));
-  assert.doesNotMatch(unflagged, /No longer listed/);
-});
-
-test('formatCaption appends the commute line when given one, omits it entirely otherwise', () => {
-  const withCommute = formatCaption(row({}), '📍 18 min walk · 7 min by tram D to TU Wien');
-  assert.match(withCommute, /📍 18 min walk · 7 min by tram D to TU Wien/);
-
-  assert.doesNotMatch(formatCaption(row({}), null), /📍/);
-  assert.doesNotMatch(formatCaption(row({})), /📍/);
-});
-
-test('formatCaption includes an optional prefix ahead of the title, within the truncation budget', () => {
-  const withPrefix = formatCaption(row({}), null, '❤️ 3 of 12\n\n');
-  assert.match(withPrefix, /^❤️ 3 of 12\n\nSunny two-room flat/);
-});
-
-test('formatCaption without a prefix behaves exactly as before (no leading position line)', () => {
-  assert.doesNotMatch(formatCaption(row({})), /❤️/);
-});
-
-test('formatCaption truncates to 1024 chars even with a prefix present', () => {
-  const longDescription = 'x'.repeat(2000);
-  const caption = formatCaption(row({ description: longDescription }), null, '❤️ 3 of 12\n\n');
-  assert.ok(caption.length <= 1024, `caption was ${caption.length} chars`);
-  assert.ok(caption.startsWith('❤️ 3 of 12\n\n'));
-  assert.ok(caption.endsWith('…'));
-});
-
-test('formatCaption shows elevator/parking/floor/energy class only when known, never fabricating "no" for a null field', () => {
-  const withAmenities = formatCaption(row({ lift: true, parkingSpaces: 2, floor: '3. Stock', energyClass: 'B' }));
-  assert.match(withAmenities, /Lift/i);
-  assert.match(withAmenities, /Parking/i);
-  assert.match(withAmenities, /3\. Stock/);
-  assert.match(withAmenities, /B/);
-
-  const withoutAmenities = formatCaption(row({ lift: null, parkingSpaces: null, floor: null, energyClass: null }));
-  assert.doesNotMatch(withoutAmenities, /Lift/i);
-  assert.doesNotMatch(withoutAmenities, /Parking/i);
-});
-
-test('formatCaption shows the unverified pet badge only when mentionsPets is true', () => {
-  assert.match(formatCaption(row({ mentionsPets: true })), /🐾 mentions pets — check listing/);
-  assert.doesNotMatch(formatCaption(row({ mentionsPets: false })), /🐾/);
-});
-
-test('formatCaption still truncates to 1024 chars with the new badge lines included', () => {
-  const caption = formatCaption(row({ description: 'x'.repeat(2000), lift: true, parkingSpaces: 1, mentionsPets: true }));
-  assert.ok(caption.length <= 1024);
+test('cardLabels resolves every label for the chat language', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  const labels = cardLabels(db, 1);
+  for (const [key, value] of Object.entries(labels)) {
+    assert.equal(typeof value, 'string', `${key} must resolve to a string`);
+    assert.ok(value.length > 0, `${key} must not be empty`);
+  }
 });
 
 test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order', () => {
@@ -1572,6 +1490,35 @@ test('completing the wizard via buttons still attaches MAIN_KEYBOARD, even thoug
   const navMessage = calls.find((c) => c.method === 'sendMessage' && (c.payload.reply_markup as { keyboard?: unknown } | undefined)?.keyboard);
   assert.ok(navMessage, 'expected MAIN_KEYBOARD to be attached to some message after button-driven wizard completion');
   assert.deepEqual((navMessage!.payload.reply_markup as { keyboard: string[][] }).keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
+});
+
+test('sendCard sends card text as HTML', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '40', images: [] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:40')!, null, db);
+
+  const sent = calls.find((c) => c.method === 'sendMessage');
+  assert.ok(sent, 'a no-photo listing sends as a message');
+  assert.equal(sent.payload.parse_mode, 'HTML');
+  assert.match(String(sent.payload.text), /<b>/);
+});
+
+test('sendCard disables the link preview so Telegram adds no extra image', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '41', images: [] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:41')!, null, db);
+
+  const sent = calls.find((c) => c.method === 'sendMessage')!;
+  assert.ok(
+    sent.payload.link_preview_options !== undefined || sent.payload.disable_web_page_preview === true,
+    'link preview must be suppressed',
+  );
 });
 
 test('a failing album degrades to a single photo instead of losing the card', async () => {

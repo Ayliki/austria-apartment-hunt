@@ -181,6 +181,21 @@ test('dispatchInstant sends exactly one photo message for a top match', async ()
   assert.equal(calls[0].method, 'sendPhoto');
 });
 
+test('an instant alert sends its caption as HTML', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db,
+    [row({ id: 'willhaben:new', valueFlag: 'good', images: ['https://cdn/a.jpg'] })], NOW_MIDDAY);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'sendPhoto');
+  assert.equal(calls[0].payload.parse_mode, 'HTML');
+  assert.match(String(calls[0].payload.caption), /<b>/);
+});
+
 test('dispatchInstant never sends an album, however many photos a listing has', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));

@@ -9,6 +9,7 @@ import {
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
+import { formatCard, type CardLabels, CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT } from './card.js';
 import { t, LOCALE_NAMES } from './locales.js';
 import { sendPhotoCached, usablePhotoUrls } from './photo.js';
 import { renderNotifyMenu, nextDailyCap } from './notify-ui.js';
@@ -163,56 +164,33 @@ export function nextCardFor(db: DB, chatId: number): ListingRow | null {
   return rankListings(candidates, swiped)[0];
 }
 
-/** Telegram's hard cap on caption length for photos and media groups alike. */
-const MAX_CAPTION_LENGTH = 1024;
-
-function truncate(s: string, maxLen: number): string {
-  if (s.length <= maxLen) return s;
-  return s.slice(0, maxLen - 1).trimEnd() + '…';
+/** Resolves every card label for a chat's language in one place, so formatCard itself stays pure and DB-free. */
+export function cardLabels(db: DB, chatId: number): CardLabels {
+  return {
+    petBadge: t(db, chatId, 'pet_badge'),
+    linkText: t(db, chatId, 'card_link_text'),
+    rooms: t(db, chatId, 'card_rooms'),
+    floor: t(db, chatId, 'card_floor'),
+    availableFrom: t(db, chatId, 'card_available_from'),
+    valueGood: t(db, chatId, 'card_value_good'),
+    valueFair: t(db, chatId, 'card_value_fair'),
+    valuePremium: t(db, chatId, 'card_value_premium'),
+    lift: t(db, chatId, 'card_lift'),
+    parking: t(db, chatId, 'card_parking'),
+    energy: t(db, chatId, 'card_energy'),
+    waitlistWarning: t(db, chatId, 'card_warning_waitlist'),
+    wgWarning: t(db, chatId, 'card_warning_wg'),
+    delistedWarning: t(db, chatId, 'card_warning_delisted'),
+  };
 }
-
-/** Default English text for the pet-mention badge — used when no localized string is supplied. Kept in sync with locales/en.ts's `pet_badge` key. */
-const DEFAULT_PET_BADGE_TEXT = '🐾 mentions pets — check listing';
 
 /**
- * Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, amenity
- * facts, pet-mention badge, commute line, description, link). Exported for direct testing.
- *
- * `petBadgeText` defaults to English so pure tests (no `db`/`chatId`) keep working unchanged; the
- * one call site that needs localization passes `t(db, chatId, 'pet_badge')` explicitly. The badge
- * only ever means the listing text mentions pets somewhere — never a confirmed pet-friendly amenity
- * — so its wording must stay hedged ("check listing") in every locale.
+ * Extra fields an HTML card send needs on a text-only message: markup mode, and no auto-preview
+ * competing with the card's own content. Only `sendMessage`/`editMessageText` payloads carry a
+ * `link_preview_options` field at all — a photo send never gets a separate Telegram-generated
+ * preview in the first place, so those call sites add `parse_mode: 'HTML'` alone instead.
  */
-export function formatCaption(
-  l: ListingRow, commuteLine?: string | null, prefix?: string, petBadgeText: string = DEFAULT_PET_BADGE_TEXT,
-): string {
-  const price = l.price != null ? `€${l.price}` : 'price n/a';
-  const area = l.area != null ? `${l.area}m²` : '';
-  const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
-  const district = l.district != null ? `district ${l.district}` : '';
-  const details = [area, rooms, district].filter(Boolean).join(' · ');
-  const flag = l.requiresWaitlistTicket
-    ? '\n⚠️ Municipal/waitlist housing — needs a Vormerkschein, Wohnticket, or Wiener Wohnen registration.'
-    : '';
-  const wgFlag = l.isWg ? '\n🚪 WG — shared flat / co-living / student room, not a whole apartment.' : '';
-  const delistedFlag = l.isDelisted ? '\n⚠️ No longer listed — likely taken down by the advertiser.' : '';
-  // Info-only facts — only ever shown when known; a null field is omitted, never rendered as "no".
-  const amenityBits = [
-    l.lift === true ? 'Lift' : null,
-    l.parkingSpaces != null && l.parkingSpaces > 0 ? `Parking (${l.parkingSpaces})` : null,
-    l.floor ? `Floor: ${l.floor}` : null,
-    l.energyClass ? `Energy: ${l.energyClass}` : null,
-    l.availableFrom ? `Available: ${l.availableFrom}` : null,
-  ].filter((x): x is string => x != null);
-  const amenities = amenityBits.length > 0 ? `\n${amenityBits.join(' · ')}` : '';
-  // Unverified — the listing text merely mentions pets; never presented as a confirmed amenity.
-  const petBadge = l.mentionsPets ? `\n${petBadgeText}` : '';
-  const commute = commuteLine ? `\n${commuteLine}` : '';
-  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${delistedFlag}${amenities}${petBadge}${commute}\n${l.url}`;
-  const full = l.description ? `${base}\n\n${l.description}` : base;
-  const withPrefix = prefix ? `${prefix}${full}` : full;
-  return truncate(withPrefix, MAX_CAPTION_LENGTH);
-}
+export const HTML_SEND_EXTRA = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } };
 
 /** Telegram's hard cap on items in a single sendMediaGroup call. */
 export const MAX_MEDIA_GROUP_ITEMS = 10;
@@ -289,11 +267,11 @@ async function sendListingCard(
   }
 
   if (images.length >= 1) {
-    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons }, now);
+    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons, parse_mode: 'HTML' }, now);
     return;
   }
 
-  await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+  await telegram.sendMessage(chatId, `${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
 }
 
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
@@ -301,7 +279,9 @@ export async function sendCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine: string | null | undefined, db: DB,
   now: Date = new Date(),
 ): Promise<void> {
-  const caption = formatCaption(card, commuteLine, undefined, t(db, chatId, 'pet_badge'));
+  const caption = formatCard(card, {
+    commuteLine, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
+  });
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
@@ -313,12 +293,14 @@ export async function sendCard(
 async function sendShortlistBrowseCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, position: number, total: number, db: DB,
 ): Promise<void> {
-  const caption = formatCaption(card, null, `❤️ ${position} of ${total}\n\n`, t(db, chatId, 'pet_badge'));
+  const caption = formatCard(card, {
+    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
+  });
   const buttons = shortlistNavButtons(card.id, position, total);
   if (card.images.length > 0) {
-    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
+    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons, parse_mode: 'HTML' });
   } else {
-    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
   }
 }
 
@@ -406,8 +388,16 @@ interface ShortlistCardCtx {
   callbackQuery?: { message?: unknown };
   chat?: { id: number };
   telegram: Telegraf['telegram'];
-  editMessageMedia: (media: { type: 'photo'; media: string; caption?: string }, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
-  editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+  editMessageMedia: (
+    media: { type: 'photo'; media: string; caption?: string; parse_mode?: 'HTML' },
+    extra?: ReturnType<typeof Markup.inlineKeyboard>,
+  ) => Promise<unknown>;
+  editMessageText: (
+    text: string,
+    extra?: { reply_markup?: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] } & {
+      parse_mode?: 'HTML'; link_preview_options?: { is_disabled: boolean };
+    },
+  ) => Promise<unknown>;
   deleteMessage: () => Promise<unknown>;
 }
 
@@ -428,9 +418,9 @@ async function deleteAndSendShortlistCard(
   }
   try {
     if (listing.images.length > 0) {
-      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons });
+      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons, parse_mode: 'HTML' });
     } else {
-      await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+      await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
     }
   } catch {
     // best-effort — see doc comment above
@@ -449,20 +439,22 @@ async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, 
   const message = ctx.callbackQuery?.message as { photo?: unknown } | undefined;
   if (!message) return;
   const chatId = ctx.chat!.id;
-  const caption = formatCaption(listing, null, `❤️ ${position} of ${total}\n\n`, t(db, chatId, 'pet_badge'));
+  const caption = formatCard(listing, {
+    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
+  });
   const buttons = shortlistNavButtons(listing.id, position, total);
   const targetHasPhoto = listing.images.length > 0;
   const currentHasPhoto = Boolean(message.photo);
   if (targetHasPhoto && currentHasPhoto) {
     try {
-      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption }, buttons);
+      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption, parse_mode: 'HTML' }, buttons);
       return;
     } catch {
       // in-place edit failed (e.g. expired image URL) — fall through to delete+send below
     }
   } else if (!targetHasPhoto && !currentHasPhoto) {
     try {
-      await ctx.editMessageText(`${caption}\n(no photo)`, buttons);
+      await ctx.editMessageText(`${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
       return;
     } catch {
       // in-place edit failed — fall through to delete+send below
