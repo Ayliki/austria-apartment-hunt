@@ -118,6 +118,6 @@ export default {
   card_warning_wg: '🚪 WG — shared flat / co-living / student room, not a whole apartment.',
   card_warning_delisted: '⚠️ No longer listed — likely taken down by the advertiser.',
   btn_export_csv: '📤 Export CSV',
-  export_caption: '{count} saved listings',
+  export_caption: 'Saved listings: {count}',
   export_failed: 'Could not build the export just now. Try again in a moment.',
 } as const;

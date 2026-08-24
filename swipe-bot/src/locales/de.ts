@@ -110,10 +110,10 @@ export default {
   card_lift: '🛗 Lift',
   card_parking: '🅿️ Parkplatz',
   card_energy: '⚡ Energieklasse',
-  card_warning_waitlist: '⚠️ Gemeindebau/Vormerkschein nötig — Wohnticket oder Wiener-Wohnen-Registrierung erforderlich.',
+  card_warning_waitlist: '⚠️ Gemeindebau/geförderte Wohnung — Vormerkschein, Wohnticket oder Wiener-Wohnen-Registrierung erforderlich.',
   card_warning_wg: '🚪 WG — Zimmer in einer Wohngemeinschaft, keine eigene Wohnung.',
   card_warning_delisted: '⚠️ Nicht mehr online — vermutlich vom Anbieter zurückgezogen.',
   btn_export_csv: '📤 CSV exportieren',
-  export_caption: '{count} gespeicherte Inserate',
+  export_caption: 'Gespeicherte Inserate: {count}',
   export_failed: 'Der Export konnte nicht erstellt werden. Bitte gleich noch einmal versuchen.',
 } as const;
