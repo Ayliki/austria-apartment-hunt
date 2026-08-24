@@ -106,10 +106,15 @@ test('formatCard omits price-per-sqm when it is unknown', () => {
   assert.ok(!out.includes('/m²'));
 });
 
-test('formatCard renders each warning flag', () => {
+test('formatCard renders each warning flag, and omits each when it does not apply', () => {
   assert.ok(formatCard(row({ isWg: true })).includes(DEFAULT_CARD_LABELS.wgWarning));
+  assert.ok(!formatCard(row({ isWg: false })).includes(DEFAULT_CARD_LABELS.wgWarning));
+
   assert.ok(formatCard(row({ requiresWaitlistTicket: true })).includes(DEFAULT_CARD_LABELS.waitlistWarning));
+  assert.ok(!formatCard(row({ requiresWaitlistTicket: false })).includes(DEFAULT_CARD_LABELS.waitlistWarning));
+
   assert.ok(formatCard(row({ isDelisted: true })).includes(DEFAULT_CARD_LABELS.delistedWarning));
+  assert.ok(!formatCard(row({ isDelisted: false })).includes(DEFAULT_CARD_LABELS.delistedWarning));
 });
 
 test('formatCard renders the pet badge only when the listing mentions pets', () => {
@@ -117,9 +122,43 @@ test('formatCard renders the pet badge only when the listing mentions pets', () 
   assert.ok(!formatCard(row({ mentionsPets: false })).includes(DEFAULT_CARD_LABELS.petBadge));
 });
 
-test('formatCard renders the commute line when supplied', () => {
+test('formatCard renders the size line: area, rooms, and floor, each with its label', () => {
+  const out = formatCard(row({ area: 38, rooms: 1, floor: '3. Stock' }));
+  assert.ok(out.includes('38 m²'));
+  assert.ok(out.includes(`1 ${DEFAULT_CARD_LABELS.rooms}`));
+  assert.ok(out.includes(`${DEFAULT_CARD_LABELS.floor} 3. Stock`));
+});
+
+test('formatCard renders the amenity line: lift, parking count, energy class, and available-from, each with its label', () => {
+  const out = formatCard(row({ lift: true, parkingSpaces: 2, energyClass: 'B', availableFrom: '01.09.2026' }));
+  assert.ok(out.includes(DEFAULT_CARD_LABELS.lift));
+  assert.ok(out.includes(`${DEFAULT_CARD_LABELS.parking} (2)`));
+  assert.ok(out.includes(`${DEFAULT_CARD_LABELS.energy} B`));
+  assert.ok(out.includes(`${DEFAULT_CARD_LABELS.availableFrom} 01.09.2026`));
+});
+
+test('formatCard omits amenity facts entirely when unknown, never fabricating "no" for a null field', () => {
+  const out = formatCard(row({ lift: null, parkingSpaces: null, floor: null, energyClass: null, availableFrom: null }));
+  assert.ok(!out.includes(DEFAULT_CARD_LABELS.lift));
+  assert.ok(!out.includes(DEFAULT_CARD_LABELS.parking));
+  assert.ok(!out.includes(DEFAULT_CARD_LABELS.energy));
+  assert.ok(!out.includes(DEFAULT_CARD_LABELS.availableFrom));
+});
+
+test('formatCard never renders "Parking (0)" for a listing with zero parking spaces', () => {
+  assert.ok(!formatCard(row({ parkingSpaces: 0 })).includes(DEFAULT_CARD_LABELS.parking));
+});
+
+test('formatCard renders the lift badge only when lift is exactly true, not merely truthy-ambiguous false', () => {
+  assert.ok(!formatCard(row({ lift: false })).includes(DEFAULT_CARD_LABELS.lift));
+});
+
+test('formatCard renders the commute line when supplied, and omits it entirely otherwise', () => {
   const out = formatCard(row(), { commuteLine: '🚇 21 min to TU Wien' });
   assert.ok(out.includes('🚇 21 min to TU Wien'));
+
+  assert.ok(!formatCard(row(), { commuteLine: null }).includes('🚇 21 min to TU Wien'));
+  assert.ok(!formatCard(row()).includes('🚇 21 min to TU Wien'));
 });
 
 test('formatCard renders the description italic, sliced to 200 characters', () => {
@@ -169,6 +208,37 @@ test('formatCard never truncates inside a tag or an entity', () => {
 test('formatCard prepends the prefix when supplied', () => {
   const out = formatCard(row(), { prefix: '❤️ 1 of 3\n\n' });
   assert.ok(out.startsWith('❤️ 1 of 3'));
+});
+
+// prefix and commuteLine are the only two fields formatCard splices in verbatim from the caller —
+// unlike title/description/addressLine/floor/energyClass/availableFrom, they used to bypass both
+// escaping and the length budget entirely. A search-profile name (prefix, via the instant-alert
+// header) and a commute destination (commuteLine) are both raw free-text a user typed, with no
+// validation upstream, so both a "can't parse entities" send failure and a blown budget are real,
+// reachable bugs — not hypothetical ones.
+
+test('formatCard escapes a caller-supplied prefix, so a profile name containing markup characters cannot break the HTML send', () => {
+  const out = formatCard(row(), { prefix: 'Suche <1000€\n\n' });
+  assert.ok(!out.includes('<1000€'), 'a raw angle bracket from the prefix must never survive into the output');
+  assert.ok(out.includes('Suche &lt;1000€'));
+});
+
+test('formatCard bounds a caller-supplied prefix, so a long profile name cannot blow the caption budget on its own', () => {
+  const longProfileName = 'x'.repeat(2200);
+  const out = formatCard(row(), { prefix: `🔥 Strong match · ${longProfileName}\n\n`, maxLength: CARD_CAPTION_LIMIT });
+  assert.ok(out.length <= CARD_CAPTION_LIMIT, `got ${out.length}`);
+});
+
+test('formatCard escapes a caller-supplied commute line, so a destination containing markup characters cannot break the HTML send', () => {
+  const out = formatCard(row(), { commuteLine: '📍 18 min walk to <script>evil</script>' });
+  assert.ok(!out.includes('<script>'), 'raw markup from the commute destination must never survive into the output');
+  assert.ok(out.includes('&lt;script&gt;'));
+});
+
+test('formatCard bounds a caller-supplied commute line, so a long commute destination cannot blow the caption budget on its own', () => {
+  const longDestination = 'x'.repeat(2200);
+  const out = formatCard(row(), { commuteLine: `📍 18 min walk to ${longDestination}`, maxLength: CARD_CAPTION_LIMIT });
+  assert.ok(out.length <= CARD_CAPTION_LIMIT, `got ${out.length}`);
 });
 
 test('formatCard bounds every scraped field independently, so no single oversized field can blow the budget', () => {

@@ -132,6 +132,26 @@ const ENERGY_CLASS_MAX = 60;
 const AVAILABLE_FROM_MAX = 60;
 
 /**
+ * Ceilings on the two caller-supplied strings formatCard splices in outside its own shrink cascade:
+ * `prefix` (a shortlist position line, or an instant-alert header built from a user's own
+ * search-profile name) and `commuteLine` (built from a free-text commute destination the user typed
+ * during onboarding). Both carry raw, unescaped, length-unbounded user text by the time they reach
+ * here — the profile-name and commute-destination inputs have no validation upstream — so, same as
+ * the four scraped fields above, they're capped and escaped once, in the one place every caller
+ * funnels through, rather than in each of the three call sites.
+ *
+ * Both survive real usage untouched: `❤️ 999 of 999` and a generated commute line like `📍 18 min
+ * walk · 7 min by tram D to TU Wien` are each well under their cap. The numbers are deliberately
+ * tight, not generous — with the title shrunk to nothing (its own recovery budget exhausted),
+ * every capped field above at once, every warning flag on, and the longest of the three locales'
+ * label text, there are only ~100 escaped characters of headroom left in the 1024-char caption
+ * budget; PREFIX_MAX + COMMUTE_LINE_MAX must stay under that with real margin, verified directly
+ * against all three locale catalogs rather than assumed.
+ */
+const PREFIX_MAX = 40;
+const COMMUTE_LINE_MAX = 55;
+
+/**
  * Escapes `raw` and truncates the *escaped* result to at most `maxLen` characters, appending an
  * ellipsis when it truncates. Capping the escaped length rather than the raw length is what makes
  * the bound exact: `&`, `<`, `>` and `"` each expand by up to 6x under escapeHtml, so a raw-length
@@ -156,16 +176,18 @@ function capEscapedField(raw: string | null, maxLen: number): string | null {
  * Length is enforced by shrinking the description *before* markup is assembled, never by slicing
  * the finished string: cutting assembled HTML can land inside a tag or an entity and make Telegram
  * reject the message. If the card is still over budget with no description at all, the title is
- * shortened instead — the only remaining unbounded field.
+ * shortened instead — the last field the shrink cascade can still touch; `prefix` and
+ * `commuteLine` are bounded independently, upfront, since neither participates in that cascade.
  */
 export function formatCard(l: ListingRow, opts: CardOptions = {}): string {
   const labels = opts.labels ?? DEFAULT_CARD_LABELS;
   const maxLength = opts.maxLength ?? CARD_MESSAGE_LIMIT;
-  const prefix = opts.prefix ?? '';
+  const prefix = capEscapedField(opts.prefix ?? '', PREFIX_MAX) ?? '';
+  const commuteLine = capEscapedField(opts.commuteLine ?? null, COMMUTE_LINE_MAX);
 
-  // Escaped-and-capped once per call, ahead of assembly: these four fields are unbounded coming out
-  // of the scraper, and each is already in its final (escaped, budget-safe) form by the time it's
-  // spliced into a line below — no further escapeHtml call on them.
+  // Escaped-and-capped once per call, ahead of assembly: these fields are unbounded and/or
+  // unescaped coming from the scraper or the caller, and each is already in its final (escaped,
+  // budget-safe) form by the time it's spliced into a line below — no further escapeHtml call on them.
   const addressLine = capEscapedField(l.addressLine, ADDRESS_LINE_MAX);
   const floor = capEscapedField(l.floor, FLOOR_MAX);
   const energyClass = capEscapedField(l.energyClass, ENERGY_CLASS_MAX);
@@ -201,7 +223,7 @@ export function formatCard(l: ListingRow, opts: CardOptions = {}): string {
     ].filter((x): x is string => x != null);
     if (amenityBits.length > 0) lines.push(amenityBits.join(' · '));
 
-    if (opts.commuteLine) lines.push(opts.commuteLine);
+    if (commuteLine) lines.push(commuteLine);
 
     if (l.requiresWaitlistTicket) lines.push(labels.waitlistWarning);
     if (l.isWg) lines.push(labels.wgWarning);
