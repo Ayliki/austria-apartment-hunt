@@ -201,13 +201,9 @@ interface MediaGroupItem {
   caption?: string;
 }
 
-/** Pure — builds a sendMediaGroup payload, capped to Telegram's limit, caption attached to the first item only (Telegram renders it as the album's caption). */
-export function buildMediaGroup(images: string[], caption: string): MediaGroupItem[] {
-  return images.slice(0, MAX_MEDIA_GROUP_ITEMS).map((url, i) => ({
-    type: 'photo' as const,
-    media: url,
-    ...(i === 0 ? { caption } : {}),
-  }));
+/** Pure — builds a sendMediaGroup payload, capped to Telegram's limit. Carries no caption: an album's text now lives on the following message, which is the only one that can hold buttons. */
+export function buildMediaGroup(images: string[]): MediaGroupItem[] {
+  return images.slice(0, MAX_MEDIA_GROUP_ITEMS).map((url) => ({ type: 'photo' as const, media: url }));
 }
 
 /** Pure — builds the Prev/Remove/Next row for browsing the shortlist one card at a time, omitting Prev at the first position and Next at the last (Telegram has no disabled-button state, so an unreachable direction is simply not offered). */
@@ -235,43 +231,72 @@ export function appendSwipeStatus(originalText: string, status: string): string 
  * images Telegram has already rejected are filtered out first, and an album that still fails falls
  * back to a single photo (itself fail-soft) rather than losing the card entirely.
  *
+ * Telegram forbids reply_markup on sendMediaGroup, so an album's buttons must live on a following
+ * message. That message now carries the card text too, rather than a contentless "👍 or 👎?" — which
+ * both attaches the controls to real content and lifts the text out of the 1024-char caption cap.
+ *
  * `now` is injected rather than read from the wall clock because two separate decisions here depend
  * on it — which urls are still suppressed, and (inside sendPhotoCached) whether a cached file_id is
  * still good — and a test cannot pin either against a moving clock.
  */
 async function sendListingCard(
-  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, caption: string,
-  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string, db: DB, now: Date,
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, cardText: string,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>, db: DB, now: Date,
 ): Promise<void> {
   const images = usablePhotoUrls(db, card.images, now);
 
   if (images.length >= 2) {
     let albumSent = false;
     try {
-      await telegram.sendMediaGroup(chatId, buildMediaGroup(images, caption));
+      await telegram.sendMediaGroup(chatId, buildMediaGroup(images));
       albumSent = true;
     } catch (err) {
       // Can't tell which image Telegram rejected, so don't blacklist any — just fall through to one photo.
       console.error('bot: album send failed, falling back to a single photo:', err);
     }
     if (albumSent) {
-      try {
-        await telegram.sendMessage(chatId, groupPromptText, buttons);
-      } catch (err) {
-        // The album itself already reached the user — a missing button row is far less harmful
-        // than resending the whole card, so this failure is logged, not escalated into a resend.
-        console.error('bot: album buttons message failed:', err);
-      }
+      await sendCardTextWithButtons(telegram, chatId, cardText, buttons);
       return;
     }
   }
 
   if (images.length >= 1) {
-    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons, parse_mode: 'HTML' }, now);
+    await sendPhotoCached(telegram, db, chatId, images[0], cardText, { ...buttons, parse_mode: 'HTML' }, now);
     return;
   }
 
-  await telegram.sendMessage(chatId, `${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+  await telegram.sendMessage(chatId, `${cardText}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+}
+
+/**
+ * Sends card text with its keyboard, retrying once unformatted if Telegram rejects the markup.
+ * Because this message now carries the listing's own facts (not just buttons), losing it loses the
+ * card — a malformed entity is overwhelmingly the likeliest rejection, and dropping parse_mode
+ * recovers it without resending the album that already reached the user. If even the retry fails,
+ * the failure is logged, not escalated — the album itself already reached the user.
+ */
+async function sendCardTextWithButtons(
+  telegram: Telegraf['telegram'], chatId: number, cardText: string,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>,
+): Promise<void> {
+  try {
+    await telegram.sendMessage(chatId, cardText, { ...buttons, ...HTML_SEND_EXTRA });
+  } catch (err) {
+    console.error('bot: formatted card send failed, retrying as plain text:', err);
+    try {
+      await telegram.sendMessage(chatId, stripHtml(cardText), { ...buttons });
+    } catch (retryErr) {
+      console.error('bot: plain-text card retry failed:', retryErr);
+    }
+  }
+}
+
+/** Strips tags and unescapes entities so a rejected HTML card is still readable as plain text. */
+export function stripHtml(s: string): string {
+  return s
+    .replace(/<a href="([^"]*)">([^<]*)<\/a>/g, '$2: $1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
@@ -279,14 +304,16 @@ export async function sendCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine: string | null | undefined, db: DB,
   now: Date = new Date(),
 ): Promise<void> {
-  const caption = formatCard(card, {
-    commuteLine, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
-  });
+  // An album's text becomes a standalone following message (see sendListingCard), so it gets the
+  // larger message budget rather than the caption budget the single-photo/no-photo paths still use.
+  const images = usablePhotoUrls(db, card.images, now);
+  const maxLength = images.length >= 2 ? CARD_MESSAGE_LIMIT : CARD_CAPTION_LIMIT;
+  const cardText = formatCard(card, { commuteLine, labels: cardLabels(db, chatId), maxLength });
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
-  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT, db, now);
+  await sendListingCard(telegram, chatId, card, cardText, buttons, db, now);
 }
 
 /** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */

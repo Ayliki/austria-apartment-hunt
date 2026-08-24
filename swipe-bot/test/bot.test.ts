@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   createBot, nextCardFor, cardLabels, buildMediaGroup, getCommuteLineFor, sendCard,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
-  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary,
+  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary, SWIPE_PROMPT_TEXT, stripHtml,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
@@ -114,19 +114,17 @@ test('appendSwipeStatus appends to a real caption/text, rather than replacing it
   );
 });
 
-test('buildMediaGroup attaches the caption to only the first item', () => {
-  const group = buildMediaGroup(['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg'], 'my caption');
+test('buildMediaGroup carries no caption on any item', () => {
+  const group = buildMediaGroup(['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg']);
   assert.equal(group.length, 3);
-  assert.equal(group[0].caption, 'my caption');
-  assert.equal(group[1].caption, undefined);
-  assert.equal(group[2].caption, undefined);
+  assert.ok(group.every((item) => item.caption === undefined));
   assert.ok(group.every((item) => item.type === 'photo'));
   assert.deepEqual(group.map((item) => item.media), ['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg']);
 });
 
 test('buildMediaGroup caps at Telegram\'s 10-item limit', () => {
   const images = Array.from({ length: 15 }, (_, i) => `https://img/${i}.jpg`);
-  const group = buildMediaGroup(images, 'caption');
+  const group = buildMediaGroup(images);
   assert.equal(group.length, MAX_MEDIA_GROUP_ITEMS);
   assert.deepEqual(group.map((item) => item.media), images.slice(0, MAX_MEDIA_GROUP_ITEMS));
 });
@@ -1617,4 +1615,75 @@ test('a successful album whose companion buttons message fails does not resend t
 
   assert.equal(calls.filter((c) => c.method === 'sendMediaGroup').length, 1);
   assert.ok(!calls.some((c) => c.method === 'sendPhoto'), 'the card must not be resent as a single photo');
+});
+
+test('a multi-photo card sends the album without a caption', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '50', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:50')!, null, db);
+
+  const album = calls.find((c) => c.method === 'sendMediaGroup')!;
+  const media = album.payload.media as { caption?: string }[];
+  assert.ok(media.every((m) => m.caption === undefined), 'album items must carry no caption');
+});
+
+test('a multi-photo card puts the listing text and the buttons on one message', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '51', title: 'Helle Garconniere', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:51')!, null, db);
+
+  const follow = calls.find((c) => c.method === 'sendMessage')!;
+  assert.match(String(follow.payload.text), /Helle Garconniere/);
+  assert.equal(follow.payload.parse_mode, 'HTML');
+  const markup = follow.payload.reply_markup as { inline_keyboard: { callback_data: string }[][] };
+  const data = markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(data.some((d) => d.startsWith('like:')), 'the like button rides the listing message');
+  assert.ok(data.some((d) => d.startsWith('pass:')), 'the pass button rides the listing message');
+});
+
+test('the old placeholder prompt is no longer sent for an album', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '52', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:52')!, null, db);
+
+  assert.ok(!calls.some((c) => c.payload.text === SWIPE_PROMPT_TEXT),
+    'the contentless "👍 or 👎?" message is gone');
+});
+
+test('a formatted send that Telegram rejects retries once as plain text', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '53', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  let firstMessage = true;
+  const { telegram, calls } = testTelegram((method) => {
+    if (method === 'sendMessage' && firstMessage) {
+      firstMessage = false;
+      return new Error("400: Bad Request: can't parse entities");
+    }
+    return undefined;
+  });
+
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:53')!, null, db);
+
+  const messages = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(messages.length, 2, 'the rejected send is retried exactly once');
+  assert.equal(messages[1].payload.parse_mode, undefined, 'the retry carries no parse_mode');
+  assert.ok(messages[1].payload.reply_markup, 'the retry keeps the buttons');
+});
+
+test('stripHtml turns a card back into readable plain text', () => {
+  const html = '<b>Wohnung &amp; Co</b>\n📍 1060 Mariahilf\n<a href="https://x/1">Open on willhaben ▸</a>';
+  const out = stripHtml(html);
+  assert.equal(out, 'Wohnung & Co\n📍 1060 Mariahilf\nOpen on willhaben ▸: https://x/1');
+  assert.ok(!out.includes('<'), 'no tags survive');
 });
