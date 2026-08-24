@@ -12,6 +12,7 @@ import {
   type ListingRow, type DB, type SearchProfilePrefs,
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
+import { CARD_CAPTION_LIMIT } from '../src/card.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -1532,6 +1533,27 @@ test('a failing album degrades to a single photo instead of losing the card', as
   assert.equal(calls[0].method, 'sendMediaGroup');
   assert.ok(calls.some((c) => c.method === 'sendPhoto'),
     'card must still reach the user as a single photo after the album fails');
+});
+
+test('a failing album falls back to a caption within the caption budget, not the message budget', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  // A long, uncapped title: at CARD_MESSAGE_LIMIT (4096) it never triggers formatCard's shrink
+  // cascade, so if the fallback used that budget the caption would sail past Telegram's real
+  // 1024-char caption cap.
+  upsertListing(db, listing({ id: '54', title: 'A'.repeat(1500), images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram((method) =>
+    method === 'sendMediaGroup' ? new Error('400: Bad Request: group send failed') : undefined);
+
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:54')!, null, db);
+
+  const photo = calls.find((c) => c.method === 'sendPhoto')!;
+  assert.ok(photo, 'card must still reach the user as a single photo after the album fails');
+  assert.ok(
+    String(photo.payload.caption).length <= CARD_CAPTION_LIMIT,
+    `fallback caption must respect the ${CARD_CAPTION_LIMIT}-char caption budget, got ${String(photo.payload.caption).length}`,
+  );
 });
 
 // A deliberately long-past anchor. sendCard takes an injected clock, so the suppression window this

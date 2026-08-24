@@ -235,12 +235,22 @@ export function appendSwipeStatus(originalText: string, status: string): string 
  * message. That message now carries the card text too, rather than a contentless "👍 or 👎?" — which
  * both attaches the controls to real content and lifts the text out of the 1024-char caption cap.
  *
+ * `renderCardText` takes a budget rather than being a finished string, because which budget applies
+ * depends on which branch actually ends up sending: an album that sends successfully hands its text
+ * to a standalone message (CARD_MESSAGE_LIMIT), but an album that fails at runtime (a rejected URL —
+ * see the atomicity note above) falls through to a photo caption (CARD_CAPTION_LIMIT) instead. That
+ * outcome isn't known until this function is already running, so the caller can't pick the budget in
+ * advance — the branch that does the send is the only one that can size its own text. Passing a
+ * pre-rendered string sized for the album's budget into the fallback would silently overflow
+ * Telegram's real caption cap, and a caption rejection reads to sendPhotoCached as an image problem,
+ * blacklisting a perfectly good (shared, cross-user) photo URL for its cooldown window.
+ *
  * `now` is injected rather than read from the wall clock because two separate decisions here depend
  * on it — which urls are still suppressed, and (inside sendPhotoCached) whether a cached file_id is
  * still good — and a test cannot pin either against a moving clock.
  */
 async function sendListingCard(
-  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, cardText: string,
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, renderCardText: (maxLength: number) => string,
   buttons: ReturnType<typeof Markup.inlineKeyboard>, db: DB, now: Date,
 ): Promise<void> {
   const images = usablePhotoUrls(db, card.images, now);
@@ -255,17 +265,17 @@ async function sendListingCard(
       console.error('bot: album send failed, falling back to a single photo:', err);
     }
     if (albumSent) {
-      await sendCardTextWithButtons(telegram, chatId, cardText, buttons);
+      await sendCardTextWithButtons(telegram, chatId, renderCardText(CARD_MESSAGE_LIMIT), buttons);
       return;
     }
   }
 
   if (images.length >= 1) {
-    await sendPhotoCached(telegram, db, chatId, images[0], cardText, { ...buttons, parse_mode: 'HTML' }, now);
+    await sendPhotoCached(telegram, db, chatId, images[0], renderCardText(CARD_CAPTION_LIMIT), { ...buttons, parse_mode: 'HTML' }, now);
     return;
   }
 
-  await telegram.sendMessage(chatId, `${cardText}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+  await telegram.sendMessage(chatId, `${renderCardText(CARD_CAPTION_LIMIT)}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
 }
 
 /**
@@ -304,16 +314,14 @@ export async function sendCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine: string | null | undefined, db: DB,
   now: Date = new Date(),
 ): Promise<void> {
-  // An album's text becomes a standalone following message (see sendListingCard), so it gets the
-  // larger message budget rather than the caption budget the single-photo/no-photo paths still use.
-  const images = usablePhotoUrls(db, card.images, now);
-  const maxLength = images.length >= 2 ? CARD_MESSAGE_LIMIT : CARD_CAPTION_LIMIT;
-  const cardText = formatCard(card, { commuteLine, labels: cardLabels(db, chatId), maxLength });
+  // The budget depends on which send path actually runs (album-then-message vs. a photo caption),
+  // which sendListingCard alone knows once it commits to a branch — see its doc comment.
+  const renderCardText = (maxLength: number) => formatCard(card, { commuteLine, labels: cardLabels(db, chatId), maxLength });
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
-  await sendListingCard(telegram, chatId, card, cardText, buttons, db, now);
+  await sendListingCard(telegram, chatId, card, renderCardText, buttons, db, now);
 }
 
 /** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */
