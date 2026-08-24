@@ -5,12 +5,13 @@ import {
   getWizardState, setWizardState, deleteWizardState, getCommuteTimes, setCommuteTimes, setListingCoords,
   setChatLanguage, createSearchProfile, countSearchProfiles, MAX_SEARCH_PROFILES_PER_CHAT,
   getSearchProfiles, getSearchProfile, setActiveSearchProfile, deleteSearchProfile, updateSearchProfile, renameSearchProfile,
-  getListingById, getNotifySettings, updateNotifySettings,
+  getListingById, getNotifySettings, updateNotifySettings, getShortlistForExport,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
 import { formatCard, type CardLabels, CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT } from './card.js';
 import { t, LOCALE_NAMES } from './locales.js';
+import { toCsv, exportFilename } from './export.js';
 import { sendPhotoCached, usablePhotoUrls } from './photo.js';
 import { renderNotifyMenu, nextDailyCap } from './notify-ui.js';
 import {
@@ -41,6 +42,7 @@ export const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: 'start', description: 'Set up (or redo) your search preferences' },
   { command: 'next', description: 'See another listing right now' },
   { command: 'shortlist', description: 'Browse everything you\'ve liked' },
+  { command: 'export', description: 'Export your shortlist as a CSV file' },
   { command: 'searches', description: 'List, switch, or delete your searches' },
   { command: 'settings', description: 'Change your preferences' },
   { command: 'help', description: 'How this bot works' },
@@ -206,13 +208,15 @@ export function buildMediaGroup(images: string[]): MediaGroupItem[] {
   return images.slice(0, MAX_MEDIA_GROUP_ITEMS).map((url) => ({ type: 'photo' as const, media: url }));
 }
 
-/** Pure — builds the Prev/Remove/Next row for browsing the shortlist one card at a time, omitting Prev at the first position and Next at the last (Telegram has no disabled-button state, so an unreachable direction is simply not offered). */
-export function shortlistNavButtons(listingId: string, position: number, total: number): ReturnType<typeof Markup.inlineKeyboard> {
+/** Pure — builds the Prev/Remove/Next row for browsing the shortlist one card at a time, omitting Prev at the first position and Next at the last (Telegram has no disabled-button state, so an unreachable direction is simply not offered), plus a full-width export row. */
+export function shortlistNavButtons(
+  listingId: string, position: number, total: number, exportLabel: string,
+): ReturnType<typeof Markup.inlineKeyboard> {
   const row: ReturnType<typeof Markup.button.callback>[] = [];
   if (position > 1) row.push(Markup.button.callback('◀️ Prev', `slnav:prev:${listingId}`));
   row.push(Markup.button.callback('🗑️ Remove', `unlike:${listingId}`));
   if (position < total) row.push(Markup.button.callback('▶️ Next', `slnav:next:${listingId}`));
-  return Markup.inlineKeyboard([row]);
+  return Markup.inlineKeyboard([row, [Markup.button.callback(exportLabel, 'slexport')]]);
 }
 
 /** Placeholder text used for the standalone buttons message that accompanies a multi-photo album — swapped wholesale (not appended to) once swiped, since it carries no listing info of its own. */
@@ -331,7 +335,7 @@ async function sendShortlistBrowseCard(
   const caption = formatCard(card, {
     prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
   });
-  const buttons = shortlistNavButtons(card.id, position, total);
+  const buttons = shortlistNavButtons(card.id, position, total, t(db, chatId, 'btn_export_csv'));
   if (card.images.length > 0) {
     await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons, parse_mode: 'HTML' });
   } else {
@@ -514,7 +518,7 @@ async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, 
   const caption = formatCard(listing, {
     prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
   });
-  const buttons = shortlistNavButtons(listing.id, position, total);
+  const buttons = shortlistNavButtons(listing.id, position, total, t(db, chatId, 'btn_export_csv'));
   const targetHasPhoto = listing.images.length > 0;
   const currentHasPhoto = Boolean(message.photo);
   if (targetHasPhoto && currentHasPhoto) {
@@ -558,6 +562,32 @@ async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, d
     return;
   }
   await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length, db);
+}
+
+/**
+ * Delivers the chat's shortlist as a CSV document. An empty shortlist gets the same reply /shortlist
+ * gives rather than a header-only file, which would read as a bug.
+ *
+ * `now` is injected so the filename's date stamp is pinnable in a test, matching sendCard's convention.
+ */
+export async function sendShortlistCsv(
+  telegram: Telegraf['telegram'], chatId: number, db: DB, now: Date = new Date(),
+): Promise<void> {
+  const rows = getShortlistForExport(db, chatId);
+  if (rows.length === 0) {
+    await telegram.sendMessage(chatId, t(db, chatId, 'shortlist_empty'));
+    return;
+  }
+  try {
+    await telegram.sendDocument(
+      chatId,
+      { source: Buffer.from(toCsv(rows), 'utf8'), filename: exportFilename(now) },
+      { caption: t(db, chatId, 'export_caption', { count: rows.length }) },
+    );
+  } catch (err) {
+    console.error('bot: shortlist export failed:', err);
+    await telegram.sendMessage(chatId, t(db, chatId, 'export_failed'));
+  }
 }
 
 /**
@@ -920,6 +950,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     await sendShortlistTo(ctx.telegram, ctx.chat.id, db);
   });
 
+  bot.command('export', async (ctx) => {
+    await sendShortlistCsv(ctx.telegram, ctx.chat.id, db);
+  });
+
   bot.command('next', async (ctx) => {
     await sendNextCard(ctx.telegram, ctx.chat.id, db, deps);
   });
@@ -1099,6 +1133,12 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     }
     await ctx.answerCbQuery();
     await replaceShortlistCard(ctx, items[targetIdx], targetIdx + 1, items.length, db);
+  });
+
+  bot.action('slexport', async (ctx) => {
+    const chatId = ctx.chat!.id;
+    await ctx.answerCbQuery();
+    await sendShortlistCsv(ctx.telegram, chatId, db);
   });
 
   bot.action(/^unlike:(.+)$/, async (ctx) => {

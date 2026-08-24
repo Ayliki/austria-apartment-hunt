@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   createBot, nextCardFor, cardLabels, buildMediaGroup, getCommuteLineFor, sendCard,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
-  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary, SWIPE_PROMPT_TEXT, stripHtml,
+  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary, SWIPE_PROMPT_TEXT, stripHtml, sendShortlistCsv,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
@@ -13,6 +13,7 @@ import {
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
 import { CARD_CAPTION_LIMIT } from '../src/card.js';
+import { t } from '../src/locales.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -77,30 +78,32 @@ test('cardLabels resolves every label for the chat language', () => {
   }
 });
 
-test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order', () => {
-  const markup = shortlistNavButtons('willhaben:a', 2, 3) as unknown as { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } };
-  const row = markup.reply_markup.inline_keyboard[0];
+test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order, plus an export row', () => {
+  const markup = shortlistNavButtons('willhaben:a', 2, 3, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } };
+  const [row, exportRow] = markup.reply_markup.inline_keyboard;
   assert.deepEqual(row.map((b) => b.text), ['◀️ Prev', '🗑️ Remove', '▶️ Next']);
   assert.deepEqual(row.map((b) => b.callback_data), ['slnav:prev:willhaben:a', 'unlike:willhaben:a', 'slnav:next:willhaben:a']);
+  assert.deepEqual(exportRow.map((b) => b.text), ['📤 Export CSV']);
+  assert.deepEqual(exportRow.map((b) => b.callback_data), ['slexport']);
 });
 
 test('shortlistNavButtons: the first position omits Prev', () => {
-  const markup = shortlistNavButtons('willhaben:a', 1, 3) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  const markup = shortlistNavButtons('willhaben:a', 1, 3, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove', '▶️ Next']);
 });
 
 test('shortlistNavButtons: the last position omits Next', () => {
-  const markup = shortlistNavButtons('willhaben:a', 3, 3) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  const markup = shortlistNavButtons('willhaben:a', 3, 3, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['◀️ Prev', '🗑️ Remove']);
 });
 
 test('shortlistNavButtons: a single-item shortlist omits both Prev and Next', () => {
-  const markup = shortlistNavButtons('willhaben:a', 1, 1) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  const markup = shortlistNavButtons('willhaben:a', 1, 1, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove']);
 });
 
-test('BOT_COMMANDS lists start, next, shortlist, searches, settings, help, language, each with a non-empty description', () => {
-  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'searches', 'settings', 'help', 'language']);
+test('BOT_COMMANDS lists start, next, shortlist, export, searches, settings, help, language, each with a non-empty description', () => {
+  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'export', 'searches', 'settings', 'help', 'language']);
   assert.ok(BOT_COMMANDS.every((c) => c.description.length > 0 && c.description.length <= 256)); // Telegram's setMyCommands description limit
 });
 
@@ -1755,4 +1758,89 @@ test('stripHtml turns a card back into readable plain text', () => {
   const out = stripHtml(html);
   assert.equal(out, 'Wohnung & Co\n📍 1060 Mariahilf\nOpen on willhaben ▸: https://x/1');
   assert.ok(!out.includes('<'), 'no tags survive');
+});
+
+// --- Task 9: CSV export wiring ---
+
+test('sendShortlistCsv sends a date-stamped document with a caption', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '80' }));
+  recordSwipe(db, 1, 'willhaben:80', 'like');
+
+  const { telegram, calls } = testTelegram();
+  await sendShortlistCsv(telegram, 1, db, new Date('2026-08-24T22:15:00.000Z'));
+
+  const doc = calls.find((c) => c.method === 'sendDocument');
+  assert.ok(doc, 'the export is delivered as a document');
+  const payload = doc.payload.document as { filename: string; source: Buffer };
+  assert.equal(payload.filename, 'shortlist-2026-08-24.csv');
+  assert.match(payload.source.toString('utf8'), /^﻿title;/);
+  assert.ok(String(doc.payload.caption).includes('1'), 'caption reports the row count');
+});
+
+test('sendShortlistCsv replies with the empty-state text instead of an empty file', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+
+  const { telegram, calls } = testTelegram();
+  await sendShortlistCsv(telegram, 1, db, new Date('2026-08-24T22:15:00.000Z'));
+
+  assert.ok(!calls.some((c) => c.method === 'sendDocument'), 'no file for an empty shortlist');
+  assert.ok(calls.some((c) => c.method === 'sendMessage'));
+});
+
+test('sendShortlistCsv replies with export_failed and does not throw when sendDocument fails', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '81' }));
+  recordSwipe(db, 1, 'willhaben:81', 'like');
+
+  const { telegram, calls } = testTelegram();
+  forceFailureOnce = 'sendDocument';
+  await sendShortlistCsv(telegram, 1, db, new Date('2026-08-24T22:15:00.000Z'));
+
+  assert.ok(!calls.some((c) => c.method === 'sendDocument'), 'the failed attempt itself is not recorded');
+  const messages = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(messages.length, 1, 'the failure is reported to the user');
+  assert.notEqual(messages[0].payload.text, t(db, 1, 'shortlist_empty'), 'a distinct failure message, not the empty-shortlist reply');
+});
+
+test('the shortlist browse card offers an export button', () => {
+  const buttons = shortlistNavButtons('willhaben:80', 1, 1, '📤 Export CSV');
+  const data = (buttons.reply_markup.inline_keyboard as { callback_data?: string }[][])
+    .flat().map((b) => b.callback_data);
+  assert.ok(data.includes('slexport'), 'an export button is present on the browse card');
+});
+
+test('/export is registered as a bot command', () => {
+  assert.ok(BOT_COMMANDS.some((c) => c.command === 'export'));
+});
+
+test('/export sends the shortlist CSV to the invoking chat', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '82' }));
+  recordSwipe(db, 1, 'willhaben:82', 'like');
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(commandUpdate(1, '/export'));
+
+  assert.ok(calls.some((c) => c.method === 'sendDocument'), '/export delivers the CSV document');
+});
+
+test('tapping the export button on the shortlist browse card answers the callback and sends the CSV', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '83' }));
+  recordSwipe(db, 1, 'willhaben:83', 'like');
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(callbackUpdate(1, 'slexport'));
+
+  const ackIdx = calls.findIndex((c) => c.method === 'answerCallbackQuery');
+  const sendIdx = calls.findIndex((c) => c.method === 'sendDocument');
+  assert.ok(ackIdx !== -1, 'the callback query is answered');
+  assert.ok(sendIdx !== -1, 'the CSV document is sent');
+  assert.ok(ackIdx < sendIdx, 'the spinner is cleared before the slow document upload begins');
 });
