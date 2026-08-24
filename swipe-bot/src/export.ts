@@ -1,4 +1,5 @@
 import type { ShortlistExportRow } from './db.js';
+import { viennaDateIso } from './notify-policy.js';
 
 /**
  * Semicolon, not comma. Excel under a German/Austrian locale reads `,` as the decimal separator and
@@ -50,7 +51,11 @@ export function toCsv(rows: ShortlistExportRow[]): string {
   return `${UTF8_BOM}${lines.join('\n')}\n`;
 }
 
-/** `shortlist-2026-08-24.csv` — the clock is injected so the name is pinnable in a test. */
+/**
+ * `shortlist-2026-08-24.csv`, date-stamped in Vienna local time — this bot is Vienna-only, and a UTC
+ * date would show the wrong day for a good chunk of the evening (e.g. 00:30 Vienna time is still the
+ * previous UTC day). The clock is injected so the name is pinnable in a test.
+ */
 export function exportFilename(now: Date): string {
-  return `shortlist-${now.toISOString().slice(0, 10)}.csv`;
+  return `shortlist-${viennaDateIso(now)}.csv`;
 }

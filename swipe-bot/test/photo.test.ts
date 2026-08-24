@@ -91,6 +91,29 @@ test('a blocked chat does not blacklist the photo for everyone else', async () =
   assert.equal(calls[1].method, 'sendMessage', 'the text fallback still runs');
 });
 
+test('a caption-too-long rejection does not blacklist the photo — the caption was the problem, not the image', async () => {
+  const db = openDb(':memory:');
+  const { telegram, calls } = testTelegram((method) =>
+    method === 'sendPhoto' ? new Error('400: Bad Request: MESSAGE_CAPTION_TOO_LONG') : undefined);
+
+  const sent = await sendPhotoCached(telegram, db, 1, 'https://cdn/toolong.jpg', 'caption', {}, NOW);
+
+  assert.equal(sent, false);
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/toolong.jpg', NOW), false, 'the photo is fine, the caption was too long');
+  assert.equal(calls[0].method, 'sendPhoto');
+  assert.equal(calls[1].method, 'sendMessage', 'the text fallback still runs');
+});
+
+test('an ordinary image rejection (not a caption-length or chat error) still blacklists the url', async () => {
+  const db = openDb(':memory:');
+  const { telegram } = testTelegram((method) =>
+    method === 'sendPhoto' ? new Error('400: Bad Request: wrong file identifier/HTTP URL specified') : undefined);
+
+  await sendPhotoCached(telegram, db, 1, 'https://cdn/badimage.jpg', 'caption', {}, NOW);
+
+  assert.equal(isKnownBadPhoto(db, 'https://cdn/badimage.jpg', NOW), true);
+});
+
 test('a chat-not-found rejection also leaves the url usable', async () => {
   const db = openDb(':memory:');
   const { telegram } = testTelegram((method) =>

@@ -71,7 +71,15 @@ test('toCsv includes saved_at from the export row, not from the listing', () => 
 });
 
 test('exportFilename is date-stamped from the injected clock', () => {
-  assert.equal(exportFilename(new Date('2026-08-24T22:15:00.000Z')), 'shortlist-2026-08-24.csv');
+  // Mid-day UTC, safely away from any Vienna day boundary — see the DST-crossing test below for that.
+  assert.equal(exportFilename(new Date('2026-08-24T10:00:00.000Z')), 'shortlist-2026-08-24.csv');
+});
+
+test('exportFilename uses Vienna local time, not UTC, across a day boundary', () => {
+  // 2026-08-24T22:30:00Z is 00:30 on 2026-08-25 in Vienna (CEST, UTC+2 in August) — the exact
+  // scenario from the bug report: a user exporting at 00:30 Vienna time on 25 August must not get a
+  // file stamped with the previous (UTC) day.
+  assert.equal(exportFilename(new Date('2026-08-24T22:30:00.000Z')), 'shortlist-2026-08-25.csv');
 });
 
 test('toCsv defends against formula injection: equals sign', () => {

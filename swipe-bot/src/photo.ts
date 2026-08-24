@@ -1,6 +1,6 @@
 import { type Telegraf } from 'telegraf';
 import { type DB, getCachedFileId, recordFileId, recordPhotoFailure, isKnownBadPhoto } from './db.js';
-import { isPermanentChatError } from './telegram-errors.js';
+import { isPermanentChatError, isCaptionTooLongError } from './telegram-errors.js';
 
 /**
  * Sends one photo, preferring a previously cached Telegram file_id over the origin URL so a CDN is
@@ -32,10 +32,11 @@ export async function sendPhotoCached(
     if (largest != null && cached == null) recordFileId(db, sourceUrl, largest, now.toISOString());
     return true;
   } catch (err) {
-    // A blocked/deleted chat rejects on this same path and says nothing about the image. photo_cache
-    // is keyed by url and shared by every user, so recording it would suppress a good photo for
-    // everyone else for an hour because one person blocked the bot.
-    if (!isPermanentChatError(err)) {
+    // A blocked/deleted chat rejects on this same path and says nothing about the image, and a
+    // too-long caption rejects the TEXT, not the image. Either way photo_cache is keyed by url and
+    // shared by every user, so recording it would suppress a perfectly good photo for everyone else
+    // for an hour over a problem that isn't the photo's fault.
+    if (!isPermanentChatError(err) && !isCaptionTooLongError(err)) {
       recordPhotoFailure(db, sourceUrl, err instanceof Error ? err.message : String(err), now.toISOString());
     }
     await sendTextFallback(telegram, chatId, caption, extra);

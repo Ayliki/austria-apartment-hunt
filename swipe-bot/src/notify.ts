@@ -9,7 +9,7 @@ import { scoreListings } from './scoring.js';
 import { viennaHour, viennaDayStartIso, isQuietHour, instantThreshold, isDigestDue } from './notify-policy.js';
 import { sendPhotoCached } from './photo.js';
 import { cardLabels, HTML_SEND_EXTRA } from './bot.js';
-import { formatCard, CARD_CAPTION_LIMIT } from './card.js';
+import { formatCard, CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT } from './card.js';
 import { isPermanentChatError } from './telegram-errors.js';
 import { t } from './locales.js';
 
@@ -119,17 +119,20 @@ async function sendInstantCard(
   telegram: Telegraf['telegram'], db: DB, profile: SearchProfile, listing: ListingRow, now: Date,
 ): Promise<void> {
   const header = t(db, profile.chatId, 'notify_instant_header', { name: profile.name });
-  const caption = formatCard(listing, {
-    prefix: `${header}\n\n`, labels: cardLabels(db, profile.chatId), maxLength: CARD_CAPTION_LIMIT,
+  const hero = listing.images[0];
+  // A caption and a message have different real limits (1024 vs. 4096) — render at whichever one
+  // this card is actually about to be sent as.
+  const text = formatCard(listing, {
+    prefix: `${header}\n\n`, labels: cardLabels(db, profile.chatId),
+    maxLength: hero != null ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT,
   });
   const buttons = Markup.inlineKeyboard([[Markup.button.url(t(db, profile.chatId, 'btn_open_listing'), listing.url)]]);
 
-  const hero = listing.images[0];
   if (hero != null) {
-    await sendPhotoCached(telegram, db, profile.chatId, hero, caption, { ...buttons, parse_mode: 'HTML' }, now);
+    await sendPhotoCached(telegram, db, profile.chatId, hero, text, { ...buttons, parse_mode: 'HTML' }, now);
     return;
   }
-  await telegram.sendMessage(profile.chatId, caption, { ...buttons, ...HTML_SEND_EXTRA });
+  await telegram.sendMessage(profile.chatId, text, { ...buttons, ...HTML_SEND_EXTRA });
 }
 
 /**

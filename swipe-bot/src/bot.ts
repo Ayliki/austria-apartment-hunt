@@ -279,15 +279,17 @@ async function sendListingCard(
     return;
   }
 
-  await telegram.sendMessage(chatId, `${renderCardText(CARD_CAPTION_LIMIT)}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+  await telegram.sendMessage(chatId, `${renderCardText(CARD_MESSAGE_LIMIT)}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
 }
 
 /**
  * Sends card text with its keyboard, retrying once unformatted if Telegram rejects the markup.
  * Because this message now carries the listing's own facts (not just buttons), losing it loses the
- * card — a malformed entity is overwhelmingly the likeliest rejection, and dropping parse_mode
- * recovers it without resending the album that already reached the user. If even the retry fails,
- * the failure is logged, not escalated — the album itself already reached the user.
+ * card's content, not just its controls — a malformed entity is overwhelmingly the likeliest
+ * rejection, and dropping parse_mode recovers it without resending the album that already reached
+ * the user. If even the retry fails, the failure is logged, not escalated: the photos are already in
+ * the chat and there is nothing further this function can do about the missing text, so throwing here
+ * would only turn one lost caption into an unhandled rejection for whatever is driving the send.
  */
 async function sendCardTextWithButtons(
   telegram: Telegraf['telegram'], chatId: number, cardText: string,
@@ -298,7 +300,10 @@ async function sendCardTextWithButtons(
   } catch (err) {
     console.error('bot: formatted card send failed, retrying as plain text:', err);
     try {
-      await telegram.sendMessage(chatId, stripHtml(cardText), { ...buttons });
+      // No parse_mode here (the retry is deliberately plain text), but the preview suppression still
+      // applies: stripHtml turns the card's <a> tag into a bare URL, and without this Telegram would
+      // auto-generate exactly the link-preview image the design suppresses everywhere else.
+      await telegram.sendMessage(chatId, stripHtml(cardText), { ...buttons, link_preview_options: HTML_SEND_EXTRA.link_preview_options });
     } catch (retryErr) {
       console.error('bot: plain-text card retry failed:', retryErr);
     }
@@ -332,14 +337,18 @@ export async function sendCard(
 async function sendShortlistBrowseCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, position: number, total: number, db: DB,
 ): Promise<void> {
-  const caption = formatCard(card, {
-    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
+  const hasPhoto = card.images.length > 0;
+  // A caption and a message have different real limits (1024 vs. 4096) — render at whichever one
+  // this card is actually about to be sent as, not always the tighter caption budget.
+  const text = formatCard(card, {
+    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId),
+    maxLength: hasPhoto ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT,
   });
   const buttons = shortlistNavButtons(card.id, position, total, t(db, chatId, 'btn_export_csv'));
-  if (card.images.length > 0) {
-    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons, parse_mode: 'HTML' });
+  if (hasPhoto) {
+    await telegram.sendPhoto(chatId, card.images[0], { caption: text, ...buttons, parse_mode: 'HTML' });
   } else {
-    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+    await telegram.sendMessage(chatId, `${text}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
   }
 }
 
@@ -397,6 +406,21 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
 const STATUS_SEPARATOR = '\n\n';
 
 /**
+ * The commute line for a card being re-rendered from the database (e.g. after a swipe), read from
+ * the commute_cache table rather than recomputed — clearSwipedCardButtons is a best-effort, no-API-
+ * call re-render, and the cache entry is guaranteed present whenever the original card carried a
+ * commute line, because getCommuteLineFor writes it at exactly that moment. Null (not an error)
+ * whenever there is no active profile, no commute destination configured, or no cache entry yet.
+ */
+function cachedCommuteLineFor(db: DB, chatId: number, listing: ListingRow): string | null {
+  const profile = getActiveSearchProfile(db, chatId);
+  if (!profile || profile.prefs.commuteDestination == null) return null;
+  const times = getCommuteTimes(db, profile.id, listing.id);
+  if (!times) return null;
+  return formatCommuteLine(times, profile.prefs.commuteDestination);
+}
+
+/**
  * Clears the buttons on the message a swipe/remove callback came from, replacing its text/caption with
  * the card plus a short status line — otherwise Telegram leaves the 👍👎/🗑️ buttons live forever, and an
  * old card in chat history stays tappable.
@@ -444,7 +468,8 @@ async function clearSwipedCardButtons(
       // purely defensive and never actually bites in practice; formatCard still gets the near-entirety
       // of `limit` to work with.
       const budget = Math.max(0, limit - status.length - STATUS_SEPARATOR.length);
-      const rendered = formatCard(listing, { labels: cardLabels(db, chatId), maxLength: budget });
+      const commuteLine = cachedCommuteLineFor(db, chatId, listing);
+      const rendered = formatCard(listing, { commuteLine, labels: cardLabels(db, chatId), maxLength: budget });
       const text = `${rendered}${STATUS_SEPARATOR}${status}`;
       const extra = { ...keyboard, ...HTML_SEND_EXTRA };
       if (message.photo) await ctx.editMessageCaption(text, extra);
@@ -485,7 +510,7 @@ interface ShortlistCardCtx {
  * to follow it, and a send failure must never throw and block the response.
  */
 async function deleteAndSendShortlistCard(
-  ctx: ShortlistCardCtx, chatId: number, listing: ListingRow, caption: string, buttons: ReturnType<typeof Markup.inlineKeyboard>,
+  ctx: ShortlistCardCtx, chatId: number, listing: ListingRow, text: string, buttons: ReturnType<typeof Markup.inlineKeyboard>,
 ): Promise<void> {
   try {
     await ctx.deleteMessage();
@@ -493,10 +518,13 @@ async function deleteAndSendShortlistCard(
     // best-effort — an old/already-gone message can't always be deleted
   }
   try {
+    // `text` must already be budgeted for whichever of these two the caller is about to hit — see
+    // replaceShortlistCard, its only caller, which renders at CARD_CAPTION_LIMIT or CARD_MESSAGE_LIMIT
+    // based on this exact same listing.images.length check.
     if (listing.images.length > 0) {
-      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons, parse_mode: 'HTML' });
+      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption: text, ...buttons, parse_mode: 'HTML' });
     } else {
-      await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+      await ctx.telegram.sendMessage(chatId, `${text}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
     }
   } catch {
     // best-effort — see doc comment above
@@ -515,28 +543,32 @@ async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, 
   const message = ctx.callbackQuery?.message as { photo?: unknown } | undefined;
   if (!message) return;
   const chatId = ctx.chat!.id;
-  const caption = formatCard(listing, {
-    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId), maxLength: CARD_CAPTION_LIMIT,
+  const targetHasPhoto = listing.images.length > 0;
+  // What the listing itself will send as (photo caption vs. text message) is what sets the budget in
+  // every branch below, including the delete+send fallback — not whether the CURRENT message has a
+  // photo, which only decides in-place-edit-vs-fresh-send.
+  const text = formatCard(listing, {
+    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId),
+    maxLength: targetHasPhoto ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT,
   });
   const buttons = shortlistNavButtons(listing.id, position, total, t(db, chatId, 'btn_export_csv'));
-  const targetHasPhoto = listing.images.length > 0;
   const currentHasPhoto = Boolean(message.photo);
   if (targetHasPhoto && currentHasPhoto) {
     try {
-      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption, parse_mode: 'HTML' }, buttons);
+      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption: text, parse_mode: 'HTML' }, buttons);
       return;
     } catch {
       // in-place edit failed (e.g. expired image URL) — fall through to delete+send below
     }
   } else if (!targetHasPhoto && !currentHasPhoto) {
     try {
-      await ctx.editMessageText(`${caption}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+      await ctx.editMessageText(`${text}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
       return;
     } catch {
       // in-place edit failed — fall through to delete+send below
     }
   }
-  await deleteAndSendShortlistCard(ctx, chatId, listing, caption, buttons);
+  await deleteAndSendShortlistCard(ctx, chatId, listing, text, buttons);
 }
 
 /** Replaces the current callback message with the empty-shortlist message — always delete+send, since there's no in-place target type to match against once nothing is left to browse. */

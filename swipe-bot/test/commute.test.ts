@@ -31,15 +31,15 @@ test('firstTransitLineLabel formats vehicle + line name, falls back sensibly', (
 test('formatCommuteLine combines walk + transit, omits whichever is missing, null when both are', () => {
   assert.equal(
     formatCommuteLine({ walkMinutes: 18, transitMinutes: 7, transitSummary: 'tram D' }, 'TU Wien'),
-    '📍 18 min walk · 7 min by tram D to TU Wien',
+    '🚏 18 min walk · 7 min by tram D to TU Wien',
   );
   assert.equal(
     formatCommuteLine({ walkMinutes: 18, transitMinutes: null, transitSummary: null }, 'TU Wien'),
-    '📍 18 min walk to TU Wien',
+    '🚏 18 min walk to TU Wien',
   );
   assert.equal(
     formatCommuteLine({ walkMinutes: null, transitMinutes: 7, transitSummary: null }, 'TU Wien'),
-    '📍 7 min by transit to TU Wien', // no line name known — falls back to the generic word
+    '🚏 7 min by transit to TU Wien', // no line name known — falls back to the generic word
   );
   assert.equal(formatCommuteLine({ walkMinutes: null, transitMinutes: null, transitSummary: null }, 'TU Wien'), null);
 });
