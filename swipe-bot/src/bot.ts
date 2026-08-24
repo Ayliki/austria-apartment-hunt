@@ -389,30 +389,67 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
   await sendCard(telegram, chatId, card, commuteLine, db);
 }
 
+/** "\n\n" — the separator formatCard's re-render is joined to the status line with, budgeted like any other card content. */
+const STATUS_SEPARATOR = '\n\n';
+
 /**
  * Clears the buttons on the message a swipe/remove callback came from, replacing its text/caption with
- * a short status line — otherwise Telegram leaves the 👍👎/🗑️ buttons live forever, and an old card in
- * chat history stays tappable. Best-effort: editing can fail (message too old, deleted, already edited),
- * which must never block sending the next card.
+ * the card plus a short status line — otherwise Telegram leaves the 👍👎/🗑️ buttons live forever, and an
+ * old card in chat history stays tappable.
+ *
+ * The text is re-rendered from the database rather than read back from `message.text`/`.caption`,
+ * because Telegram returns those fields with all markup stripped: echoing either back under
+ * parse_mode would drop the formatting and would fail outright on a title containing a bare `&`.
+ * Two shapes can't be re-rendered and fall back to the original append-to-plain-text behaviour, sent
+ * WITHOUT parse_mode:
+ *  - a pre-this-change album-companion message, recognizable because its text is exactly
+ *    SWIPE_PROMPT_TEXT — it never carried listing info of its own even when `listingId`'s row is
+ *    still in the DB, so there is nothing to append a re-rendered card to;
+ *  - a listing since deleted from the database (whether or not the message predates this change).
+ *
+ * Best-effort throughout: editing can fail (message too old, deleted, already edited), which must
+ * never block sending the next card.
  */
 async function clearSwipedCardButtons(
   ctx: {
     callbackQuery?: { message?: unknown };
-    editMessageCaption: (caption?: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
-    editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+    editMessageCaption: (caption?: string, extra?: Record<string, unknown>) => Promise<unknown>;
+    editMessageText: (text: string, extra?: Record<string, unknown>) => Promise<unknown>;
   },
   status: string,
+  db: DB,
+  chatId: number,
+  listingId: string | null,
   undoButton?: ReturnType<typeof Markup.button.callback>,
 ): Promise<void> {
   const message = ctx.callbackQuery?.message as { text?: string; caption?: string; photo?: unknown } | undefined;
   if (!message) return;
+
+  const keyboard = Markup.inlineKeyboard(undoButton ? [undoButton] : []);
+  // The album-companion placeholder is always a plain-text message (Telegram forbids reply_markup on
+  // sendMediaGroup, so its buttons live on a standalone text message, never a caption) — checking
+  // message.text alone is enough to recognize it.
+  const isPlaceholder = message.text != null && GROUP_PLACEHOLDER_TEXTS.includes(message.text);
+  const listing = !isPlaceholder && listingId != null ? getListingById(db, listingId) : null;
+
   try {
-    const markup = Markup.inlineKeyboard(undoButton ? [undoButton] : []);
-    if (message.photo) {
-      await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), markup);
-    } else if (message.text) {
-      await ctx.editMessageText(appendSwipeStatus(message.text, status), markup);
+    if (listing != null) {
+      const limit = message.photo ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT;
+      // Never hand formatCard a negative budget: status is always one of t()'s short, fixed
+      // status_* strings (well under 100 chars in every locale — see locales/*.ts), so this floor is
+      // purely defensive and never actually bites in practice; formatCard still gets the near-entirety
+      // of `limit` to work with.
+      const budget = Math.max(0, limit - status.length - STATUS_SEPARATOR.length);
+      const rendered = formatCard(listing, { labels: cardLabels(db, chatId), maxLength: budget });
+      const text = `${rendered}${STATUS_SEPARATOR}${status}`;
+      const extra = { ...keyboard, ...HTML_SEND_EXTRA };
+      if (message.photo) await ctx.editMessageCaption(text, extra);
+      else await ctx.editMessageText(text, extra);
+      return;
     }
+    // Pre-deploy placeholder, or a listing since deleted from the DB: keep the original plain-text behaviour.
+    if (message.photo) await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), { ...keyboard });
+    else if (message.text) await ctx.editMessageText(appendSwipeStatus(message.text, status), { ...keyboard });
   } catch {
     // best-effort — see doc comment above
   }
@@ -1026,10 +1063,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const undoButton = Markup.button.callback('↩️ Undo', `undo:${listingId}`);
     if (direction === 'like' && !saved) {
       await ctx.answerCbQuery(t(db, chatId, 'listing_no_longer_available'));
-      await clearSwipedCardButtons(ctx, t(db, chatId, 'status_no_longer_available'), undoButton);
+      await clearSwipedCardButtons(ctx, t(db, chatId, 'status_no_longer_available'), db, chatId, listingId, undoButton);
     } else {
       await ctx.answerCbQuery(direction === 'like' ? t(db, chatId, 'saved_to_shortlist') : t(db, chatId, 'passed'));
-      await clearSwipedCardButtons(ctx, direction === 'like' ? t(db, chatId, 'status_added_to_shortlist') : t(db, chatId, 'status_passed'), undoButton);
+      await clearSwipedCardButtons(ctx, direction === 'like' ? t(db, chatId, 'status_added_to_shortlist') : t(db, chatId, 'status_passed'), db, chatId, listingId, undoButton);
     }
     await sendNextCard(ctx.telegram, chatId, db, deps);
   });
@@ -1043,7 +1080,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       return;
     }
     await ctx.answerCbQuery(t(db, chatId, 'swipe_undone'));
-    await clearSwipedCardButtons(ctx, t(db, chatId, 'status_undone'));
+    await clearSwipedCardButtons(ctx, t(db, chatId, 'status_undone'), db, chatId, listingId);
   });
 
   bot.action(/^slnav:(prev|next):(.+)$/, async (ctx) => {

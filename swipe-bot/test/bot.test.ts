@@ -1195,6 +1195,53 @@ test('a swipe on a photo card edits the caption (not the text), leaving the phot
   assert.equal(calls.some((c) => c.method === 'editMessageText'), false);
 });
 
+test('swiping a card re-renders its text from the database, keeping the markup', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '60', title: 'Wohnung & Co', images: [] }));
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate({
+    update_id: 1,
+    callback_query: {
+      id: 'cb1', from: { id: 1, is_bot: false, first_name: 'T' },
+      message: { message_id: 7, date: 0, chat: { id: 1, type: 'private' }, text: 'stale plain text' },
+      chat_instance: 'x', data: 'like:willhaben:60',
+    },
+  } as never);
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'the swiped card is edited in place');
+  assert.equal(edit.payload.parse_mode, 'HTML');
+  assert.match(String(edit.payload.text), /Wohnung &amp; Co/,
+    'text is re-rendered from the DB and escaped, not echoed back from message.text');
+  assert.ok(!String(edit.payload.text).includes('stale plain text'));
+});
+
+test('swiping an old-style companion placeholder card falls back to plain text, even though the listing is still in the DB', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', title: 'Wohnung & Co' }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: SWIPE_PROMPT_TEXT }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an editMessageText call');
+  assert.equal(edit!.payload.text, '✅ Added to shortlist', 'wholesale-replaced, not re-rendered from the DB');
+  assert.equal(edit!.payload.parse_mode, undefined, 'the fallback path must not send parse_mode: HTML');
+});
+
+test('swiping a card whose listing has been deleted falls back to appending status to the stale text, without parse_mode', async () => {
+  const db = openDb(':memory:');
+  // No upsertListing — 'willhaben:a' simulates a listing removed from the DB after the card was sent.
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'pass:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an editMessageText call');
+  assert.match(edit!.payload.text as string, /^Sunny flat\n€650 · 43m²\nhttps:\/\/x\/1\n\(no photo\)\n\n👎 Passed$/);
+  assert.equal(edit!.payload.parse_mode, undefined, 'the fallback path must not send parse_mode: HTML');
+});
+
 test('/shortlist sends nothing but the empty-state message when there are no liked listings', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
