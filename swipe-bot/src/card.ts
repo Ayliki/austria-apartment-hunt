@@ -132,21 +132,20 @@ const ENERGY_CLASS_MAX = 60;
 const AVAILABLE_FROM_MAX = 60;
 
 /**
- * Ceilings on the two caller-supplied strings formatCard splices in outside its own shrink cascade:
- * `prefix` (a shortlist position line, or an instant-alert header built from a user's own
- * search-profile name) and `commuteLine` (built from a free-text commute destination the user typed
- * during onboarding). Both carry raw, unescaped, length-unbounded user text by the time they reach
- * here — the profile-name and commute-destination inputs have no validation upstream — so, same as
- * the four scraped fields above, they're capped and escaped once, in the one place every caller
- * funnels through, rather than in each of the three call sites.
+ * Last-resort ceilings on the two caller-supplied strings formatCard splices in: `prefix` (a
+ * shortlist position line, or an instant-alert header built from a user's own search-profile name)
+ * and `commuteLine` (built from a free-text commute destination the user typed during onboarding).
+ * Both carry raw, unescaped, length-unbounded user text by the time they reach here — the
+ * profile-name and commute-destination inputs have no validation upstream.
  *
- * Both survive real usage untouched: `❤️ 999 of 999` and a generated commute line like `📍 18 min
- * walk · 7 min by tram D to TU Wien` are each well under their cap. The numbers are deliberately
- * tight, not generous — with the title shrunk to nothing (its own recovery budget exhausted),
- * every capped field above at once, every warning flag on, and the longest of the three locales'
- * label text, there are only ~100 escaped characters of headroom left in the 1024-char caption
- * budget; PREFIX_MAX + COMMUTE_LINE_MAX must stay under that with real margin, verified directly
- * against all three locale catalogs rather than assumed.
+ * Unlike the four scraped-field caps above, these are NOT applied upfront: `prefix`/`commuteLine`
+ * take a place in the shrink cascade *after* description and title have already given up everything
+ * they can (see formatCard below), so a normal shortlist position or profile name is never touched
+ * — capping every prefix unconditionally, even a 16-char search name, was itself a real regression a
+ * prior version of this fix shipped. These numbers only ever apply in a pathological combination
+ * (every scraped-field cap maxed, every warning flag on, the longest of the three locales' label
+ * text, the title already shrunk to nothing) — verified directly against all three locale catalogs
+ * rather than assumed; see formatCard's tests.
  */
 const PREFIX_MAX = 40;
 const COMMUTE_LINE_MAX = 55;
@@ -171,29 +170,48 @@ function capEscapedField(raw: string | null, maxLen: number): string | null {
 }
 
 /**
+ * Like capEscapedField, but for `prefix`: preserves a trailing run of newlines when truncating,
+ * rather than counting them against `maxLen`. `prefix` always ends in a blank line separating it
+ * from the card's own first line (the bold title); truncating that blank line away along with the
+ * rest let a shortened prefix's ellipsis land directly against `<b>`, merging what should read as
+ * two lines into one.
+ */
+function capPrefix(raw: string, maxLen: number): string {
+  const trailingNewlines = raw.match(/\n+$/)?.[0] ?? '';
+  const body = raw.slice(0, raw.length - trailingNewlines.length);
+  const cappedBody = capEscapedField(body, Math.max(1, maxLen - trailingNewlines.length)) ?? '';
+  return cappedBody + trailingNewlines;
+}
+
+/**
  * Builds the whole card as HTML.
  *
- * Length is enforced by shrinking the description *before* markup is assembled, never by slicing
- * the finished string: cutting assembled HTML can land inside a tag or an entity and make Telegram
- * reject the message. If the card is still over budget with no description at all, the title is
- * shortened instead — the last field the shrink cascade can still touch; `prefix` and
- * `commuteLine` are bounded independently, upfront, since neither participates in that cascade.
+ * Length is enforced by shrinking fields *before* markup is assembled, never by slicing the
+ * finished string: cutting assembled HTML can land inside a tag or an entity and make Telegram
+ * reject the message. The shrink cascade goes, in order: drop the description, then shorten the
+ * title, then — only if the card is still over budget with the title already at its floor — cap
+ * `prefix` and `commuteLine` too. That order means a normal card (even with a full-length profile
+ * name or commute line) is never touched by the last step; only a genuinely pathological
+ * combination of oversized fields ever reaches it.
  */
 export function formatCard(l: ListingRow, opts: CardOptions = {}): string {
   const labels = opts.labels ?? DEFAULT_CARD_LABELS;
   const maxLength = opts.maxLength ?? CARD_MESSAGE_LIMIT;
-  const prefix = capEscapedField(opts.prefix ?? '', PREFIX_MAX) ?? '';
-  const commuteLine = capEscapedField(opts.commuteLine ?? null, COMMUTE_LINE_MAX);
 
-  // Escaped-and-capped once per call, ahead of assembly: these fields are unbounded and/or
-  // unescaped coming from the scraper or the caller, and each is already in its final (escaped,
-  // budget-safe) form by the time it's spliced into a line below — no further escapeHtml call on them.
+  // Escaped, but deliberately NOT length-capped here — see PREFIX_MAX/COMMUTE_LINE_MAX above for why.
+  const rawPrefix = opts.prefix ?? '';
+  const escapedPrefix = escapeHtml(rawPrefix);
+  const escapedCommuteLine = opts.commuteLine ? escapeHtml(opts.commuteLine) : null;
+
+  // Escaped-and-capped once per call, ahead of assembly: these four fields are unbounded coming out
+  // of the scraper, and each is already in its final (escaped, budget-safe) form by the time it's
+  // spliced into a line below — no further escapeHtml call on them.
   const addressLine = capEscapedField(l.addressLine, ADDRESS_LINE_MAX);
   const floor = capEscapedField(l.floor, FLOOR_MAX);
   const energyClass = capEscapedField(l.energyClass, ENERGY_CLASS_MAX);
   const availableFrom = capEscapedField(l.availableFrom, AVAILABLE_FROM_MAX);
 
-  const build = (title: string, description: string | null): string => {
+  const build = (title: string, description: string | null, prefix: string, commuteLine: string | null): string => {
     const lines: string[] = [];
     lines.push(`<b>${escapeHtml(title)}</b>`);
 
@@ -242,15 +260,23 @@ export function formatCard(l: ListingRow, opts: CardOptions = {}): string {
     ? `${l.description.slice(0, DESCRIPTION_SLICE).trimEnd()}…`
     : l.description;
 
-  let out = build(l.title, sliced);
+  let out = build(l.title, sliced, escapedPrefix, escapedCommuteLine);
   if (out.length <= maxLength) return out;
 
-  out = build(l.title, null);
+  out = build(l.title, null, escapedPrefix, escapedCommuteLine);
   if (out.length <= maxLength) return out;
 
-  // Still over budget with no description: the title is the only unbounded field left. Shorten it
-  // by exactly the overflow, then re-assemble so escaping and tags stay intact by construction.
-  const overflow = out.length - maxLength;
-  const shortTitle = `${l.title.slice(0, Math.max(1, l.title.length - overflow - 1)).trimEnd()}…`;
-  return build(shortTitle, null);
+  // Still over budget with no description: shorten the title next, by exactly the overflow, then
+  // re-assemble so escaping and tags stay intact by construction.
+  const titleOverflow = out.length - maxLength;
+  const shortTitle = `${l.title.slice(0, Math.max(1, l.title.length - titleOverflow - 1)).trimEnd()}…`;
+  out = build(shortTitle, null, escapedPrefix, escapedCommuteLine);
+  if (out.length <= maxLength) return out;
+
+  // Still over budget with the title at its floor: prefix and commuteLine are the only fields left
+  // — cap them too, now, as the true last resort (see PREFIX_MAX/COMMUTE_LINE_MAX's doc comment for
+  // why this never fires on a normal card).
+  const shortPrefix = capPrefix(rawPrefix, PREFIX_MAX);
+  const shortCommuteLine = opts.commuteLine ? capEscapedField(opts.commuteLine, COMMUTE_LINE_MAX) : null;
+  return build(shortTitle, null, shortPrefix, shortCommuteLine);
 }

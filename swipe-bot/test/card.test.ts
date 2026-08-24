@@ -129,6 +129,11 @@ test('formatCard renders the size line: area, rooms, and floor, each with its la
   assert.ok(out.includes(`${DEFAULT_CARD_LABELS.floor} 3. Stock`));
 });
 
+test('formatCard omits the size line entirely when area, rooms, and floor are all unknown', () => {
+  const out = formatCard(row({ area: null, rooms: null, floor: null }));
+  assert.ok(!out.includes('📐'));
+});
+
 test('formatCard renders the amenity line: lift, parking count, energy class, and available-from, each with its label', () => {
   const out = formatCard(row({ lift: true, parkingSpaces: 2, energyClass: 'B', availableFrom: '01.09.2026' }));
   assert.ok(out.includes(DEFAULT_CARD_LABELS.lift));
@@ -227,6 +232,23 @@ test('formatCard bounds a caller-supplied prefix, so a long profile name cannot 
   const longProfileName = 'x'.repeat(2200);
   const out = formatCard(row(), { prefix: `🔥 Strong match · ${longProfileName}\n\n`, maxLength: CARD_CAPTION_LIMIT });
   assert.ok(out.length <= CARD_CAPTION_LIMIT, `got ${out.length}`);
+});
+
+test('formatCard does not truncate a normal, everyday prefix, even one close to the old fixed cap', () => {
+  // "1 Zimmer Wohnung Wien" (21 chars) plus the header wrapper used to overflow PREFIX_MAX in every
+  // locale under the first version of this fix — prefix/commuteLine now only shrink once
+  // description and title have already given up everything they can, so a normal card (which fits
+  // comfortably under budget on its own) never reaches that step.
+  const prefix = '🔥 Strong match · 1 Zimmer Wohnung Wien\n\n';
+  const out = formatCard(row(), { prefix, maxLength: CARD_CAPTION_LIMIT });
+  assert.ok(out.startsWith(prefix), 'a realistic profile name must survive completely untouched');
+});
+
+test('formatCard preserves the prefix\'s trailing line break when it does have to truncate it, instead of gluing the ellipsis to the title', () => {
+  const longProfileName = 'x'.repeat(2200);
+  const out = formatCard(row(), { prefix: `🔥 Strong match · ${longProfileName}\n\n`, maxLength: CARD_CAPTION_LIMIT });
+  assert.ok(!out.includes('…<b>'), 'a truncated prefix must never run directly into the title with no line break');
+  assert.match(out, /\n<b>/, 'the title must still start on its own line after a truncated prefix');
 });
 
 test('formatCard escapes a caller-supplied commute line, so a destination containing markup characters cannot break the HTML send', () => {
