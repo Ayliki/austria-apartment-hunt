@@ -170,16 +170,26 @@ function capEscapedField(raw: string | null, maxLen: number): string | null {
 }
 
 /**
- * Like capEscapedField, but for `prefix`: preserves a trailing run of newlines when truncating,
- * rather than counting them against `maxLen`. `prefix` always ends in a blank line separating it
- * from the card's own first line (the bold title); truncating that blank line away along with the
- * rest let a shortened prefix's ellipsis land directly against `<b>`, merging what should read as
- * two lines into one.
+ * Like capEscapedField, but for `prefix`: keeps its trailing blank line intact when truncating,
+ * rather than cutting it away along with everything else. `prefix` always ends in exactly `\n\n`
+ * separating it from the card's own first line (the bold title); truncating that blank line away
+ * let a shortened prefix's ellipsis land directly against `<b>`, merging what should read as two
+ * lines into one.
+ *
+ * "Intact" does not mean "unbounded": an earlier version of this function re-appended the *whole*
+ * trailing run of newlines after capping the body, uncounted against `maxLen` — so a prefix that was
+ * mostly blank lines (a pasted or fat-fingered profile name, say) could make the return value far
+ * longer than `maxLen`, defeating the budget guarantee this function exists to provide. A prefix
+ * never needs more than its final blank line, so the trailing run is normalized down to at most two
+ * newlines *first*, and that normalized run is what counts against `maxLen` — the same accounting
+ * capEscapedField applies to every other character. The result is unconditional: this never returns
+ * more than `maxLen` characters, for any input, including one that is nothing but newlines.
  */
 function capPrefix(raw: string, maxLen: number): string {
-  const trailingNewlines = raw.match(/\n+$/)?.[0] ?? '';
-  const body = raw.slice(0, raw.length - trailingNewlines.length);
-  const cappedBody = capEscapedField(body, Math.max(1, maxLen - trailingNewlines.length)) ?? '';
+  const trailingRun = raw.match(/\n+$/)?.[0] ?? '';
+  const body = raw.slice(0, raw.length - trailingRun.length);
+  const trailingNewlines = trailingRun.slice(0, Math.min(2, maxLen));
+  const cappedBody = capEscapedField(body, Math.max(0, maxLen - trailingNewlines.length)) ?? '';
   return cappedBody + trailingNewlines;
 }
 

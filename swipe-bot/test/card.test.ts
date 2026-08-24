@@ -251,6 +251,17 @@ test('formatCard preserves the prefix\'s trailing line break when it does have t
   assert.match(out, /\n<b>/, 'the title must still start on its own line after a truncated prefix');
 });
 
+test('formatCard bounds a prefix that is mostly blank lines, not just one that is mostly text', () => {
+  // The prefix-truncation fix above preserves a trailing newline run so the ellipsis doesn't glue to
+  // the title — but re-appending that whole run uncounted against the budget (an earlier version of
+  // this fix did exactly that) opens the same hole Critical 2 closed, just via newlines instead of
+  // ordinary characters: a profile name that is mostly blank lines, plausible as pasted or
+  // fat-fingered input, needs no other oversized field to blow the caption budget.
+  const floodedName = '\n'.repeat(1000);
+  const out = formatCard(row(), { prefix: `🔥 Strong match · ${floodedName}\n\n`, maxLength: CARD_CAPTION_LIMIT });
+  assert.ok(out.length <= CARD_CAPTION_LIMIT, `got ${out.length}`);
+});
+
 test('formatCard escapes a caller-supplied commute line, so a destination containing markup characters cannot break the HTML send', () => {
   const out = formatCard(row(), { commuteLine: '📍 18 min walk to <script>evil</script>' });
   assert.ok(!out.includes('<script>'), 'raw markup from the commute destination must never survive into the output');
