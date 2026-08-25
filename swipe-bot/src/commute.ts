@@ -102,7 +102,15 @@ export async function computeCommute(origin: GeoPoint, destination: GeoPoint, ap
   };
 }
 
-/** Pure — formats a commute line like "📍 18 min walk · 7 min by tram D to TU Wien" for the card caption. Null if there's nothing to show. */
+/**
+ * Pure — formats a commute line like "🚏 18 min walk · 7 min by tram D to TU Wien" for the card
+ * caption. Null if there's nothing to show.
+ *
+ * 🚏, not 📍: the card's own location line (card.ts) already uses 📍 for the listing's address, and
+ * a card with a commute line used to show the pin twice — once for "where the flat is", once for
+ * "how to get from it". A transit glyph reads as "how to get there" regardless of whether the line
+ * ends up being walk-only, transit-only, or both.
+ */
 export function formatCommuteLine(times: CommuteTimes, destinationLabel: string): string | null {
   const parts: string[] = [];
   if (times.walkMinutes != null) parts.push(`${times.walkMinutes} min walk`);
@@ -110,5 +118,5 @@ export function formatCommuteLine(times: CommuteTimes, destinationLabel: string)
     parts.push(`${times.transitMinutes} min by ${times.transitSummary ?? 'transit'}`);
   }
   if (parts.length === 0) return null;
-  return `📍 ${parts.join(' · ')} to ${destinationLabel}`;
+  return `🚏 ${parts.join(' · ')} to ${destinationLabel}`;
 }

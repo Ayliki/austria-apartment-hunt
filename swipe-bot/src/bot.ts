@@ -5,11 +5,13 @@ import {
   getWizardState, setWizardState, deleteWizardState, getCommuteTimes, setCommuteTimes, setListingCoords,
   setChatLanguage, createSearchProfile, countSearchProfiles, MAX_SEARCH_PROFILES_PER_CHAT,
   getSearchProfiles, getSearchProfile, setActiveSearchProfile, deleteSearchProfile, updateSearchProfile, renameSearchProfile,
-  getListingById, getNotifySettings, updateNotifySettings,
+  getListingById, getNotifySettings, updateNotifySettings, getShortlistForExport,
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
+import { formatCard, type CardLabels, CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT } from './card.js';
 import { t, LOCALE_NAMES } from './locales.js';
+import { toCsv, exportFilename } from './export.js';
 import { sendPhotoCached, usablePhotoUrls } from './photo.js';
 import { renderNotifyMenu, nextDailyCap } from './notify-ui.js';
 import {
@@ -40,6 +42,7 @@ export const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: 'start', description: 'Set up (or redo) your search preferences' },
   { command: 'next', description: 'See another listing right now' },
   { command: 'shortlist', description: 'Browse everything you\'ve liked' },
+  { command: 'export', description: 'Export your shortlist as a CSV file' },
   { command: 'searches', description: 'List, switch, or delete your searches' },
   { command: 'settings', description: 'Change your preferences' },
   { command: 'help', description: 'How this bot works' },
@@ -163,56 +166,33 @@ export function nextCardFor(db: DB, chatId: number): ListingRow | null {
   return rankListings(candidates, swiped)[0];
 }
 
-/** Telegram's hard cap on caption length for photos and media groups alike. */
-const MAX_CAPTION_LENGTH = 1024;
-
-function truncate(s: string, maxLen: number): string {
-  if (s.length <= maxLen) return s;
-  return s.slice(0, maxLen - 1).trimEnd() + '…';
+/** Resolves every card label for a chat's language in one place, so formatCard itself stays pure and DB-free. */
+export function cardLabels(db: DB, chatId: number): CardLabels {
+  return {
+    petBadge: t(db, chatId, 'pet_badge'),
+    linkText: t(db, chatId, 'card_link_text'),
+    rooms: t(db, chatId, 'card_rooms'),
+    floor: t(db, chatId, 'card_floor'),
+    availableFrom: t(db, chatId, 'card_available_from'),
+    valueGood: t(db, chatId, 'card_value_good'),
+    valueFair: t(db, chatId, 'card_value_fair'),
+    valuePremium: t(db, chatId, 'card_value_premium'),
+    lift: t(db, chatId, 'card_lift'),
+    parking: t(db, chatId, 'card_parking'),
+    energy: t(db, chatId, 'card_energy'),
+    waitlistWarning: t(db, chatId, 'card_warning_waitlist'),
+    wgWarning: t(db, chatId, 'card_warning_wg'),
+    delistedWarning: t(db, chatId, 'card_warning_delisted'),
+  };
 }
-
-/** Default English text for the pet-mention badge — used when no localized string is supplied. Kept in sync with locales/en.ts's `pet_badge` key. */
-const DEFAULT_PET_BADGE_TEXT = '🐾 mentions pets — check listing';
 
 /**
- * Pure — builds the card caption (title, price/size/rooms/district, eligibility flag, amenity
- * facts, pet-mention badge, commute line, description, link). Exported for direct testing.
- *
- * `petBadgeText` defaults to English so pure tests (no `db`/`chatId`) keep working unchanged; the
- * one call site that needs localization passes `t(db, chatId, 'pet_badge')` explicitly. The badge
- * only ever means the listing text mentions pets somewhere — never a confirmed pet-friendly amenity
- * — so its wording must stay hedged ("check listing") in every locale.
+ * Extra fields an HTML card send needs on a text-only message: markup mode, and no auto-preview
+ * competing with the card's own content. Only `sendMessage`/`editMessageText` payloads carry a
+ * `link_preview_options` field at all — a photo send never gets a separate Telegram-generated
+ * preview in the first place, so those call sites add `parse_mode: 'HTML'` alone instead.
  */
-export function formatCaption(
-  l: ListingRow, commuteLine?: string | null, prefix?: string, petBadgeText: string = DEFAULT_PET_BADGE_TEXT,
-): string {
-  const price = l.price != null ? `€${l.price}` : 'price n/a';
-  const area = l.area != null ? `${l.area}m²` : '';
-  const rooms = l.rooms != null ? `${l.rooms} rooms` : '';
-  const district = l.district != null ? `district ${l.district}` : '';
-  const details = [area, rooms, district].filter(Boolean).join(' · ');
-  const flag = l.requiresWaitlistTicket
-    ? '\n⚠️ Municipal/waitlist housing — needs a Vormerkschein, Wohnticket, or Wiener Wohnen registration.'
-    : '';
-  const wgFlag = l.isWg ? '\n🚪 WG — shared flat / co-living / student room, not a whole apartment.' : '';
-  const delistedFlag = l.isDelisted ? '\n⚠️ No longer listed — likely taken down by the advertiser.' : '';
-  // Info-only facts — only ever shown when known; a null field is omitted, never rendered as "no".
-  const amenityBits = [
-    l.lift === true ? 'Lift' : null,
-    l.parkingSpaces != null && l.parkingSpaces > 0 ? `Parking (${l.parkingSpaces})` : null,
-    l.floor ? `Floor: ${l.floor}` : null,
-    l.energyClass ? `Energy: ${l.energyClass}` : null,
-    l.availableFrom ? `Available: ${l.availableFrom}` : null,
-  ].filter((x): x is string => x != null);
-  const amenities = amenityBits.length > 0 ? `\n${amenityBits.join(' · ')}` : '';
-  // Unverified — the listing text merely mentions pets; never presented as a confirmed amenity.
-  const petBadge = l.mentionsPets ? `\n${petBadgeText}` : '';
-  const commute = commuteLine ? `\n${commuteLine}` : '';
-  const base = `${l.title}\n${price} · ${details}${flag}${wgFlag}${delistedFlag}${amenities}${petBadge}${commute}\n${l.url}`;
-  const full = l.description ? `${base}\n\n${l.description}` : base;
-  const withPrefix = prefix ? `${prefix}${full}` : full;
-  return truncate(withPrefix, MAX_CAPTION_LENGTH);
-}
+export const HTML_SEND_EXTRA = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } };
 
 /** Telegram's hard cap on items in a single sendMediaGroup call. */
 export const MAX_MEDIA_GROUP_ITEMS = 10;
@@ -223,22 +203,20 @@ interface MediaGroupItem {
   caption?: string;
 }
 
-/** Pure — builds a sendMediaGroup payload, capped to Telegram's limit, caption attached to the first item only (Telegram renders it as the album's caption). */
-export function buildMediaGroup(images: string[], caption: string): MediaGroupItem[] {
-  return images.slice(0, MAX_MEDIA_GROUP_ITEMS).map((url, i) => ({
-    type: 'photo' as const,
-    media: url,
-    ...(i === 0 ? { caption } : {}),
-  }));
+/** Pure — builds a sendMediaGroup payload, capped to Telegram's limit. Carries no caption: an album's text now lives on the following message, which is the only one that can hold buttons. */
+export function buildMediaGroup(images: string[]): MediaGroupItem[] {
+  return images.slice(0, MAX_MEDIA_GROUP_ITEMS).map((url) => ({ type: 'photo' as const, media: url }));
 }
 
-/** Pure — builds the Prev/Remove/Next row for browsing the shortlist one card at a time, omitting Prev at the first position and Next at the last (Telegram has no disabled-button state, so an unreachable direction is simply not offered). */
-export function shortlistNavButtons(listingId: string, position: number, total: number): ReturnType<typeof Markup.inlineKeyboard> {
+/** Pure — builds the Prev/Remove/Next row for browsing the shortlist one card at a time, omitting Prev at the first position and Next at the last (Telegram has no disabled-button state, so an unreachable direction is simply not offered), plus a full-width export row. */
+export function shortlistNavButtons(
+  listingId: string, position: number, total: number, exportLabel: string,
+): ReturnType<typeof Markup.inlineKeyboard> {
   const row: ReturnType<typeof Markup.button.callback>[] = [];
   if (position > 1) row.push(Markup.button.callback('◀️ Prev', `slnav:prev:${listingId}`));
   row.push(Markup.button.callback('🗑️ Remove', `unlike:${listingId}`));
   if (position < total) row.push(Markup.button.callback('▶️ Next', `slnav:next:${listingId}`));
-  return Markup.inlineKeyboard([row]);
+  return Markup.inlineKeyboard([row, [Markup.button.callback(exportLabel, 'slexport')]]);
 }
 
 /** Placeholder text used for the standalone buttons message that accompanies a multi-photo album — swapped wholesale (not appended to) once swiped, since it carries no listing info of its own. */
@@ -257,43 +235,87 @@ export function appendSwipeStatus(originalText: string, status: string): string 
  * images Telegram has already rejected are filtered out first, and an album that still fails falls
  * back to a single photo (itself fail-soft) rather than losing the card entirely.
  *
+ * Telegram forbids reply_markup on sendMediaGroup, so an album's buttons must live on a following
+ * message. That message now carries the card text too, rather than a contentless "👍 or 👎?" — which
+ * both attaches the controls to real content and lifts the text out of the 1024-char caption cap.
+ *
+ * `renderCardText` takes a budget rather than being a finished string, because which budget applies
+ * depends on which branch actually ends up sending: an album that sends successfully hands its text
+ * to a standalone message (CARD_MESSAGE_LIMIT), but an album that fails at runtime (a rejected URL —
+ * see the atomicity note above) falls through to a photo caption (CARD_CAPTION_LIMIT) instead. That
+ * outcome isn't known until this function is already running, so the caller can't pick the budget in
+ * advance — the branch that does the send is the only one that can size its own text. Passing a
+ * pre-rendered string sized for the album's budget into the fallback would silently overflow
+ * Telegram's real caption cap, and a caption rejection reads to sendPhotoCached as an image problem,
+ * blacklisting a perfectly good (shared, cross-user) photo URL for its cooldown window.
+ *
  * `now` is injected rather than read from the wall clock because two separate decisions here depend
  * on it — which urls are still suppressed, and (inside sendPhotoCached) whether a cached file_id is
  * still good — and a test cannot pin either against a moving clock.
  */
 async function sendListingCard(
-  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, caption: string,
-  buttons: ReturnType<typeof Markup.inlineKeyboard>, groupPromptText: string, db: DB, now: Date,
+  telegram: Telegraf['telegram'], chatId: number, card: ListingRow, renderCardText: (maxLength: number) => string,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>, db: DB, now: Date,
 ): Promise<void> {
   const images = usablePhotoUrls(db, card.images, now);
 
   if (images.length >= 2) {
     let albumSent = false;
     try {
-      await telegram.sendMediaGroup(chatId, buildMediaGroup(images, caption));
+      await telegram.sendMediaGroup(chatId, buildMediaGroup(images));
       albumSent = true;
     } catch (err) {
       // Can't tell which image Telegram rejected, so don't blacklist any — just fall through to one photo.
       console.error('bot: album send failed, falling back to a single photo:', err);
     }
     if (albumSent) {
-      try {
-        await telegram.sendMessage(chatId, groupPromptText, buttons);
-      } catch (err) {
-        // The album itself already reached the user — a missing button row is far less harmful
-        // than resending the whole card, so this failure is logged, not escalated into a resend.
-        console.error('bot: album buttons message failed:', err);
-      }
+      await sendCardTextWithButtons(telegram, chatId, renderCardText(CARD_MESSAGE_LIMIT), buttons);
       return;
     }
   }
 
   if (images.length >= 1) {
-    await sendPhotoCached(telegram, db, chatId, images[0], caption, { ...buttons }, now);
+    await sendPhotoCached(telegram, db, chatId, images[0], renderCardText(CARD_CAPTION_LIMIT), { ...buttons, parse_mode: 'HTML' }, now);
     return;
   }
 
-  await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+  await telegram.sendMessage(chatId, `${renderCardText(CARD_MESSAGE_LIMIT)}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
+}
+
+/**
+ * Sends card text with its keyboard, retrying once unformatted if Telegram rejects the markup.
+ * Because this message now carries the listing's own facts (not just buttons), losing it loses the
+ * card's content, not just its controls — a malformed entity is overwhelmingly the likeliest
+ * rejection, and dropping parse_mode recovers it without resending the album that already reached
+ * the user. If even the retry fails, the failure is logged, not escalated: the photos are already in
+ * the chat and there is nothing further this function can do about the missing text, so throwing here
+ * would only turn one lost caption into an unhandled rejection for whatever is driving the send.
+ */
+async function sendCardTextWithButtons(
+  telegram: Telegraf['telegram'], chatId: number, cardText: string,
+  buttons: ReturnType<typeof Markup.inlineKeyboard>,
+): Promise<void> {
+  try {
+    await telegram.sendMessage(chatId, cardText, { ...buttons, ...HTML_SEND_EXTRA });
+  } catch (err) {
+    console.error('bot: formatted card send failed, retrying as plain text:', err);
+    try {
+      // No parse_mode here (the retry is deliberately plain text), but the preview suppression still
+      // applies: stripHtml turns the card's <a> tag into a bare URL, and without this Telegram would
+      // auto-generate exactly the link-preview image the design suppresses everywhere else.
+      await telegram.sendMessage(chatId, stripHtml(cardText), { ...buttons, link_preview_options: HTML_SEND_EXTRA.link_preview_options });
+    } catch (retryErr) {
+      console.error('bot: plain-text card retry failed:', retryErr);
+    }
+  }
+}
+
+/** Strips tags and unescapes entities so a rejected HTML card is still readable as plain text. */
+export function stripHtml(s: string): string {
+  return s
+    .replace(/<a href="([^"]*)">([^<]*)<\/a>/g, '$2: $1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
 /** Sends one listing as a swipeable card (photo album / single photo / text, with 👍👎 buttons). Shared by the pull path (/next) and the push path (proactive new-match notifications). */
@@ -301,24 +323,32 @@ export async function sendCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, commuteLine: string | null | undefined, db: DB,
   now: Date = new Date(),
 ): Promise<void> {
-  const caption = formatCaption(card, commuteLine, undefined, t(db, chatId, 'pet_badge'));
+  // The budget depends on which send path actually runs (album-then-message vs. a photo caption),
+  // which sendListingCard alone knows once it commits to a branch — see its doc comment.
+  const renderCardText = (maxLength: number) => formatCard(card, { commuteLine, labels: cardLabels(db, chatId), maxLength });
   const buttons = Markup.inlineKeyboard([
     Markup.button.callback('👎', `pass:${card.id}`),
     Markup.button.callback('👍', `like:${card.id}`),
   ]);
-  await sendListingCard(telegram, chatId, card, caption, buttons, SWIPE_PROMPT_TEXT, db, now);
+  await sendListingCard(telegram, chatId, card, renderCardText, buttons, db, now);
 }
 
 /** Sends one shortlist entry as a NEW message — single photo only (never the full album, unlike the swipe deck), so a later Prev/Next/Remove tap can edit this exact message in place. No commute line, to avoid a Routes API call per browse. */
 async function sendShortlistBrowseCard(
   telegram: Telegraf['telegram'], chatId: number, card: ListingRow, position: number, total: number, db: DB,
 ): Promise<void> {
-  const caption = formatCaption(card, null, `❤️ ${position} of ${total}\n\n`, t(db, chatId, 'pet_badge'));
-  const buttons = shortlistNavButtons(card.id, position, total);
-  if (card.images.length > 0) {
-    await telegram.sendPhoto(chatId, card.images[0], { caption, ...buttons });
+  const hasPhoto = card.images.length > 0;
+  // A caption and a message have different real limits (1024 vs. 4096) — render at whichever one
+  // this card is actually about to be sent as, not always the tighter caption budget.
+  const text = formatCard(card, {
+    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId),
+    maxLength: hasPhoto ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT,
+  });
+  const buttons = shortlistNavButtons(card.id, position, total, t(db, chatId, 'btn_export_csv'));
+  if (hasPhoto) {
+    await telegram.sendPhoto(chatId, card.images[0], { caption: text, ...buttons, parse_mode: 'HTML' });
   } else {
-    await telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+    await telegram.sendMessage(chatId, `${text}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
   }
 }
 
@@ -372,30 +402,83 @@ async function sendNextCard(telegram: Telegraf['telegram'], chatId: number, db: 
   await sendCard(telegram, chatId, card, commuteLine, db);
 }
 
+/** "\n\n" — the separator formatCard's re-render is joined to the status line with, budgeted like any other card content. */
+const STATUS_SEPARATOR = '\n\n';
+
+/**
+ * The commute line for a card being re-rendered from the database (e.g. after a swipe), read from
+ * the commute_cache table rather than recomputed — clearSwipedCardButtons is a best-effort, no-API-
+ * call re-render, and the cache entry is guaranteed present whenever the original card carried a
+ * commute line, because getCommuteLineFor writes it at exactly that moment. Null (not an error)
+ * whenever there is no active profile, no commute destination configured, or no cache entry yet.
+ */
+function cachedCommuteLineFor(db: DB, chatId: number, listing: ListingRow): string | null {
+  const profile = getActiveSearchProfile(db, chatId);
+  if (!profile || profile.prefs.commuteDestination == null) return null;
+  const times = getCommuteTimes(db, profile.id, listing.id);
+  if (!times) return null;
+  return formatCommuteLine(times, profile.prefs.commuteDestination);
+}
+
 /**
  * Clears the buttons on the message a swipe/remove callback came from, replacing its text/caption with
- * a short status line — otherwise Telegram leaves the 👍👎/🗑️ buttons live forever, and an old card in
- * chat history stays tappable. Best-effort: editing can fail (message too old, deleted, already edited),
- * which must never block sending the next card.
+ * the card plus a short status line — otherwise Telegram leaves the 👍👎/🗑️ buttons live forever, and an
+ * old card in chat history stays tappable.
+ *
+ * The text is re-rendered from the database rather than read back from `message.text`/`.caption`,
+ * because Telegram returns those fields with all markup stripped: echoing either back under
+ * parse_mode would drop the formatting and would fail outright on a title containing a bare `&`.
+ * Two shapes can't be re-rendered and fall back to the original append-to-plain-text behaviour, sent
+ * WITHOUT parse_mode:
+ *  - a pre-this-change album-companion message, recognizable because its text is exactly
+ *    SWIPE_PROMPT_TEXT — it never carried listing info of its own even when `listingId`'s row is
+ *    still in the DB, so there is nothing to append a re-rendered card to;
+ *  - a listing since deleted from the database (whether or not the message predates this change).
+ *
+ * Best-effort throughout: editing can fail (message too old, deleted, already edited), which must
+ * never block sending the next card.
  */
 async function clearSwipedCardButtons(
   ctx: {
     callbackQuery?: { message?: unknown };
-    editMessageCaption: (caption?: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
-    editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+    editMessageCaption: (caption?: string, extra?: Record<string, unknown>) => Promise<unknown>;
+    editMessageText: (text: string, extra?: Record<string, unknown>) => Promise<unknown>;
   },
   status: string,
+  db: DB,
+  chatId: number,
+  listingId: string | null,
   undoButton?: ReturnType<typeof Markup.button.callback>,
 ): Promise<void> {
   const message = ctx.callbackQuery?.message as { text?: string; caption?: string; photo?: unknown } | undefined;
   if (!message) return;
+
+  const keyboard = Markup.inlineKeyboard(undoButton ? [undoButton] : []);
+  // The album-companion placeholder is always a plain-text message (Telegram forbids reply_markup on
+  // sendMediaGroup, so its buttons live on a standalone text message, never a caption) — checking
+  // message.text alone is enough to recognize it.
+  const isPlaceholder = message.text != null && GROUP_PLACEHOLDER_TEXTS.includes(message.text);
+  const listing = !isPlaceholder && listingId != null ? getListingById(db, listingId) : null;
+
   try {
-    const markup = Markup.inlineKeyboard(undoButton ? [undoButton] : []);
-    if (message.photo) {
-      await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), markup);
-    } else if (message.text) {
-      await ctx.editMessageText(appendSwipeStatus(message.text, status), markup);
+    if (listing != null) {
+      const limit = message.photo ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT;
+      // Never hand formatCard a negative budget: status is always one of t()'s short, fixed
+      // status_* strings (well under 100 chars in every locale — see locales/*.ts), so this floor is
+      // purely defensive and never actually bites in practice; formatCard still gets the near-entirety
+      // of `limit` to work with.
+      const budget = Math.max(0, limit - status.length - STATUS_SEPARATOR.length);
+      const commuteLine = cachedCommuteLineFor(db, chatId, listing);
+      const rendered = formatCard(listing, { commuteLine, labels: cardLabels(db, chatId), maxLength: budget });
+      const text = `${rendered}${STATUS_SEPARATOR}${status}`;
+      const extra = { ...keyboard, ...HTML_SEND_EXTRA };
+      if (message.photo) await ctx.editMessageCaption(text, extra);
+      else await ctx.editMessageText(text, extra);
+      return;
     }
+    // Pre-deploy placeholder, or a listing since deleted from the DB: keep the original plain-text behaviour.
+    if (message.photo) await ctx.editMessageCaption(appendSwipeStatus(message.caption ?? '', status), { ...keyboard });
+    else if (message.text) await ctx.editMessageText(appendSwipeStatus(message.text, status), { ...keyboard });
   } catch {
     // best-effort — see doc comment above
   }
@@ -406,8 +489,16 @@ interface ShortlistCardCtx {
   callbackQuery?: { message?: unknown };
   chat?: { id: number };
   telegram: Telegraf['telegram'];
-  editMessageMedia: (media: { type: 'photo'; media: string; caption?: string }, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
-  editMessageText: (text: string, extra?: ReturnType<typeof Markup.inlineKeyboard>) => Promise<unknown>;
+  editMessageMedia: (
+    media: { type: 'photo'; media: string; caption?: string; parse_mode?: 'HTML' },
+    extra?: ReturnType<typeof Markup.inlineKeyboard>,
+  ) => Promise<unknown>;
+  editMessageText: (
+    text: string,
+    extra?: { reply_markup?: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] } & {
+      parse_mode?: 'HTML'; link_preview_options?: { is_disabled: boolean };
+    },
+  ) => Promise<unknown>;
   deleteMessage: () => Promise<unknown>;
 }
 
@@ -419,7 +510,7 @@ interface ShortlistCardCtx {
  * to follow it, and a send failure must never throw and block the response.
  */
 async function deleteAndSendShortlistCard(
-  ctx: ShortlistCardCtx, chatId: number, listing: ListingRow, caption: string, buttons: ReturnType<typeof Markup.inlineKeyboard>,
+  ctx: ShortlistCardCtx, chatId: number, listing: ListingRow, text: string, buttons: ReturnType<typeof Markup.inlineKeyboard>,
 ): Promise<void> {
   try {
     await ctx.deleteMessage();
@@ -427,10 +518,13 @@ async function deleteAndSendShortlistCard(
     // best-effort — an old/already-gone message can't always be deleted
   }
   try {
+    // `text` must already be budgeted for whichever of these two the caller is about to hit — see
+    // replaceShortlistCard, its only caller, which renders at CARD_CAPTION_LIMIT or CARD_MESSAGE_LIMIT
+    // based on this exact same listing.images.length check.
     if (listing.images.length > 0) {
-      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption, ...buttons });
+      await ctx.telegram.sendPhoto(chatId, listing.images[0], { caption: text, ...buttons, parse_mode: 'HTML' });
     } else {
-      await ctx.telegram.sendMessage(chatId, `${caption}\n(no photo)`, buttons);
+      await ctx.telegram.sendMessage(chatId, `${text}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
     }
   } catch {
     // best-effort — see doc comment above
@@ -449,26 +543,32 @@ async function replaceShortlistCard(ctx: ShortlistCardCtx, listing: ListingRow, 
   const message = ctx.callbackQuery?.message as { photo?: unknown } | undefined;
   if (!message) return;
   const chatId = ctx.chat!.id;
-  const caption = formatCaption(listing, null, `❤️ ${position} of ${total}\n\n`, t(db, chatId, 'pet_badge'));
-  const buttons = shortlistNavButtons(listing.id, position, total);
   const targetHasPhoto = listing.images.length > 0;
+  // What the listing itself will send as (photo caption vs. text message) is what sets the budget in
+  // every branch below, including the delete+send fallback — not whether the CURRENT message has a
+  // photo, which only decides in-place-edit-vs-fresh-send.
+  const text = formatCard(listing, {
+    prefix: `❤️ ${position} of ${total}\n\n`, labels: cardLabels(db, chatId),
+    maxLength: targetHasPhoto ? CARD_CAPTION_LIMIT : CARD_MESSAGE_LIMIT,
+  });
+  const buttons = shortlistNavButtons(listing.id, position, total, t(db, chatId, 'btn_export_csv'));
   const currentHasPhoto = Boolean(message.photo);
   if (targetHasPhoto && currentHasPhoto) {
     try {
-      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption }, buttons);
+      await ctx.editMessageMedia({ type: 'photo', media: listing.images[0], caption: text, parse_mode: 'HTML' }, buttons);
       return;
     } catch {
       // in-place edit failed (e.g. expired image URL) — fall through to delete+send below
     }
   } else if (!targetHasPhoto && !currentHasPhoto) {
     try {
-      await ctx.editMessageText(`${caption}\n(no photo)`, buttons);
+      await ctx.editMessageText(`${text}\n(no photo)`, { ...buttons, ...HTML_SEND_EXTRA });
       return;
     } catch {
       // in-place edit failed — fall through to delete+send below
     }
   }
-  await deleteAndSendShortlistCard(ctx, chatId, listing, caption, buttons);
+  await deleteAndSendShortlistCard(ctx, chatId, listing, text, buttons);
 }
 
 /** Replaces the current callback message with the empty-shortlist message — always delete+send, since there's no in-place target type to match against once nothing is left to browse. */
@@ -494,6 +594,32 @@ async function sendShortlistTo(telegram: Telegraf['telegram'], chatId: number, d
     return;
   }
   await sendShortlistBrowseCard(telegram, chatId, items[0], 1, items.length, db);
+}
+
+/**
+ * Delivers the chat's shortlist as a CSV document. An empty shortlist gets the same reply /shortlist
+ * gives rather than a header-only file, which would read as a bug.
+ *
+ * `now` is injected so the filename's date stamp is pinnable in a test, matching sendCard's convention.
+ */
+export async function sendShortlistCsv(
+  telegram: Telegraf['telegram'], chatId: number, db: DB, now: Date = new Date(),
+): Promise<void> {
+  const rows = getShortlistForExport(db, chatId);
+  if (rows.length === 0) {
+    await telegram.sendMessage(chatId, t(db, chatId, 'shortlist_empty'));
+    return;
+  }
+  try {
+    await telegram.sendDocument(
+      chatId,
+      { source: Buffer.from(toCsv(rows), 'utf8'), filename: exportFilename(now) },
+      { caption: t(db, chatId, 'export_caption', { count: rows.length }) },
+    );
+  } catch (err) {
+    console.error('bot: shortlist export failed:', err);
+    await telegram.sendMessage(chatId, t(db, chatId, 'export_failed'));
+  }
 }
 
 /**
@@ -856,6 +982,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     await sendShortlistTo(ctx.telegram, ctx.chat.id, db);
   });
 
+  bot.command('export', async (ctx) => {
+    await sendShortlistCsv(ctx.telegram, ctx.chat.id, db);
+  });
+
   bot.command('next', async (ctx) => {
     await sendNextCard(ctx.telegram, ctx.chat.id, db, deps);
   });
@@ -999,10 +1129,10 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     const undoButton = Markup.button.callback('↩️ Undo', `undo:${listingId}`);
     if (direction === 'like' && !saved) {
       await ctx.answerCbQuery(t(db, chatId, 'listing_no_longer_available'));
-      await clearSwipedCardButtons(ctx, t(db, chatId, 'status_no_longer_available'), undoButton);
+      await clearSwipedCardButtons(ctx, t(db, chatId, 'status_no_longer_available'), db, chatId, listingId, undoButton);
     } else {
       await ctx.answerCbQuery(direction === 'like' ? t(db, chatId, 'saved_to_shortlist') : t(db, chatId, 'passed'));
-      await clearSwipedCardButtons(ctx, direction === 'like' ? t(db, chatId, 'status_added_to_shortlist') : t(db, chatId, 'status_passed'), undoButton);
+      await clearSwipedCardButtons(ctx, direction === 'like' ? t(db, chatId, 'status_added_to_shortlist') : t(db, chatId, 'status_passed'), db, chatId, listingId, undoButton);
     }
     await sendNextCard(ctx.telegram, chatId, db, deps);
   });
@@ -1016,7 +1146,7 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
       return;
     }
     await ctx.answerCbQuery(t(db, chatId, 'swipe_undone'));
-    await clearSwipedCardButtons(ctx, t(db, chatId, 'status_undone'));
+    await clearSwipedCardButtons(ctx, t(db, chatId, 'status_undone'), db, chatId, listingId);
   });
 
   bot.action(/^slnav:(prev|next):(.+)$/, async (ctx) => {
@@ -1035,6 +1165,12 @@ export function createBot(db: DB, token: string, deps: BotDeps): Telegraf {
     }
     await ctx.answerCbQuery();
     await replaceShortlistCard(ctx, items[targetIdx], targetIdx + 1, items.length, db);
+  });
+
+  bot.action('slexport', async (ctx) => {
+    const chatId = ctx.chat!.id;
+    await ctx.answerCbQuery();
+    await sendShortlistCsv(ctx.telegram, chatId, db);
   });
 
   bot.action(/^unlike:(.+)$/, async (ctx) => {

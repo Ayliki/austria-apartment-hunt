@@ -181,6 +181,21 @@ test('dispatchInstant sends exactly one photo message for a top match', async ()
   assert.equal(calls[0].method, 'sendPhoto');
 });
 
+test('an instant alert sends its caption as HTML', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db,
+    [row({ id: 'willhaben:new', valueFlag: 'good', images: ['https://cdn/a.jpg'] })], NOW_MIDDAY);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'sendPhoto');
+  assert.equal(calls[0].payload.parse_mode, 'HTML');
+  assert.match(String(calls[0].payload.caption), /<b>/);
+});
+
 test('dispatchInstant never sends an album, however many photos a listing has', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
@@ -245,6 +260,23 @@ test('dispatchInstant never touches the MCP sentinel chat', async () => {
   await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good' })], NOW_MIDDAY);
 
   assert.equal(calls.length, 0);
+});
+
+test('a no-photo instant alert renders at the message budget (4096), not the caption budget (1024)', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', commuteProfilePrefs({ commuteDestination: null, commuteLat: null, commuteLon: null }));
+  seedHistory(db, 30);
+  // Long enough to survive intact at CARD_MESSAGE_LIMIT but to force formatCard's title-shortening
+  // step at the tighter CARD_CAPTION_LIMIT — see bot.test.ts's equivalent sendCard test.
+  const longTitle = 'A'.repeat(1100);
+
+  const { telegram, calls } = testTelegram();
+  await dispatchInstant(telegram, db, [row({ id: 'willhaben:new', valueFlag: 'good', title: longTitle, images: [] })], NOW_MIDDAY);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'sendMessage');
+  assert.ok(String(calls[0].payload.text).includes(longTitle),
+    'a no-photo instant alert is sent as a message (4096 cap), so the title must not be shortened as if it were a caption (1024 cap)');
 });
 
 test('a failing send for one profile does not stop the next profile', async () => {

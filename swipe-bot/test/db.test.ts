@@ -5,7 +5,7 @@ import { rmSync } from 'node:fs';
 import {
   openDb,
   upsertListing, listingKey,
-  recordSwipe, getShortlist, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
+  recordSwipe, getShortlist, getShortlistForExport, removeFromShortlist, getCandidateListings, getSwipedWithDirection,
   getListingsByIds, getAllListingIds, matchesPrefs, getCommuteTimes, setCommuteTimes, setListingCoords,
   getListingsBySource, applyListingRefresh, setListingDelisted, deleteDelistedUnshortlisted,
   getLastSwipe, undoSwipe,
@@ -16,7 +16,7 @@ import {
   getNotifySettings, updateNotifySettings, recordNotified, countInstantSince, getNotifiedListingIds, DEFAULT_NOTIFY_SETTINGS,
   getCachedFileId, recordFileId, recordPhotoFailure, isKnownBadPhoto, isPermanentPhotoError,
   PHOTO_TRANSIENT_COOLDOWN_MS, PHOTO_PERMANENT_COOLDOWN_MS,
-  type ListingRow, type SearchProfilePrefs,
+  type ListingRow, type SearchProfilePrefs, type ShortlistExportRow,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { initialWizardState, applyWizardChoice, finalizePrefs, BUDGET_BANDS } from '../src/wizard.js';
@@ -310,6 +310,41 @@ test('undoSwipe refuses to undo anything but the chat\'s most recent swipe', () 
 test('undoSwipe on a chat with no swipes at all is a no-op', () => {
   const db = openDb(':memory:');
   assert.equal(undoSwipe(db, 1, 'willhaben:a'), false);
+});
+
+test('getShortlistForExport returns each saved listing with its saved_at timestamp', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: '70' }));
+  upsertListing(db, listing({ id: '71' }));
+  // recordSwipe stamps saved_at from the wall clock (src/db.ts:733), so two likes in the same
+  // millisecond would make the ordering assertion below flaky. Inserting directly pins both.
+  db.prepare('INSERT INTO shortlist (chat_id, listing_id, saved_at) VALUES (?, ?, ?)')
+    .run(1, 'willhaben:70', '2026-08-01T10:00:00.000Z');
+  db.prepare('INSERT INTO shortlist (chat_id, listing_id, saved_at) VALUES (?, ?, ?)')
+    .run(1, 'willhaben:71', '2026-08-02T10:00:00.000Z');
+
+  const rows = getShortlistForExport(db, 1);
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].listing.id, 'willhaben:71', 'newest-liked first, matching getShortlist');
+  assert.equal(rows[0].savedAt, '2026-08-02T10:00:00.000Z');
+  assert.equal(rows[1].savedAt, '2026-08-01T10:00:00.000Z');
+});
+
+test('getShortlistForExport agrees with getShortlist on ordering', () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: '72' }));
+  upsertListing(db, listing({ id: '73' }));
+  recordSwipe(db, 1, 'willhaben:72', 'like');
+  recordSwipe(db, 1, 'willhaben:73', 'like');
+
+  const exported = getShortlistForExport(db, 1).map((r) => r.listing.id);
+  assert.deepEqual(exported, getShortlist(db, 1).map((l) => l.id));
+});
+
+test('getShortlistForExport returns an empty array for a chat with no likes', () => {
+  const db = openDb(':memory:');
+  assert.deepEqual(getShortlistForExport(db, 99), []);
 });
 
 test('getCandidateListings excludes already-swiped and filters by prefs', () => {

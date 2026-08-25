@@ -12,6 +12,17 @@ export function viennaHour(now: Date): number {
   return Number(formatted);
 }
 
+const VIENNA_DATE_FORMAT = new Intl.DateTimeFormat('en-CA', { timeZone: VIENNA, year: 'numeric', month: '2-digit', day: '2-digit' });
+
+/**
+ * Vienna calendar date (YYYY-MM-DD) for the given instant, DST included — e.g. for date-stamping a
+ * filename. `en-CA` formats as YYYY-MM-DD directly, so no field reassembly is needed the way
+ * viennaFields (below) needs it for arithmetic.
+ */
+export function viennaDateIso(now: Date): string {
+  return VIENNA_DATE_FORMAT.format(now);
+}
+
 const VIENNA_FIELDS = new Intl.DateTimeFormat('en-CA', {
   timeZone: VIENNA, year: 'numeric', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,

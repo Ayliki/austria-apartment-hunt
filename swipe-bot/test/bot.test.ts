@@ -1,17 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createBot, nextCardFor, formatCaption, buildMediaGroup, getCommuteLineFor, sendCard,
+  createBot, nextCardFor, cardLabels, buildMediaGroup, getCommuteLineFor, sendCard,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
-  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary,
+  summarizeMatches, formatAggregateSummary, sendProfileActivationSummary, SWIPE_PROMPT_TEXT, stripHtml, sendShortlistCsv,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
   openDb, upsertListing, createSearchProfile, getActiveSearchProfile, getSearchProfile, getSearchProfiles, getWizardState, recordSwipe, getShortlist,
-  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, recordPhotoFailure, getListingById, isKnownBadPhoto,
+  getCandidateListings, MAX_SEARCH_PROFILES_PER_CHAT, deleteSearchProfile, recordPhotoFailure, getListingById, isKnownBadPhoto, setCommuteTimes,
   type ListingRow, type DB, type SearchProfilePrefs,
 } from '../src/db.js';
 import { initialWizardState, WIZARD_STEPS } from '../src/wizard.js';
+import { CARD_CAPTION_LIMIT, DEFAULT_CARD_LABELS, type CardLabels } from '../src/card.js';
+import { t, type LocaleKey } from '../src/locales.js';
+import en from '../src/locales/en.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
 import { Telegram, type Telegraf } from 'telegraf';
 
@@ -62,126 +65,84 @@ test('nextCardFor returns the top-ranked candidate, excluding already-swiped', (
   assert.equal(card!.id, 'willhaben:b');
 });
 
-test('formatCaption includes title, price, size/rooms/district, and the link', () => {
-  const caption = formatCaption(row({}));
-  assert.match(caption, /Sunny two-room flat/);
-  assert.match(caption, /€650/);
-  assert.match(caption, /43m²/);
-  assert.match(caption, /2 rooms/);
-  assert.match(caption, /district 6/);
-  assert.match(caption, /https:\/\/x\/1/);
+// formatCaption's own unit tests were replaced by formatCard's equivalent coverage in
+// test/card.test.ts when Task 4 retired the plain-text renderer — see that file for
+// title/price/warning-flag/pet-badge/commute-line/prefix/truncation coverage.
+
+test('cardLabels resolves every label for the chat language', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  const labels = cardLabels(db, 1);
+  for (const [key, value] of Object.entries(labels)) {
+    assert.equal(typeof value, 'string', `${key} must resolve to a string`);
+    assert.ok(value.length > 0, `${key} must not be empty`);
+  }
 });
 
-test('formatCaption appends the description when present, omits the block when null', () => {
-  const withDesc = formatCaption(row({ description: 'Bright and quiet, close to the U-Bahn.' }));
-  assert.match(withDesc, /Bright and quiet, close to the U-Bahn\./);
+/**
+ * Maps each CardLabels field to the LocaleKey it must be wired to — shared by the two tests below.
+ * A non-empty-string assertion alone (see the test above) can't catch a SWAPPED pair (e.g.
+ * `lift: t(..., 'card_parking')`): both sides are still non-empty strings, just the wrong ones. This
+ * table pins the wiring itself, so a swap fails.
+ */
+const CARD_LABEL_KEYS: Record<keyof CardLabels, LocaleKey> = {
+  petBadge: 'pet_badge',
+  linkText: 'card_link_text',
+  rooms: 'card_rooms',
+  floor: 'card_floor',
+  availableFrom: 'card_available_from',
+  valueGood: 'card_value_good',
+  valueFair: 'card_value_fair',
+  valuePremium: 'card_value_premium',
+  lift: 'card_lift',
+  parking: 'card_parking',
+  energy: 'card_energy',
+  waitlistWarning: 'card_warning_waitlist',
+  wgWarning: 'card_warning_wg',
+  delistedWarning: 'card_warning_delisted',
+};
 
-  const withoutDesc = formatCaption(row({ description: null }));
-  assert.doesNotMatch(withoutDesc, /\n\n/); // no description block appended at all
+test('cardLabels wires every field to its own locale key, catching a swapped pair that a mere non-empty check would miss', () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  const labels = cardLabels(db, 1);
+  for (const [key, localeKey] of Object.entries(CARD_LABEL_KEYS) as [keyof CardLabels, LocaleKey][]) {
+    assert.equal(labels[key], t(db, 1, localeKey), `cardLabels().${key} must equal t(..., '${localeKey}')`);
+  }
 });
 
-test('formatCaption truncates to Telegram\'s 1024-char caption limit instead of overflowing', () => {
-  const longDescription = 'x'.repeat(2000);
-  const caption = formatCaption(row({ description: longDescription }));
-  assert.ok(caption.length <= 1024, `caption was ${caption.length} chars`);
-  assert.ok(caption.endsWith('…'));
+test('DEFAULT_CARD_LABELS matches the English locale catalog for every field, so the two copies cannot drift', () => {
+  for (const [key, localeKey] of Object.entries(CARD_LABEL_KEYS) as [keyof CardLabels, LocaleKey][]) {
+    assert.equal(DEFAULT_CARD_LABELS[key], en[localeKey], `DEFAULT_CARD_LABELS.${key} must match en.${localeKey}`);
+  }
 });
 
-test('formatCaption flags municipal/waitlist housing, and only when it actually requires one', () => {
-  const flagged = formatCaption(row({ requiresWaitlistTicket: true }));
-  assert.match(flagged, /⚠️ Municipal\/waitlist housing/);
-
-  const unflagged = formatCaption(row({ requiresWaitlistTicket: false }));
-  assert.doesNotMatch(unflagged, /⚠️/);
-});
-
-test('formatCaption tags WG/shared-flat listings, and only those', () => {
-  const flagged = formatCaption(row({ isWg: true }));
-  assert.match(flagged, /🚪 WG/);
-
-  const unflagged = formatCaption(row({ isWg: false }));
-  assert.doesNotMatch(unflagged, /🚪/);
-});
-
-test('formatCaption flags a delisted listing, and only when it actually is', () => {
-  const flagged = formatCaption(row({ isDelisted: true }));
-  assert.match(flagged, /⚠️ No longer listed/);
-
-  const unflagged = formatCaption(row({ isDelisted: false }));
-  assert.doesNotMatch(unflagged, /No longer listed/);
-});
-
-test('formatCaption appends the commute line when given one, omits it entirely otherwise', () => {
-  const withCommute = formatCaption(row({}), '📍 18 min walk · 7 min by tram D to TU Wien');
-  assert.match(withCommute, /📍 18 min walk · 7 min by tram D to TU Wien/);
-
-  assert.doesNotMatch(formatCaption(row({}), null), /📍/);
-  assert.doesNotMatch(formatCaption(row({})), /📍/);
-});
-
-test('formatCaption includes an optional prefix ahead of the title, within the truncation budget', () => {
-  const withPrefix = formatCaption(row({}), null, '❤️ 3 of 12\n\n');
-  assert.match(withPrefix, /^❤️ 3 of 12\n\nSunny two-room flat/);
-});
-
-test('formatCaption without a prefix behaves exactly as before (no leading position line)', () => {
-  assert.doesNotMatch(formatCaption(row({})), /❤️/);
-});
-
-test('formatCaption truncates to 1024 chars even with a prefix present', () => {
-  const longDescription = 'x'.repeat(2000);
-  const caption = formatCaption(row({ description: longDescription }), null, '❤️ 3 of 12\n\n');
-  assert.ok(caption.length <= 1024, `caption was ${caption.length} chars`);
-  assert.ok(caption.startsWith('❤️ 3 of 12\n\n'));
-  assert.ok(caption.endsWith('…'));
-});
-
-test('formatCaption shows elevator/parking/floor/energy class only when known, never fabricating "no" for a null field', () => {
-  const withAmenities = formatCaption(row({ lift: true, parkingSpaces: 2, floor: '3. Stock', energyClass: 'B' }));
-  assert.match(withAmenities, /Lift/i);
-  assert.match(withAmenities, /Parking/i);
-  assert.match(withAmenities, /3\. Stock/);
-  assert.match(withAmenities, /B/);
-
-  const withoutAmenities = formatCaption(row({ lift: null, parkingSpaces: null, floor: null, energyClass: null }));
-  assert.doesNotMatch(withoutAmenities, /Lift/i);
-  assert.doesNotMatch(withoutAmenities, /Parking/i);
-});
-
-test('formatCaption shows the unverified pet badge only when mentionsPets is true', () => {
-  assert.match(formatCaption(row({ mentionsPets: true })), /🐾 mentions pets — check listing/);
-  assert.doesNotMatch(formatCaption(row({ mentionsPets: false })), /🐾/);
-});
-
-test('formatCaption still truncates to 1024 chars with the new badge lines included', () => {
-  const caption = formatCaption(row({ description: 'x'.repeat(2000), lift: true, parkingSpaces: 1, mentionsPets: true }));
-  assert.ok(caption.length <= 1024);
-});
-
-test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order', () => {
-  const markup = shortlistNavButtons('willhaben:a', 2, 3) as unknown as { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } };
-  const row = markup.reply_markup.inline_keyboard[0];
+test('shortlistNavButtons: a middle position shows Prev, Remove, and Next in that order, plus an export row', () => {
+  const markup = shortlistNavButtons('willhaben:a', 2, 3, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } };
+  const [row, exportRow] = markup.reply_markup.inline_keyboard;
   assert.deepEqual(row.map((b) => b.text), ['◀️ Prev', '🗑️ Remove', '▶️ Next']);
   assert.deepEqual(row.map((b) => b.callback_data), ['slnav:prev:willhaben:a', 'unlike:willhaben:a', 'slnav:next:willhaben:a']);
+  assert.deepEqual(exportRow.map((b) => b.text), ['📤 Export CSV']);
+  assert.deepEqual(exportRow.map((b) => b.callback_data), ['slexport']);
 });
 
 test('shortlistNavButtons: the first position omits Prev', () => {
-  const markup = shortlistNavButtons('willhaben:a', 1, 3) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  const markup = shortlistNavButtons('willhaben:a', 1, 3, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove', '▶️ Next']);
 });
 
 test('shortlistNavButtons: the last position omits Next', () => {
-  const markup = shortlistNavButtons('willhaben:a', 3, 3) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  const markup = shortlistNavButtons('willhaben:a', 3, 3, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['◀️ Prev', '🗑️ Remove']);
 });
 
 test('shortlistNavButtons: a single-item shortlist omits both Prev and Next', () => {
-  const markup = shortlistNavButtons('willhaben:a', 1, 1) as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
+  const markup = shortlistNavButtons('willhaben:a', 1, 1, '📤 Export CSV') as unknown as { reply_markup: { inline_keyboard: { text: string }[][] } };
   assert.deepEqual(markup.reply_markup.inline_keyboard[0].map((b) => b.text), ['🗑️ Remove']);
 });
 
-test('BOT_COMMANDS lists start, next, shortlist, searches, settings, help, language, each with a non-empty description', () => {
-  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'searches', 'settings', 'help', 'language']);
+test('BOT_COMMANDS lists start, next, shortlist, export, searches, settings, help, language, each with a non-empty description', () => {
+  assert.deepEqual(BOT_COMMANDS.map((c) => c.command), ['start', 'next', 'shortlist', 'export', 'searches', 'settings', 'help', 'language']);
   assert.ok(BOT_COMMANDS.every((c) => c.description.length > 0 && c.description.length <= 256)); // Telegram's setMyCommands description limit
 });
 
@@ -196,19 +157,17 @@ test('appendSwipeStatus appends to a real caption/text, rather than replacing it
   );
 });
 
-test('buildMediaGroup attaches the caption to only the first item', () => {
-  const group = buildMediaGroup(['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg'], 'my caption');
+test('buildMediaGroup carries no caption on any item', () => {
+  const group = buildMediaGroup(['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg']);
   assert.equal(group.length, 3);
-  assert.equal(group[0].caption, 'my caption');
-  assert.equal(group[1].caption, undefined);
-  assert.equal(group[2].caption, undefined);
+  assert.ok(group.every((item) => item.caption === undefined));
   assert.ok(group.every((item) => item.type === 'photo'));
   assert.deepEqual(group.map((item) => item.media), ['https://img/1.jpg', 'https://img/2.jpg', 'https://img/3.jpg']);
 });
 
 test('buildMediaGroup caps at Telegram\'s 10-item limit', () => {
   const images = Array.from({ length: 15 }, (_, i) => `https://img/${i}.jpg`);
-  const group = buildMediaGroup(images, 'caption');
+  const group = buildMediaGroup(images);
   assert.equal(group.length, MAX_MEDIA_GROUP_ITEMS);
   assert.deepEqual(group.map((item) => item.media), images.slice(0, MAX_MEDIA_GROUP_ITEMS));
 });
@@ -1278,6 +1237,70 @@ test('a swipe on a photo card edits the caption (not the text), leaving the phot
   assert.equal(calls.some((c) => c.method === 'editMessageText'), false);
 });
 
+test('swiping a card re-renders its text from the database, keeping the markup', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '60', title: 'Wohnung & Co', images: [] }));
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate({
+    update_id: 1,
+    callback_query: {
+      id: 'cb1', from: { id: 1, is_bot: false, first_name: 'T' },
+      message: { message_id: 7, date: 0, chat: { id: 1, type: 'private' }, text: 'stale plain text' },
+      chat_instance: 'x', data: 'like:willhaben:60',
+    },
+  } as never);
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'the swiped card is edited in place');
+  assert.equal(edit.payload.parse_mode, 'HTML');
+  assert.match(String(edit.payload.text), /Wohnung &amp; Co/,
+    'text is re-rendered from the DB and escaped, not echoed back from message.text');
+  assert.ok(!String(edit.payload.text).includes('stale plain text'));
+});
+
+test('swiping a card whose profile has a commute destination keeps the commute line in the re-rendered card', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs({ commuteDestination: 'TU Wien', commuteLat: 48.1986, commuteLon: 16.3695 }));
+  upsertListing(db, listing({ id: '61' }));
+  const profile = getActiveSearchProfile(db, 1)!;
+  setCommuteTimes(db, profile.id, 'willhaben:61', { walkMinutes: 8, transitMinutes: 22, transitSummary: 'U4' });
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:61', { text: 'stale plain text' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an editMessageText call');
+  assert.match(String(edit.payload.text), /8 min walk/, 'the cached commute line must survive the re-render');
+  assert.match(String(edit.payload.text), /22 min by U4/);
+  assert.match(String(edit.payload.text), /TU Wien/);
+});
+
+test('swiping an old-style companion placeholder card falls back to plain text, even though the listing is still in the DB', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a', title: 'Wohnung & Co' }));
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'like:willhaben:a', { text: SWIPE_PROMPT_TEXT }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an editMessageText call');
+  assert.equal(edit!.payload.text, '✅ Added to shortlist', 'wholesale-replaced, not re-rendered from the DB');
+  assert.equal(edit!.payload.parse_mode, undefined, 'the fallback path must not send parse_mode: HTML');
+});
+
+test('swiping a card whose listing has been deleted falls back to appending status to the stale text, without parse_mode', async () => {
+  const db = openDb(':memory:');
+  // No upsertListing — 'willhaben:a' simulates a listing removed from the DB after the card was sent.
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'pass:willhaben:a', { text: 'Sunny flat\n€650 · 43m²\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an editMessageText call');
+  assert.match(edit!.payload.text as string, /^Sunny flat\n€650 · 43m²\nhttps:\/\/x\/1\n\(no photo\)\n\n👎 Passed$/);
+  assert.equal(edit!.payload.parse_mode, undefined, 'the fallback path must not send parse_mode: HTML');
+});
+
 test('/shortlist sends nothing but the empty-state message when there are no liked listings', async () => {
   const db = openDb(':memory:');
   const { bot, calls } = createTestBot(db);
@@ -1320,6 +1343,19 @@ test('/shortlist on a listing with a photo sends a sendPhoto card, not a text me
   assert.equal(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€')), false); // no text card
 });
 
+test('/shortlist on a no-photo listing renders at the message budget (4096), not the caption budget (1024)', async () => {
+  const db = openDb(':memory:');
+  const longTitle = 'A'.repeat(1100); // see sendCard's equivalent test for why this length is chosen
+  upsertListing(db, listing({ id: 'new', price: 600, title: longTitle, images: [] }));
+  recordSwipe(db, 1, 'willhaben:new', 'like');
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(commandUpdate(1, '/shortlist'));
+
+  const card = calls.find((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€'))!;
+  assert.ok(String(card.payload.text).includes(longTitle),
+    'a no-photo shortlist card is sent as a message (4096 cap), so the title must not be shortened as if it were a caption (1024 cap)');
+});
+
 test('tapping Next from position 1 of 3 edits the same message in place to position 2 of 3', async () => {
   const db = openDb(':memory:');
   upsertListing(db, listing({ id: 'a', price: 500 }));
@@ -1337,6 +1373,23 @@ test('tapping Next from position 1 of 3 edits the same message in place to posit
   assert.match(edit!.payload.text as string, /❤️ 2 of 3/);
   assert.match(edit!.payload.text as string, /€600/);
   assert.equal(calls.some((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€')), false); // no new card message
+});
+
+test('tapping Next between two no-photo shortlist cards edits in place at the message budget (4096), not the caption budget (1024)', async () => {
+  const db = openDb(':memory:');
+  const longTitle = 'A'.repeat(1100); // see sendCard's equivalent test for why this length is chosen
+  upsertListing(db, listing({ id: 'a', price: 500, title: longTitle }));
+  upsertListing(db, listing({ id: 'b', price: 600 }));
+  recordSwipe(db, 1, 'willhaben:a', 'like');
+  recordSwipe(db, 1, 'willhaben:b', 'like');
+  // newest-liked first: b (pos 1, no photo), a (pos 2, no photo, long title) — Next from 'b' goes to 'a'
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:next:willhaben:b', { text: '❤️ 1 of 2\n\nFlat\n€600\nhttps://x/1\n(no photo)' }));
+
+  const edit = calls.find((c) => c.method === 'editMessageText');
+  assert.ok(edit, 'expected an in-place edit, not a new message');
+  assert.ok(String(edit!.payload.text).includes(longTitle),
+    'both cards are no-photo, so this edit is a message (4096 cap); the title must not be shortened as if it were a caption (1024 cap)');
 });
 
 test('tapping Next from a photo card to another photo card edits the media in place, not delete+resend', async () => {
@@ -1408,6 +1461,23 @@ test('navigating to a listing whose photo-presence differs from the current mess
   assert.ok(calls.some((c) => c.method === 'sendPhoto'), 'expected a fresh photo message for the target');
   assert.equal(calls.some((c) => c.method === 'editMessageText'), false);
   assert.equal(calls.some((c) => c.method === 'editMessageMedia'), false);
+});
+
+test('a delete+send fallback to a no-photo target renders at the message budget (4096), not the caption budget (1024)', async () => {
+  const db = openDb(':memory:');
+  const longTitle = 'A'.repeat(1100); // see sendCard's equivalent test for why this length is chosen
+  upsertListing(db, listing({ id: 'target', price: 500, title: longTitle, images: [] })); // no photo
+  upsertListing(db, listing({ id: 'photo', price: 600, images: ['https://img/1.jpg'] })); // current message
+  recordSwipe(db, 1, 'willhaben:target', 'like');
+  recordSwipe(db, 1, 'willhaben:photo', 'like');
+  // newest-first: photo (pos 1, has photo), target (pos 2, no photo, long title) — Next from 'photo' goes to 'target'
+  const { bot, calls } = createTestBot(db);
+  await bot.handleUpdate(callbackUpdate(1, 'slnav:next:willhaben:photo', { photo: [{ file_id: 'x' }], caption: '❤️ 1 of 2\n\nFlat\n€600\nhttps://x/1' }));
+
+  assert.ok(calls.some((c) => c.method === 'deleteMessage'), 'cross-type navigation falls back to delete+send');
+  const sent = calls.find((c) => c.method === 'sendMessage' && (c.payload.text as string).includes('€'))!;
+  assert.ok(String(sent.payload.text).includes(longTitle),
+    'the delete+send fallback sends a message (4096 cap) for a no-photo target; the title must not be shortened as if it were a caption (1024 cap)');
 });
 
 test('tapping Remove on a middle item advances in place to the item that slid into its slot', async () => {
@@ -1574,6 +1644,51 @@ test('completing the wizard via buttons still attaches MAIN_KEYBOARD, even thoug
   assert.deepEqual((navMessage!.payload.reply_markup as { keyboard: string[][] }).keyboard, [['⏭ Next', '📋 Shortlist', '⚙️ Settings']]);
 });
 
+test('sendCard sends card text as HTML', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '40', images: [] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:40')!, null, db);
+
+  const sent = calls.find((c) => c.method === 'sendMessage');
+  assert.ok(sent, 'a no-photo listing sends as a message');
+  assert.equal(sent.payload.parse_mode, 'HTML');
+  assert.match(String(sent.payload.text), /<b>/);
+});
+
+test('sendCard disables the link preview so Telegram adds no extra image', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '41', images: [] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:41')!, null, db);
+
+  const sent = calls.find((c) => c.method === 'sendMessage')!;
+  assert.ok(
+    sent.payload.link_preview_options !== undefined || sent.payload.disable_web_page_preview === true,
+    'link preview must be suppressed',
+  );
+});
+
+test('sendCard renders a no-photo card at the message budget (4096), not the tighter caption budget (1024)', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  // Long enough to survive intact at CARD_MESSAGE_LIMIT but to force formatCard's title-shortening
+  // step at the tighter CARD_CAPTION_LIMIT — verified directly against formatCard beforehand.
+  const longTitle = 'A'.repeat(1100);
+  upsertListing(db, listing({ id: '56', title: longTitle, images: [] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:56')!, null, db);
+
+  const sent = calls.find((c) => c.method === 'sendMessage')!;
+  assert.ok(String(sent.payload.text).includes(longTitle),
+    'a no-photo card is sent as a message (4096 cap), so the title must not be shortened as if it were a caption (1024 cap)');
+});
+
 test('a failing album degrades to a single photo instead of losing the card', async () => {
   const db = openDb(':memory:');
   createSearchProfile(db, 1, 'Test', defaultPrefs());
@@ -1587,6 +1702,27 @@ test('a failing album degrades to a single photo instead of losing the card', as
   assert.equal(calls[0].method, 'sendMediaGroup');
   assert.ok(calls.some((c) => c.method === 'sendPhoto'),
     'card must still reach the user as a single photo after the album fails');
+});
+
+test('a failing album falls back to a caption within the caption budget, not the message budget', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  // A long, uncapped title: at CARD_MESSAGE_LIMIT (4096) it never triggers formatCard's shrink
+  // cascade, so if the fallback used that budget the caption would sail past Telegram's real
+  // 1024-char caption cap.
+  upsertListing(db, listing({ id: '54', title: 'A'.repeat(1500), images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram((method) =>
+    method === 'sendMediaGroup' ? new Error('400: Bad Request: group send failed') : undefined);
+
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:54')!, null, db);
+
+  const photo = calls.find((c) => c.method === 'sendPhoto')!;
+  assert.ok(photo, 'card must still reach the user as a single photo after the album fails');
+  assert.ok(
+    String(photo.payload.caption).length <= CARD_CAPTION_LIMIT,
+    `fallback caption must respect the ${CARD_CAPTION_LIMIT}-char caption budget, got ${String(photo.payload.caption).length}`,
+  );
 });
 
 // A deliberately long-past anchor. sendCard takes an injected clock, so the suppression window this
@@ -1670,4 +1806,163 @@ test('a successful album whose companion buttons message fails does not resend t
 
   assert.equal(calls.filter((c) => c.method === 'sendMediaGroup').length, 1);
   assert.ok(!calls.some((c) => c.method === 'sendPhoto'), 'the card must not be resent as a single photo');
+});
+
+test('a multi-photo card sends the album without a caption', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '50', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:50')!, null, db);
+
+  const album = calls.find((c) => c.method === 'sendMediaGroup')!;
+  const media = album.payload.media as { caption?: string }[];
+  assert.ok(media.every((m) => m.caption === undefined), 'album items must carry no caption');
+});
+
+test('a multi-photo card puts the listing text and the buttons on one message', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '51', title: 'Helle Garconniere', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:51')!, null, db);
+
+  const follow = calls.find((c) => c.method === 'sendMessage')!;
+  assert.match(String(follow.payload.text), /Helle Garconniere/);
+  assert.equal(follow.payload.parse_mode, 'HTML');
+  const markup = follow.payload.reply_markup as { inline_keyboard: { callback_data: string }[][] };
+  const data = markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(data.some((d) => d.startsWith('like:')), 'the like button rides the listing message');
+  assert.ok(data.some((d) => d.startsWith('pass:')), 'the pass button rides the listing message');
+});
+
+test('the old placeholder prompt is no longer sent for an album', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '52', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  const { telegram, calls } = testTelegram();
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:52')!, null, db);
+
+  assert.ok(!calls.some((c) => c.payload.text === SWIPE_PROMPT_TEXT),
+    'the contentless "👍 or 👎?" message is gone');
+});
+
+test('a formatted send that Telegram rejects retries once as plain text', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '53', images: ['https://cdn/a.jpg', 'https://cdn/b.jpg'] }));
+
+  let firstMessage = true;
+  const { telegram, calls } = testTelegram((method) => {
+    if (method === 'sendMessage' && firstMessage) {
+      firstMessage = false;
+      return new Error("400: Bad Request: can't parse entities");
+    }
+    return undefined;
+  });
+
+  await sendCard(telegram, 1, getListingById(db, 'willhaben:53')!, null, db);
+
+  const messages = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(messages.length, 2, 'the rejected send is retried exactly once');
+  assert.equal(messages[1].payload.parse_mode, undefined, 'the retry carries no parse_mode');
+  assert.ok(messages[1].payload.reply_markup, 'the retry keeps the buttons');
+  assert.deepEqual(messages[1].payload.link_preview_options, { is_disabled: true },
+    'the plain-text retry must still suppress the link preview — stripHtml leaves a bare URL behind');
+});
+
+test('stripHtml turns a card back into readable plain text', () => {
+  const html = '<b>Wohnung &amp; Co</b>\n📍 1060 Mariahilf\n<a href="https://x/1">Open on willhaben ▸</a>';
+  const out = stripHtml(html);
+  assert.equal(out, 'Wohnung & Co\n📍 1060 Mariahilf\nOpen on willhaben ▸: https://x/1');
+  assert.ok(!out.includes('<'), 'no tags survive');
+});
+
+// --- Task 9: CSV export wiring ---
+
+test('sendShortlistCsv sends a date-stamped document with a caption', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '80' }));
+  recordSwipe(db, 1, 'willhaben:80', 'like');
+
+  const { telegram, calls } = testTelegram();
+  // Mid-day UTC, safely away from the Vienna day boundary — see export.test.ts for that case.
+  await sendShortlistCsv(telegram, 1, db, new Date('2026-08-24T10:00:00.000Z'));
+
+  const doc = calls.find((c) => c.method === 'sendDocument');
+  assert.ok(doc, 'the export is delivered as a document');
+  const payload = doc.payload.document as { filename: string; source: Buffer };
+  assert.equal(payload.filename, 'shortlist-2026-08-24.csv');
+  assert.match(payload.source.toString('utf8'), /^﻿title;/);
+  assert.ok(String(doc.payload.caption).includes('1'), 'caption reports the row count');
+});
+
+test('sendShortlistCsv replies with the empty-state text instead of an empty file', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+
+  const { telegram, calls } = testTelegram();
+  await sendShortlistCsv(telegram, 1, db, new Date('2026-08-24T22:15:00.000Z'));
+
+  assert.ok(!calls.some((c) => c.method === 'sendDocument'), 'no file for an empty shortlist');
+  assert.ok(calls.some((c) => c.method === 'sendMessage'));
+});
+
+test('sendShortlistCsv replies with export_failed and does not throw when sendDocument fails', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '81' }));
+  recordSwipe(db, 1, 'willhaben:81', 'like');
+
+  const { telegram, calls } = testTelegram();
+  forceFailureOnce = 'sendDocument';
+  await sendShortlistCsv(telegram, 1, db, new Date('2026-08-24T22:15:00.000Z'));
+
+  assert.ok(!calls.some((c) => c.method === 'sendDocument'), 'the failed attempt itself is not recorded');
+  const messages = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(messages.length, 1, 'the failure is reported to the user');
+  assert.notEqual(messages[0].payload.text, t(db, 1, 'shortlist_empty'), 'a distinct failure message, not the empty-shortlist reply');
+});
+
+test('the shortlist browse card offers an export button', () => {
+  const buttons = shortlistNavButtons('willhaben:80', 1, 1, '📤 Export CSV');
+  const data = (buttons.reply_markup.inline_keyboard as { callback_data?: string }[][])
+    .flat().map((b) => b.callback_data);
+  assert.ok(data.includes('slexport'), 'an export button is present on the browse card');
+});
+
+test('/export is registered as a bot command', () => {
+  assert.ok(BOT_COMMANDS.some((c) => c.command === 'export'));
+});
+
+test('/export sends the shortlist CSV to the invoking chat', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '82' }));
+  recordSwipe(db, 1, 'willhaben:82', 'like');
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(commandUpdate(1, '/export'));
+
+  assert.ok(calls.some((c) => c.method === 'sendDocument'), '/export delivers the CSV document');
+});
+
+test('tapping the export button on the shortlist browse card answers the callback and sends the CSV', async () => {
+  const db = openDb(':memory:');
+  createSearchProfile(db, 1, 'Test', defaultPrefs());
+  upsertListing(db, listing({ id: '83' }));
+  recordSwipe(db, 1, 'willhaben:83', 'like');
+  const { bot, calls } = createTestBot(db);
+
+  await bot.handleUpdate(callbackUpdate(1, 'slexport'));
+
+  const ackIdx = calls.findIndex((c) => c.method === 'answerCallbackQuery');
+  const sendIdx = calls.findIndex((c) => c.method === 'sendDocument');
+  assert.ok(ackIdx !== -1, 'the callback query is answered');
+  assert.ok(sendIdx !== -1, 'the CSV document is sent');
+  assert.ok(ackIdx < sendIdx, 'the spinner is cleared before the slow document upload begins');
 });

@@ -48,3 +48,22 @@ export function isPermanentChatError(err: unknown): boolean {
   if (message.startsWith('403:') || message.includes('forbidden:')) return true;
   return PERMANENT_CHAT_PATTERNS.some((pattern) => message.includes(pattern));
 }
+
+/** Telegram's own wordings for "the caption text you sent is too long for this send", not the image. */
+const CAPTION_TOO_LONG_PATTERNS = [
+  'message_caption_too_long',
+  'caption is too long',
+];
+
+/**
+ * True when a send was rejected because its CAPTION overflowed Telegram's 1024-char cap, not
+ * because the photo itself was bad — same shape of problem as isPermanentChatError above (a
+ * rejection with a cause outside the image), and worth its own category rather than folding it into
+ * "unrecognised = image failure": photo_cache is keyed by url and shared by every user, so treating
+ * a caption-sizing bug as an image failure blacklists a perfectly good photo for everyone for an
+ * hour. This has already been the fallout of two separate caption-budget bugs during development.
+ */
+export function isCaptionTooLongError(err: unknown): boolean {
+  const message = errorText(err).toLowerCase();
+  return CAPTION_TOO_LONG_PATTERNS.some((pattern) => message.includes(pattern));
+}
