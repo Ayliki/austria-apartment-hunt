@@ -7,6 +7,7 @@ import {
   openDb, upsertListing, setListingDelisted, getListingsByIds, recordSwipe, getShortlist,
 } from '../src/db.js';
 import type { NormalizedListing } from 'apt-hunter/dist/normalize.js';
+import type { SourceName } from 'apt-hunter/dist/hunt.js';
 
 function listing(overrides: Partial<NormalizedListing>): NormalizedListing {
   return {
@@ -41,7 +42,12 @@ function fetcherThrowing(message: string): ListingFetcher {
   return { callToolText: async () => { throw new Error(message); } };
 }
 
-const noDelay = { delayMs: 0, sleep: async () => {} };
+/**
+ * These tests exercise sweep mechanics, not deployment policy, so they opt both sources in
+ * explicitly. The default set is immoscout-only (apt-hunter's DEFAULT_SOURCES); the tests that
+ * cover *that* pass their own `sources` or omit it deliberately.
+ */
+const noDelay = { delayMs: 0, sleep: async () => {}, sources: ['immoscout', 'willhaben'] as SourceName[] };
 
 test('classifyGetListingError: willhaben "not found" is not-found, anything else is transient', () => {
   assert.equal(
@@ -83,7 +89,7 @@ test('refreshAllListings updates images/address/coords on a successful willhaben
   assert.equal(row.addressLine, '1060, Wien, 06. Bezirk, Mariahilf, Österreich');
   assert.equal(row.lat, 48.2);
   assert.equal(row.lon, 16.35);
-  assert.deepEqual(summary.willhaben, { checked: 1, updated: 1, delisted: 0, errored: 0 });
+  assert.deepEqual(summary.willhaben, { checked: 1, updated: 1, delisted: 0, errored: 0, skipped: false });
 });
 
 test('refreshAllListings updates images/address on a successful immoscout fetch (no coords available from detail)', async () => {
@@ -253,4 +259,76 @@ test('refreshAllListings still deletes normally when only a small, plausible num
   assert.equal(summary.willhaben.delisted, 2); // 2 out of 20 = 10% < max(10, 5) threshold — not tripped
   assert.deepEqual(summary.deletionSkippedFor, []);
   assert.equal(summary.deleted, 2);
+});
+
+test('refreshAllListings does NOT sweep willhaben by default — a disabled source must not be re-fetched every 6h', async () => {
+  // The regression this guards: gating only the poller leaves the refresh sweep hitting the
+  // disabled source once per stored row, every REFRESH_INTERVAL_MS, forever. Turning a source off
+  // has to turn off *every* outbound path to it, not just the search one.
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));                        // willhaben row
+  upsertListing(db, listing({ id: 'b', source: 'immoscout' }));   // immoscout row
+
+  let willhabenCalls = 0;
+  const countingWillhaben: ListingFetcher = {
+    callToolText: async () => { willhabenCalls++; return WH_DETAIL_TEXT; },
+  };
+
+  const summary = await refreshAllListings(db, {
+    willhaben: countingWillhaben,
+    immoscout: fetcherReturning('{"images":[],"address":null}'),
+  }, { delayMs: 0, sleep: async () => {} }); // no `sources` — the real default applies
+
+  assert.equal(willhabenCalls, 0, 'willhaben must not be contacted at all under the default source set');
+  assert.deepEqual(summary.willhaben, { checked: 0, updated: 0, delisted: 0, errored: 0, skipped: true });
+  assert.equal(summary.immoscout.skipped, false);
+  assert.equal(summary.immoscout.checked, 1);
+});
+
+test('refreshAllListings never flags a skipped source\'s rows as delisted', async () => {
+  // A skipped source is "not asked", not "asked and got nothing" — its rows must survive untouched,
+  // or disabling willhaben would quietly delete every willhaben listing anyone shortlisted.
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
+
+  await refreshAllListings(db, {
+    immoscout: fetcherReturning('{"images":[],"address":null}'),
+  }, { delayMs: 0, sleep: async () => {} });
+
+  const [row] = getListingsByIds(db, ['willhaben:a']);
+  assert.ok(row, 'the willhaben row must still exist');
+  assert.equal(row.isDelisted, false);
+});
+
+test('refreshAllListings skips a source that is enabled but has no fetcher supplied', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
+
+  const summary = await refreshAllListings(db, {}, {
+    delayMs: 0, sleep: async () => {}, sources: ['immoscout', 'willhaben'] as SourceName[],
+  });
+
+  assert.equal(summary.willhaben.skipped, true);
+  assert.equal(summary.immoscout.skipped, true);
+});
+
+test('refreshAllListings sweeps willhaben when it is explicitly opted in', async () => {
+  // The opt-in must genuinely still work — this is a policy default, not a removal of the feature.
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'a' }));
+
+  let willhabenCalls = 0;
+  const summary = await refreshAllListings(db, {
+    willhaben: { callToolText: async () => { willhabenCalls++; return WH_DETAIL_TEXT; } },
+    immoscout: fetcherReturning('{"images":[],"address":null}'),
+  }, { delayMs: 0, sleep: async () => {}, sources: ['immoscout', 'willhaben'] as SourceName[] });
+
+  assert.equal(willhabenCalls, 1);
+  assert.equal(summary.willhaben.skipped, false);
+  assert.equal(summary.willhaben.checked, 1);
+});
+
+test('exceedsBlastRadius never trips on a skipped source', () => {
+  const skipped: SourceRefreshSummary = { checked: 0, updated: 0, delisted: 0, errored: 0, skipped: true };
+  assert.equal(exceedsBlastRadius(skipped), false);
 });

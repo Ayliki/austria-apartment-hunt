@@ -1,7 +1,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpConnection } from 'apt-hunter/dist/mcp-client.js';
-import { willhabenSpec, immoscoutSpec } from 'apt-hunter/dist/hunt.js';
+import { willhabenSpec, immoscoutSpec, resolveSources } from 'apt-hunter/dist/hunt.js';
 import { openDb } from './db.js';
 import { createBot, BOT_COMMANDS, type BotDeps } from './bot.js';
 import { runPoll } from './poller.js';
@@ -52,12 +52,19 @@ async function main(): Promise<void> {
   // The first run after this ships (right here, at startup) doubles as the one-time backfill for
   // rows inserted before this feature existed — there's no separate backfill script.
   const refresh = async () => {
-    const willhabenConn = new McpConnection(willhabenSpec());
-    const immoscoutConn = new McpConnection(immoscoutSpec());
+    // Only ever connect to sources this deployment has enabled. A sweep is a second standing
+    // source of outbound requests on top of the poller (one get_listing per stored row, every 6h),
+    // so a disabled source must not get a connection here either — not merely be filtered later.
+    const sources = resolveSources();
+    const specs = { willhaben: willhabenSpec, immoscout: immoscoutSpec } as const;
+    const conns: Partial<Record<(typeof sources)[number], McpConnection>> = {};
     try {
-      await willhabenConn.connect();
-      await immoscoutConn.connect();
-      const summary = await refreshAllListings(db, { willhaben: willhabenConn, immoscout: immoscoutConn });
+      for (const source of sources) {
+        const conn = new McpConnection(specs[source]());
+        await conn.connect();
+        conns[source] = conn;
+      }
+      const summary = await refreshAllListings(db, conns, { sources });
       console.log('refresh:', JSON.stringify(summary));
       if (summary.deletionSkippedFor.length > 0) {
         console.error(`refresh: BLAST RADIUS GUARD TRIPPED for ${summary.deletionSkippedFor.join(', ')} — skipped this cycle's delete pass, investigate before the next sweep`);
@@ -65,8 +72,9 @@ async function main(): Promise<void> {
     } catch (err) {
       console.error('refresh failed:', err);
     } finally {
-      await willhabenConn.close().catch((err) => console.error('willhaben conn close failed:', err));
-      await immoscoutConn.close().catch((err) => console.error('immoscout conn close failed:', err));
+      for (const [source, conn] of Object.entries(conns)) {
+        await conn.close().catch((err) => console.error(`${source} conn close failed:`, err));
+      }
     }
   };
 

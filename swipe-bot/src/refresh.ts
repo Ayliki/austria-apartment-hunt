@@ -1,4 +1,5 @@
 import { parseWillhabenDetailText } from 'apt-hunter/dist/normalize.js';
+import { ALL_SOURCES, resolveSources, type SourceName } from 'apt-hunter/dist/hunt.js';
 import {
   type DB,
   getListingsBySource, applyListingRefresh, setListingDelisted, deleteDelistedUnshortlisted,
@@ -11,9 +12,13 @@ export interface ListingFetcher {
   callToolText(tool: string, args: Record<string, unknown>): Promise<string>;
 }
 
+/**
+ * Optional per source: a disabled source (see apt-hunter's DEFAULT_SOURCES) gets no connection at
+ * all, so there is nothing to pass. A source with no fetcher is skipped exactly like a disabled one.
+ */
 export interface RefreshDeps {
-  willhaben: ListingFetcher;
-  immoscout: ListingFetcher;
+  willhaben?: ListingFetcher;
+  immoscout?: ListingFetcher;
 }
 
 export interface SourceRefreshSummary {
@@ -21,6 +26,13 @@ export interface SourceRefreshSummary {
   updated: number;
   delisted: number;
   errored: number;
+  /** True when this source was not swept at all (disabled, or no fetcher supplied) — distinct from a sweep that checked 0 rows because there were none. */
+  skipped: boolean;
+}
+
+/** A source that was never contacted this sweep. Deliberately not "zero rows found": nothing was asked. */
+export function skippedSummary(): SourceRefreshSummary {
+  return { checked: 0, updated: 0, delisted: 0, errored: 0, skipped: true };
 }
 
 export interface RefreshSummary {
@@ -45,6 +57,7 @@ const BLAST_RADIUS_FRACTION = 0.25;
 
 /** True if a source's delisted count this sweep is implausibly high for real listings being taken down — almost certainly a block page or a markup change misfiring as "not found" instead. */
 export function exceedsBlastRadius(summary: SourceRefreshSummary): boolean {
+  if (summary.skipped) return false; // nothing was fetched, so nothing can look like a block page
   return summary.delisted > Math.max(BLAST_RADIUS_MIN_DELISTED, summary.checked * BLAST_RADIUS_FRACTION);
 }
 
@@ -71,7 +84,7 @@ async function refreshSource(
 ): Promise<SourceRefreshSummary> {
   const rows = getListingsBySource(db, source);
   const tool = source === 'willhaben' ? 'willhaben_get_listing' : 'immoscout_get_listing';
-  const summary: SourceRefreshSummary = { checked: 0, updated: 0, delisted: 0, errored: 0 };
+  const summary: SourceRefreshSummary = { checked: 0, updated: 0, delisted: 0, errored: 0, skipped: false };
 
   for (const row of rows) {
     summary.checked++;
@@ -112,18 +125,26 @@ async function refreshSource(
  * as both the one-time backfill and the ongoing cleanup, there is no separate script.
  */
 export async function refreshAllListings(
-  db: DB, deps: RefreshDeps, opts: { delayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+  db: DB, deps: RefreshDeps, opts: { delayMs?: number; sleep?: (ms: number) => Promise<void>; sources?: SourceName[] } = {},
 ): Promise<RefreshSummary> {
   const delayMs = opts.delayMs ?? DEFAULT_DELAY_MS;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-  const willhaben = await refreshSource(db, 'willhaben', deps.willhaben, delayMs, sleep);
-  const immoscout = await refreshSource(db, 'immoscout', deps.immoscout, delayMs, sleep);
+  // A sweep re-fetches every stored row from its origin, so it is a second, standing source of
+  // outbound requests entirely separate from the poller — gate it on the same source set, or
+  // disabling a source in the poller would silently leave this hitting it every 6h forever.
+  const enabled = new Set(opts.sources ?? resolveSources());
 
-  const deletionSkippedFor: ListingSource[] = [];
-  if (exceedsBlastRadius(willhaben)) deletionSkippedFor.push('willhaben');
-  if (exceedsBlastRadius(immoscout)) deletionSkippedFor.push('immoscout');
+  const summaries = {} as Record<SourceName, SourceRefreshSummary>;
+  for (const source of ALL_SOURCES) {
+    const fetcher = deps[source];
+    summaries[source] = enabled.has(source) && fetcher
+      ? await refreshSource(db, source, fetcher, delayMs, sleep)
+      : skippedSummary();
+  }
+
+  const deletionSkippedFor: ListingSource[] = ALL_SOURCES.filter((s) => exceedsBlastRadius(summaries[s]));
   const deleted = deletionSkippedFor.length > 0 ? 0 : deleteDelistedUnshortlisted(db);
 
-  return { willhaben, immoscout, deleted, deletionSkippedFor };
+  return { willhaben: summaries.willhaben, immoscout: summaries.immoscout, deleted, deletionSkippedFor };
 }
