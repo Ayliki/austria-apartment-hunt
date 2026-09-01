@@ -332,3 +332,69 @@ test('exceedsBlastRadius never trips on a skipped source', () => {
   const skipped: SourceRefreshSummary = { checked: 0, updated: 0, delisted: 0, errored: 0, skipped: true };
   assert.equal(exceedsBlastRadius(skipped), false);
 });
+
+/**
+ * ImmoScout24 answers a removed expose with HTTP 410 Gone, not 404. classifyGetListingError only
+ * matched 404, so every taken-down listing was filed as 'transient' forever: never flagged
+ * is_delisted, never deleted, still shown as a live apartment, and re-fetched every 6h for nothing.
+ * Measured on 60 random stored listings: 32x HTTP 200, 28x HTTP 410, no other status.
+ */
+test('classifyGetListingError: immoscout HTTP 410 Gone is not-found, not transient', () => {
+  assert.equal(
+    classifyGetListingError('immoscout', new Error('immoscout_get_listing failed: Error: GET https://www.immobilienscout24.at/expose/6a79c9d9d51bd349946bd10d failed with HTTP 410')),
+    'not-found',
+  );
+});
+
+test('classifyGetListingError: HTTP 410 is not-found for willhaben too — 410 means permanently gone in any source', () => {
+  assert.equal(classifyGetListingError('willhaben', new Error('willhaben_get_listing failed: GET ... failed with HTTP 410')), 'not-found');
+});
+
+test('classifyGetListingError: still treats retryable HTTP statuses as transient', () => {
+  for (const status of [429, 500, 502, 503]) {
+    assert.equal(
+      classifyGetListingError('immoscout', new Error(`immoscout_get_listing failed: Error: GET https://x failed with HTTP ${status}`)),
+      'transient',
+      `HTTP ${status} must stay transient`,
+    );
+  }
+});
+
+test('a 410 listing is flagged delisted and swept up, instead of erroring forever', async () => {
+  const db = openDb(':memory:');
+  upsertListing(db, listing({ id: 'gone', source: 'immoscout' }));
+
+  const summary = await refreshAllListings(db, {
+    immoscout: fetcherThrowing('immoscout_get_listing failed: Error: GET https://x/expose/gone failed with HTTP 410'),
+  }, { delayMs: 0, sleep: async () => {}, sources: ['immoscout'] as SourceName[] });
+
+  assert.equal(summary.immoscout.delisted, 1);
+  assert.equal(summary.immoscout.errored, 0, 'a permanently gone listing is not an error');
+  assert.equal(summary.deleted, 1, 'and it gets cleaned up, since nobody shortlisted it');
+});
+
+/**
+ * Guards the trap the 410 fix would otherwise spring: correcting the classification flags the whole
+ * accumulated backlog at once, tripping the blast-radius guard. If the guard counted re-confirmations
+ * of already-flagged rows, it would trip on every subsequent sweep too and the delete pass would
+ * never run again. Only genuinely NEW delistings may count toward it.
+ */
+test('the blast-radius guard counts only newly flagged listings, so a standing backlog cannot jam it forever', async () => {
+  const db = openDb(':memory:');
+  for (let i = 0; i < 40; i++) upsertListing(db, listing({ id: `gone${i}`, source: 'immoscout' }));
+  // Shortlist one so the delete pass cannot empty the table and hide the effect.
+  recordSwipe(db, 1, 'immoscout:gone0', 'like');
+
+  const gone = fetcherThrowing('immoscout_get_listing failed: Error: GET https://x failed with HTTP 410');
+  const opts = { delayMs: 0, sleep: async () => {}, sources: ['immoscout'] as SourceName[] };
+
+  const first = await refreshAllListings(db, { immoscout: gone }, opts);
+  assert.equal(first.immoscout.delisted, 40, 'first sweep sees 40 genuinely new delistings');
+  assert.deepEqual(first.deletionSkippedFor, ['immoscout'], 'and the guard correctly trips on that mass event');
+  assert.equal(first.deleted, 0);
+
+  const second = await refreshAllListings(db, { immoscout: gone }, opts);
+  assert.equal(second.immoscout.delisted, 0, 'second sweep re-confirms the same rows — nothing NEW is delisted');
+  assert.deepEqual(second.deletionSkippedFor, [], 'so the guard must not trip again');
+  assert.ok(second.deleted > 0, 'and the backlog finally gets cleaned up');
+});

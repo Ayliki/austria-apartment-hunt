@@ -75,6 +75,11 @@ interface ImmoscoutDetail {
  */
 export function classifyGetListingError(source: ListingSource, err: Error): 'not-found' | 'transient' {
   const msg = err.message;
+  // 410 Gone is source-independent and stronger than 404: the resource existed and was deliberately
+  // removed. ImmoScout24 answers a taken-down expose with 410, never 404 — measured on 60 random
+  // stored listings (32x 200, 28x 410, nothing else), so before this branch existed every removed
+  // listing was misfiled as a transient failure and stayed in the deck as a live apartment forever.
+  if (msg.includes('HTTP 410')) return 'not-found';
   if (source === 'willhaben') return msg.includes('not found') ? 'not-found' : 'transient';
   return msg.includes('HTTP 404') || msg.includes('no Expose') ? 'not-found' : 'transient';
 }
@@ -107,8 +112,9 @@ async function refreshSource(
     } catch (err) {
       const kind = classifyGetListingError(source, err as Error);
       if (kind === 'not-found') {
-        setListingDelisted(db, row.id, true);
-        summary.delisted++;
+        // Only a genuine transition counts: re-confirming an already-flagged row is not new
+        // information, and letting it count would keep the blast-radius guard tripped permanently.
+        if (setListingDelisted(db, row.id, true)) summary.delisted++;
       } else {
         summary.errored++;
       }

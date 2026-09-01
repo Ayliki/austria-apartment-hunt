@@ -485,8 +485,15 @@ export function applyListingRefresh(
 }
 
 /** Flags (or un-flags) a listing as taken off its source site. See deleteDelistedUnshortlisted for what happens next. */
-export function setListingDelisted(db: DB, id: string, delisted: boolean): void {
-  db.prepare('UPDATE listings SET is_delisted = ? WHERE id = ?').run(delisted ? 1 : 0, id);
+/**
+ * Returns true only when the flag actually changed. Callers need that to tell a NEW delisting from a
+ * re-confirmation of one already known — the refresh sweep's blast-radius guard measures the former,
+ * and counting the latter would let a standing backlog jam the guard on every sweep forever.
+ */
+export function setListingDelisted(db: DB, id: string, delisted: boolean): boolean {
+  const info = db.prepare('UPDATE listings SET is_delisted = ? WHERE id = ? AND is_delisted != ?')
+    .run(delisted ? 1 : 0, id, delisted ? 1 : 0);
+  return info.changes > 0;
 }
 
 /**
