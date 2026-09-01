@@ -107,7 +107,7 @@ export interface CardOptions {
   maxLength?: number;
 }
 
-const SOURCE_NAMES: Record<ListingRow['source'], string> = {
+export const SOURCE_NAMES: Record<ListingRow['source'], string> = {
   willhaben: 'willhaben',
   immoscout: 'ImmoScout24',
 };

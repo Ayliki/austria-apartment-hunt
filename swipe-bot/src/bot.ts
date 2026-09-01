@@ -9,11 +9,12 @@ import {
 } from './db.js';
 import { rankListings } from './scoring.js';
 import { formatCommuteLine, type GeoPoint } from './commute.js';
-import { formatCard, type CardLabels, CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT } from './card.js';
+import { formatCard, SOURCE_NAMES, type CardLabels, CARD_CAPTION_LIMIT, CARD_MESSAGE_LIMIT } from './card.js';
 import { t, LOCALE_NAMES } from './locales.js';
 import { toCsv, exportFilename } from './export.js';
 import { sendPhotoCached, usablePhotoUrls } from './photo.js';
 import { renderNotifyMenu, nextDailyCap } from './notify-ui.js';
+import { resolveSources } from 'apt-hunter/dist/hunt.js';
 import {
   WIZARD_STEPS, BUDGET_BANDS, DISTRICT_GROUPS, initialWizardState, applyWizardChoice, isWizardComplete, finalizePrefs, parseCustomBudget,
   type WizardState, type WizardChoice, type WizardStepId,
@@ -32,9 +33,29 @@ export const SAFETY_NOTICE =
   'Avoid international transfers and escrow/Treuhand arrangements. ' +
   'Only use the listing\'s official contact channel.';
 
-/** Builds the localized /help body via t()'s `help_full` key, substituting the search-profile cap and the (untranslated, safety-critical) SAFETY_NOTICE. */
+/**
+ * Human-readable list of the portals this deployment actually queries ("ImmoScout24", or
+ * "willhaben and ImmoScout24"). Derived from the live source set rather than written into the
+ * copy, because a hardcoded list silently becomes a lie the moment APT_SOURCES changes — /help
+ * promised willhaben for a while after willhaben had already been switched off.
+ */
+export function activeSourceNames(sources = resolveSources(), conjunction = 'and'): string {
+  const names = sources.map((s) => SOURCE_NAMES[s]);
+  if (names.length === 0) return '';
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(', ')} ${conjunction} ${names[names.length - 1]}`;
+}
+
+/** Builds the localized /help body via t()'s `help_full` key, substituting the search-profile cap, the live source list, the non-affiliation disclaimer, and the (untranslated, safety-critical) SAFETY_NOTICE. */
 function buildHelpText(db: DB, chatId: number): string {
-  return t(db, chatId, 'help_full', { maxProfiles: MAX_SEARCH_PROFILES_PER_CHAT, safetyNotice: SAFETY_NOTICE });
+  const sources = activeSourceNames();
+  const disclaimer = t(db, chatId, 'help_disclaimer', { sources });
+  return t(db, chatId, 'help_full', {
+    maxProfiles: MAX_SEARCH_PROFILES_PER_CHAT,
+    safetyNotice: SAFETY_NOTICE,
+    sources,
+    disclaimer,
+  });
 }
 
 /** Registered via setMyCommands (in index.ts's startup, not here — createBot stays synchronous) so Telegram shows a persistent ☰ menu. */

@@ -61,7 +61,7 @@ export default {
   status_undone: '↩️ Rückgängig',
   help_full:
     'Ich finde Mietwohnungen in Wien nach deinen Kriterien und zeige sie als Karten zum Durchwischen, wie bei einer Dating-App.\n\n' +
-    'So funktioniert\'s: Alle ~3 Stunden prüfe ich willhaben und immobilienscout24 auf neue Treffer für jede deiner Suchen. ' +
+    'So funktioniert\'s: Alle ~3 Stunden prüfe ich {sources} auf neue Treffer für jede deiner Suchen. ' +
     'Wenn eine Anzeige wirklich heraussticht (als gutes Preis-Leistungs-Verhältnis markiert und unter den besten, die diese Suche ' +
     'im letzten Monat gesehen hat), schicke ich sie dir sofort, bis zu ein paar Mal am Tag. Alles andere sammle ich in einer ' +
     'Übersicht zu festen Zeiten am Tag (standardmäßig morgens und abends), damit du nichts verpasst, auch ohne Sofortmeldung. ' +
@@ -81,7 +81,7 @@ export default {
     '/language — die Sprache des Bots ändern\n\n' +
     'Die Schaltflächen "⏭ Next" / "📋 Shortlist" / "⚙️ Settings" unter dem Nachrichtenfeld (ebenfalls auf Englisch) tun dasselbe wie die ' +
     'zugehörigen Befehle — ein Tap statt Tippen.\n\n' +
-    '{safetyNotice}',
+    '{safetyNotice}\n\n{disclaimer}',
 
   notify_instant_header: '🔥 Starker Treffer · {name}',
   notify_digest_header: '🏠 {name} · {count} neue seit deinem letzten Update',
@@ -116,4 +116,8 @@ export default {
   btn_export_csv: '📤 CSV exportieren',
   export_caption: 'Gespeicherte Inserate: {count}',
   export_failed: 'Der Export konnte nicht erstellt werden. Bitte gleich noch einmal versuchen.',
+  help_disclaimer:
+    'Dieser Bot ist unabhängig und steht in keiner Verbindung zu {sources}, ist von dort weder autorisiert noch unterstützt. '
+    + 'Er verweist auf öffentliche Inserate; jede Karte verlinkt auf das Original-Inserat, wo du dich bewirbst. '
+    + 'Alle Inhalte der Inserate gehören dem Inserenten und dem jeweiligen Portal.',
 } as const;

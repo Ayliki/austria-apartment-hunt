@@ -187,3 +187,34 @@ test('help_full still carries the {maxProfiles} and {safetyNotice} placeholders 
     assert.ok(catalog.help_full.includes('{safetyNotice}'), 'help_full is missing {safetyNotice}');
   }
 });
+
+/**
+ * The regression these guard: /help hardcoded "willhaben and immobilienscout24" in all three
+ * catalogs, so when willhaben was switched off the bot kept telling every user it was still
+ * checking a portal it no longer touched. Copy must never name the portals itself — it gets them
+ * from the live source set via {sources}.
+ */
+test('no catalog names a portal literally in help_full — the source list must come from {sources}', () => {
+  for (const [lang, cat] of Object.entries({ en, ru, de })) {
+    assert.doesNotMatch(cat.help_full, /willhaben/i, `${lang} help_full must not hardcode "willhaben"`);
+    assert.doesNotMatch(cat.help_full, /immobilienscout|immoscout/i, `${lang} help_full must not hardcode ImmoScout24`);
+    assert.ok(cat.help_full.includes('{sources}'), `${lang} help_full must use the {sources} placeholder`);
+  }
+});
+
+test('every catalog renders the non-affiliation disclaimer inside /help', () => {
+  for (const [lang, cat] of Object.entries({ en, ru, de })) {
+    assert.ok(cat.help_full.includes('{disclaimer}'), `${lang} help_full must render {disclaimer}`);
+    assert.ok(cat.help_disclaimer.length > 0, `${lang} needs a help_disclaimer`);
+    assert.ok(cat.help_disclaimer.includes('{sources}'), `${lang} help_disclaimer must name the live sources`);
+  }
+});
+
+test('help_disclaimer states non-affiliation and points at the original ad in every language', () => {
+  assert.match(en.help_disclaimer, /not affiliated with/i);
+  assert.match(en.help_disclaimer, /original ad/i);
+  assert.match(de.help_disclaimer, /keiner Verbindung/i);
+  assert.match(de.help_disclaimer, /Original-Inserat/i);
+  assert.match(ru.help_disclaimer, /не связан/i);
+  assert.match(ru.help_disclaimer, /оригинал/i);
+});

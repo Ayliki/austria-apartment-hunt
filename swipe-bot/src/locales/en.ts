@@ -62,7 +62,7 @@ export default {
   help_full:
     'I find Vienna rental apartments matching your preferences and let you swipe through them, ' +
     'like a dating app.\n\n' +
-    'How it works: every ~3h I check willhaben and immobilienscout24 for new matches for each of your ' +
+    'How it works: every ~3h I check {sources} for new matches for each of your ' +
     'searches. When one is a genuine standout, flagged good value and ranking among the best that search ' +
     'has seen in the last month, I message you about it right away, up to a handful of times a day. ' +
     'Everything else goes into a digest at set times each day (mornings and evenings by default), so you ' +
@@ -83,7 +83,7 @@ export default {
     '/language — change the bot\'s language\n\n' +
     'The ⏭ Next / 📋 Shortlist / ⚙️ Settings buttons below the message box do the same as the ' +
     'matching commands, one tap instead of typing.\n\n' +
-    '{safetyNotice}',
+    '{safetyNotice}\n\n{disclaimer}',
 
   notify_instant_header: '🔥 Strong match · {name}',
   notify_digest_header: '🏠 {name} · {count} new since your last update',
@@ -120,4 +120,8 @@ export default {
   btn_export_csv: '📤 Export CSV',
   export_caption: 'Saved listings: {count}',
   export_failed: 'Could not build the export just now. Try again in a moment.',
+  help_disclaimer:
+    'This bot is independent and is not affiliated with, authorised by, or endorsed by {sources}. '
+    + 'It points you at public listings; every card links to the original ad, which is where you apply. '
+    + 'All listing content belongs to the advertiser and the portal it was published on.',
 } as const;

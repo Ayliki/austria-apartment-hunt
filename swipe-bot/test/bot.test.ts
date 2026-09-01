@@ -4,6 +4,7 @@ import {
   createBot, nextCardFor, cardLabels, buildMediaGroup, getCommuteLineFor, sendCard,
   appendSwipeStatus, shortlistNavButtons, BOT_COMMANDS, MAX_MEDIA_GROUP_ITEMS, renderWizardStep, type BotDeps, type GeocodeFn,
   summarizeMatches, formatAggregateSummary, sendProfileActivationSummary, SWIPE_PROMPT_TEXT, stripHtml, sendShortlistCsv,
+  activeSourceNames,
 } from '../src/bot.js';
 import type { CommuteTimes } from '../src/db.js';
 import {
@@ -1965,4 +1966,15 @@ test('tapping the export button on the shortlist browse card answers the callbac
   assert.ok(ackIdx !== -1, 'the callback query is answered');
   assert.ok(sendIdx !== -1, 'the CSV document is sent');
   assert.ok(ackIdx < sendIdx, 'the spinner is cleared before the slow document upload begins');
+});
+
+test('activeSourceNames renders the live source set, never a hardcoded portal list', () => {
+  assert.equal(activeSourceNames(['immoscout']), 'ImmoScout24');
+  assert.equal(activeSourceNames(['immoscout', 'willhaben']), 'ImmoScout24 and willhaben');
+  assert.equal(activeSourceNames(['willhaben']), 'willhaben');
+  assert.equal(activeSourceNames([]), '');
+});
+
+test('activeSourceNames takes a localized conjunction', () => {
+  assert.equal(activeSourceNames(['immoscout', 'willhaben'], 'und'), 'ImmoScout24 und willhaben');
 });
