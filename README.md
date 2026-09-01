@@ -1,9 +1,13 @@
 # austria-apartment-hunt
 
-A ready-to-use Claude Code setup for hunting apartments in Vienna across both
-[willhaben.at](https://www.willhaben.at) and
-[immobilienscout24.at](https://www.immobilienscout24.at). Search, deduplicate,
+A ready-to-use Claude Code setup for hunting apartments in Vienna on
+[immobilienscout24.at](https://www.immobilienscout24.at), with optional,
+opt-in support for [willhaben.at](https://www.willhaben.at). Search, deduplicate,
 score, and shortlist rentals straight from a Claude Code conversation.
+
+> **Sources:** immoscout is queried by default and willhaben is off unless you
+> explicitly ask for it — see [Sources](#sources-immoscout-by-default-willhaben-only-on-request)
+> for why.
 
 The repo is now **`austria-apartment-hunt`** (renamed from `willhaben-apartment-hunt`).
 GitHub auto-redirects the old URL, but new clones should use the new name.
@@ -106,9 +110,52 @@ Or run the CLI directly:
 node ./apt-hunter/dist/cli.js --price-to 700 --area-from 30 --districts 1-9 --no-open
 ```
 
+## Sources: immoscout by default, willhaben only on request
+
+**By default this queries immobilienscout24.at and nothing else.** That is a legal
+posture, not a preference:
+
+- `immobilienscout24.at/robots.txt` is `User-Agent: * / Allow: /`, carries
+  `Content-Signal: ai-train=yes, search=yes, ai-input=yes`, and adds explicit `Allow`
+  rules for `Claude-User`, `ChatGPT-User`, `PerplexityBot` and `OAI-SearchBot`. The site
+  actively signals that machine access is welcome.
+- `willhaben.at/robots.txt` opens with *"It is expressively forbidden to use spiders,
+  search robots or other automatic methods to access willhaben.at"*, disallows the
+  `/webapi/`, `/rest/`, `/restapi/` and `/ajax/` paths a programmatic search needs, and
+  willhaben's Nutzungsbedingungen separately forbid `"Robot/Crawler"` extraction and
+  commercial reuse. See [`willhaben-mcp-patched/DISCLAIMER.md`](willhaben-mcp-patched/DISCLAIMER.md).
+
+So willhaben never turns itself on. Adding it is an explicit, per-deployment opt-in:
+
+```bash
+# CLI: one-off
+node ./apt-hunter/dist/cli.js --sources immoscout,willhaben --price-to 700 --no-open
+
+# Poller / bot: environment
+APT_SOURCES=immoscout,willhaben node ./swipe-bot/dist/index.js
+```
+
+`APT_SOURCES` accepts a comma-separated list of `immoscout` and `willhaben`, in any
+order and any case; the effective order is always immoscout-first, so the permitted
+source wins cross-source dedupe ties. An unrecognised name throws rather than silently
+falling back to the default.
+
+If you do opt in, the vendored willhaben MCP now identifies itself honestly rather than
+spoofing a Chrome User-Agent — set `WILLHABEN_USER_AGENT` to add your own contact URL.
+Presenting a bot as a browser is precisely the *circumvention of a technical protection
+measure* that BGH I ZR 159/10 (*Automobil-Onlinebörse*) singled out as the fact that turns
+otherwise-lawful scraping into an unfairness claim, so there is nothing to gain by it.
+
+**Running a public, monetised service off willhaben data is a different question again**
+— see CJEU C-202/12 (*Innoweb v Wegener*), where a dedicated meta search engine over a
+third party's ad database was held to re-utilise a substantial part of that database, and
+CJEU C-30/14 (*Ryanair v PR Aviation*), where terms of use were held to bind even for a
+database with no IP protection. This repo is a personal tool; it is not a licence to build
+one of those.
+
 ## Swipe bot (Telegram)
 
-`swipe-bot/` turns the same willhaben + immoscout sources into a Telegram
+`swipe-bot/` turns the same sources into a Telegram
 swipe-card experience: a background poller keeps a shared listing pool fresh
 (one poll every ~3h regardless of how many people use the bot, never scaling
 requests with user count), and each person swipes 👍/👎 on cards with photos.

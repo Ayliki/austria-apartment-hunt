@@ -1,4 +1,4 @@
-import { huntBothSources, type HuntOptions } from 'apt-hunter/dist/hunt.js';
+import { huntSources, type HuntOptions } from 'apt-hunter/dist/hunt.js';
 import { dedupeListings } from 'apt-hunter/dist/dedupe.js';
 import { scoreValue } from 'apt-hunter/dist/score.js';
 import { type DB, type ListingRow, type SearchProfile, getAllListingIds, getAllSearchProfiles, getListingsByIds, listingKey, upsertListing } from './db.js';
@@ -35,7 +35,8 @@ export async function runPoll(db: DB, opts: { maxPages?: number } = {}): Promise
   if (opts.maxPages != null) filter.maxPages = opts.maxPages;
   filter.isNewListing = isNewListingPredicate(getAllListingIds(db));
 
-  const { listings, warnings } = await huntBothSources(filter);
+  // Source set comes from APT_SOURCES; the deployed bot runs immoscout only (see hunt.ts's DEFAULT_SOURCES).
+  const { listings, warnings } = await huntSources(filter);
   const { merged } = dedupeListings(listings);
   scoreValue(merged);
 

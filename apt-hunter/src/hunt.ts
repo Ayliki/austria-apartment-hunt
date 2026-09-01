@@ -12,6 +12,57 @@ import {
 const WILLHABEN_ENRICH_CAP = 30;
 const IMMOSCOUT_ENRICH_CAP = 30;
 
+export type SourceName = 'immoscout' | 'willhaben';
+
+/**
+ * Listed in priority order: immoscout leads, willhaben trails. `combineHuntResults` emits
+ * listings in this order, so the primary source's hits reach dedupe first and win ties.
+ */
+export const ALL_SOURCES: readonly SourceName[] = ['immoscout', 'willhaben'] as const;
+
+/**
+ * immoscout only, by default and deliberately.
+ *
+ * immobilienscout24.at's robots.txt is `User-Agent: * / Allow: /` with
+ * `Content-Signal: ai-train=yes, search=yes, ai-input=yes` and explicit Allow rules for
+ * Claude-User / ChatGPT-User / PerplexityBot — the site actively signals that machine access
+ * is welcome. willhaben's robots.txt opens with "It is expressively forbidden to use spiders,
+ * search robots or other automatic methods to access willhaben.at", disallows the /webapi/,
+ * /rest/ and /ajax/ paths a programmatic search uses, and its Nutzungsbedingungen forbid
+ * "Robot/Crawler" extraction and commercial reuse (see willhaben-mcp-patched/DISCLAIMER.md).
+ *
+ * So willhaben never turns itself on: an operator has to opt in per deployment via
+ * APT_SOURCES, which keeps that a conscious, documented choice rather than a default.
+ */
+export const DEFAULT_SOURCES: readonly SourceName[] = ['immoscout'] as const;
+
+/**
+ * Parses an `APT_SOURCES`-style list ("immoscout", "immoscout,willhaben", " Willhaben , immoscout ").
+ * Blank/absent means DEFAULT_SOURCES. Unknown names throw rather than being ignored, so a typo
+ * like APT_SOURCES=immoscout24 fails loudly instead of silently running the default set.
+ * The returned order always follows ALL_SOURCES, not the input, so priority can't be reordered
+ * by accident.
+ */
+export function parseSources(raw: string | undefined): SourceName[] {
+  const names = (raw ?? '')
+    .split(',')
+    .map((n) => n.trim().toLowerCase())
+    .filter((n) => n.length > 0);
+  if (names.length === 0) return [...DEFAULT_SOURCES];
+
+  const unknown = names.filter((n) => !(ALL_SOURCES as readonly string[]).includes(n));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown source(s): ${unknown.join(', ')}. Valid sources: ${ALL_SOURCES.join(', ')}`);
+  }
+  const chosen = new Set(names as SourceName[]);
+  return ALL_SOURCES.filter((s) => chosen.has(s));
+}
+
+/** Explicit argument wins over APT_SOURCES, which wins over DEFAULT_SOURCES. */
+export function resolveSources(explicit?: string, env: string | undefined = process.env.APT_SOURCES): SourceName[] {
+  return parseSources(explicit ?? env);
+}
+
 export interface HuntOptions {
   priceFrom?: number;
   priceTo?: number;
@@ -167,20 +218,36 @@ export async function huntImmoscout(opts: HuntOptions): Promise<NormalizedListin
   }
 }
 
-/** Pure — combines settled results from both sources into one HuntResult. Unit-tested directly. */
-export function combineHuntResults(
-  wh: PromiseSettledResult<NormalizedListing[]>,
-  is24: PromiseSettledResult<NormalizedListing[]>,
-): HuntResult {
-  const warnings: string[] = [];
-  const willhabenListings = wh.status === 'fulfilled' ? wh.value : [];
-  if (wh.status === 'rejected') warnings.push(`willhaben source failed: ${(wh.reason as Error).message}`);
-  const immoscoutListings = is24.status === 'fulfilled' ? is24.value : [];
-  if (is24.status === 'rejected') warnings.push(`immoscout source failed: ${(is24.reason as Error).message}`);
-  return { listings: [...willhabenListings, ...immoscoutListings], warnings };
+/** One source's outcome, tagged so `combineHuntResults` can name it in a warning. */
+export interface SourceOutcome {
+  source: SourceName;
+  result: PromiseSettledResult<NormalizedListing[]>;
 }
 
-export async function huntBothSources(opts: HuntOptions): Promise<HuntResult> {
-  const [wh, is24] = await Promise.allSettled([huntWillhaben(opts), huntImmoscout(opts)]);
-  return combineHuntResults(wh, is24);
+/**
+ * Pure — flattens per-source outcomes into one HuntResult, in the order given (so the caller's
+ * source priority is preserved) and warning about each source that threw. Unit-tested directly.
+ */
+export function combineHuntResults(outcomes: SourceOutcome[]): HuntResult {
+  const listings: NormalizedListing[] = [];
+  const warnings: string[] = [];
+  for (const { source, result } of outcomes) {
+    if (result.status === 'fulfilled') listings.push(...result.value);
+    else warnings.push(`${source} source failed: ${(result.reason as Error).message}`);
+  }
+  return { listings, warnings };
+}
+
+const HUNTERS: Record<SourceName, (opts: HuntOptions) => Promise<NormalizedListing[]>> = {
+  immoscout: huntImmoscout,
+  willhaben: huntWillhaben,
+};
+
+/**
+ * Runs exactly the enabled sources (see DEFAULT_SOURCES for why that is immoscout alone) and
+ * combines them. A source that throws degrades to a warning; it never fails the whole hunt.
+ */
+export async function huntSources(opts: HuntOptions, sources: SourceName[] = resolveSources()): Promise<HuntResult> {
+  const settled = await Promise.allSettled(sources.map((s) => HUNTERS[s](opts)));
+  return combineHuntResults(sources.map((source, i) => ({ source, result: settled[i] })));
 }

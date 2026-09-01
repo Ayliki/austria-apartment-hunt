@@ -213,7 +213,13 @@ var init_constants = __esm({
       wien: "900",
       vienna: "900"
     };
-    DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+    // PATCHED: upstream hardcodes a spoofed Chrome User-Agent. Presenting a bot as a browser is
+    // exactly the "circumvention of a technical protection measure" that BGH I ZR 159/10
+    // (Automobil-Onlinebörse) singled out as the fact that turns otherwise-lawful scraping into an
+    // unfairness claim — the one detail worth losing nothing to give up. This identifies itself
+    // honestly instead, so willhaben can recognise and block it if they want to; override with
+    // WILLHABEN_USER_AGENT to add your own contact URL. See DISCLAIMER.md.
+    DEFAULT_USER_AGENT = process.env.WILLHABEN_USER_AGENT || "willhaben-mcp/1.0 (+https://github.com/aliildan/willhaben-mcp; unofficial, non-commercial)";
     CACHE_TTL_MS = 5 * 60 * 1e3;
     RATE_LIMIT_PER_SEC = 1;
   }

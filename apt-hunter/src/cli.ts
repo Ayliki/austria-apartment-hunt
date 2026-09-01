@@ -4,7 +4,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
-import { huntWillhaben, huntImmoscout, combineHuntResults, type HuntOptions } from './hunt.js';
+import { huntSources, resolveSources, ALL_SOURCES, type HuntOptions, type SourceName } from './hunt.js';
 import { dedupeListings } from './dedupe.js';
 import { scoreValue } from './score.js';
 import { renderReport } from './report.js';
@@ -50,6 +50,7 @@ async function main(): Promise<void> {
       location: { type: 'string', default: 'Wien' },
       'max-pages': { type: 'string', default: '6' },
       'no-open': { type: 'boolean', default: false },
+      sources: { type: 'string' },
     },
   });
   const num = (v: string | undefined) => (v == null ? undefined : Number(v));
@@ -66,15 +67,18 @@ async function main(): Promise<void> {
     noOpen: values['no-open']!,
   };
 
-  const [wh, is24] = await Promise.allSettled([huntWillhaben(opts), huntImmoscout(opts)]);
-  const { listings: rawListings, warnings } = combineHuntResults(wh, is24);
-  const willhabenListings = wh.status === 'fulfilled' ? wh.value : [];
-  const immoscoutListings = is24.status === 'fulfilled' ? is24.value : [];
+  // Defaults to immoscout alone; --sources (or APT_SOURCES) is the conscious opt-in to willhaben.
+  const sources = resolveSources(values.sources);
+  const { listings: rawListings, warnings } = await huntSources(opts, sources);
   for (const w of warnings) console.error('WARNING:', w);
-  if (warnings.length === 2) {
-    console.error('Both sources failed — no report generated.');
+  if (warnings.length === sources.length) {
+    console.error(`Every requested source failed (${sources.join(', ')}) — no report generated.`);
     process.exit(1);
   }
+
+  const perSource = Object.fromEntries(
+    ALL_SOURCES.map((s) => [s, rawListings.filter((l) => l.source === s).length]),
+  ) as Record<SourceName, number>;
 
   const { merged, duplicatePairs } = dedupeListings(rawListings);
   scoreValue(merged);
@@ -86,7 +90,7 @@ async function main(): Promise<void> {
     listings: merged,
     rawListings,
     generatedAt: new Date().toISOString(),
-    query: { ...values, districts: opts.districts },
+    query: { ...values, sources, districts: opts.districts },
     warnings,
     duplicatePairs,
   }));
@@ -94,9 +98,9 @@ async function main(): Promise<void> {
   const top = pickTop(merged);
   const summary = {
     reportPath,
+    sources,
     counts: {
-      willhaben: willhabenListings.length,
-      immoscout: immoscoutListings.length,
+      ...perSource,
       merged: merged.length,
       duplicates: duplicatePairs,
     },
